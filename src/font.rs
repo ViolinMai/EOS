@@ -1,4 +1,5 @@
 pub const FONT_WIDTH: usize = 8;
+#[allow(dead_code)]
 pub const FONT_HEIGHT: usize = 16;
 
 pub fn get_glyph(c: char) -> [u8; 16] {

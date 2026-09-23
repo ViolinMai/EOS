@@ -1,11 +1,13 @@
 use core::arch::asm;
 use crate::log_info;
 
+#[allow(dead_code)]
 pub const PAGE_SIZE: u64 = 4096;
 
 pub const PAGE_PRESENT: u64 = 1 << 0;
 pub const PAGE_WRITABLE: u64 = 1 << 1;
 pub const PAGE_USER: u64 = 1 << 2;
+#[allow(dead_code)]
 pub const PAGE_NO_EXECUTE: u64 = 1 << 63;
 
 const PHYSICAL_ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -15,6 +17,7 @@ const PHYSICAL_ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
 pub struct PageTableEntry(pub u64);
 
 impl PageTableEntry {
+    #[allow(dead_code)]
     pub const fn empty() -> Self {
         Self(0)
     }
@@ -24,11 +27,13 @@ impl PageTableEntry {
         (self.0 & PAGE_PRESENT) != 0
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn is_writable(&self) -> bool {
         (self.0 & PAGE_WRITABLE) != 0
     }
 
+    #[allow(dead_code)]
     #[inline]
     pub fn is_user(&self) -> bool {
         (self.0 & PAGE_USER) != 0
@@ -51,6 +56,7 @@ pub struct PageTable {
 }
 
 impl PageTable {
+    #[allow(dead_code)]
     pub const fn empty() -> Self {
         Self {
             entries: [PageTableEntry::empty(); 512],
@@ -74,6 +80,7 @@ impl VirtualMemoryManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn make_executable(&self, virt_addr: u64, size: usize) {
         let mut curr = virt_addr & !0xFFF;
         let end = (virt_addr + size as u64 + 0xFFF) & !0xFFF;
@@ -101,7 +108,6 @@ impl VirtualMemoryManager {
                             let pt = &mut *((pt_phys + self.hhdm_offset) as *mut PageTable);
 
                             if pt.entries[p1_idx].is_present() {
-                                // إزالة بت NX (No-Execute) وتفعيل الإذن بالتنفيذ
                                 pt.entries[p1_idx].0 &= !PAGE_NO_EXECUTE;
                                 pt.entries[p1_idx].0 |= PAGE_PRESENT | PAGE_WRITABLE;
                                 invalidate_tlb(curr);
@@ -114,6 +120,7 @@ impl VirtualMemoryManager {
         }
     }
 
+    #[allow(dead_code)]
     pub fn translate(&self, virt_addr: u64) -> Option<(u64, u64)> {
         let p4_idx = ((virt_addr >> 39) & 0x1FF) as usize;
         let p3_idx = ((virt_addr >> 30) & 0x1FF) as usize;

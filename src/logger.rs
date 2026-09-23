@@ -3,6 +3,7 @@ use crate::writer::WRITER;
 use core::fmt;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[allow(dead_code)]
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum LogLevel {
     Debug,
@@ -16,25 +17,26 @@ pub struct KernelLogger;
 
 static PRINT_LOCK: AtomicBool = AtomicBool::new(false);
 
-#[inline]
+#[inline(always)]
 fn get_current_core_id() -> u32 {
-    let ebx_val: u32;
+    let core_id: u32;
     unsafe {
-        // 💡 حفظ rbx واستخراج قيمته دون حجزه كـ operand مباشر لـ LLVM
+        // 💡 استخدام دالة cpuid آمنة تتجاوز قيد حجز مسجل rbx في LLVM
         core::arch::asm!(
             "push rbx",
             "mov eax, 1",
             "cpuid",
+            "shr ebx, 24",
             "mov {0:e}, ebx",
             "pop rbx",
-            out(reg) ebx_val,
+            out(reg) core_id,
             out("eax") _,
             out("ecx") _,
             out("edx") _,
             options(nomem, preserves_flags)
         );
     }
-    (ebx_val >> 24) & 0xFF
+    core_id
 }
 
 impl KernelLogger {
@@ -47,15 +49,23 @@ impl KernelLogger {
             LogLevel::Fatal => ("[FATAL]", "\x1b[35m"),
         };
 
+        let core_id = get_current_core_id();
+        let ticks = crate::arch::x86_64::pit::get_ticks();
+        let secs = ticks / 100;
+        let frac = (ticks % 100) * 10;
+
+        serial_print!("{}{}\x1b[0m \x1b[1;30m[{:03}.{:02}s]\x1b[0m \x1b[1;34m[CPU#{}]\x1b[0m \x1b[1;30m[{:<6}]\x1b[0m {}\n",
+            color_prefix, tag, secs, frac, core_id, subsystem, args
+        );
+
+        let mut attempts = 0;
         while PRINT_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            attempts += 1;
+            if attempts > 10_000 {
+                return;
+            }
             core::hint::spin_loop();
         }
-
-        let core_id = get_current_core_id();
-
-        serial_print!("{}{}\x1b[0m \x1b[1;34m[CPU#{}]\x1b[0m \x1b[1;30m[{:<6}]\x1b[0m {}\n",
-            color_prefix, tag, core_id, subsystem, args
-        );
 
         let (r, g, b) = match level {
             LogLevel::Debug => (148, 163, 184),

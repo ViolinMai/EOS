@@ -39,17 +39,6 @@ pub fn get_uptime_seconds() -> u64 {
     get_ticks() / (TARGET_HZ as u64)
 }
 
-pub fn sleep_ms(ms: u64) {
-    let target_ticks = (ms * (TARGET_HZ as u64)) / 1000;
-    let start = get_ticks();
-    while get_ticks() - start < target_ticks {
-        unsafe {
-            asm!("hlt", options(nomem, nostack));
-        }
-    }
-}
-
-// 💡 قراءة دورات المعالج مباشرة عبر تعليمة RDTSC للقياس الدقيق
 #[inline]
 pub fn read_tsc() -> u64 {
     let lo: u32;
@@ -58,4 +47,19 @@ pub fn read_tsc() -> u64 {
         asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
     }
     ((hi as u64) << 32) | (lo as u64)
+}
+
+// 💡 sleep دقيق ومستقر حتى لو كانت المقاطعات معطلة أثناء الـ Syscall
+pub fn sleep_ms(ms: u64) {
+    // نفعّل المقاطعات محلياً للتأكد من وصول نبضات الـ PIT Timer
+    unsafe { asm!("sti", options(nomem, nostack)); }
+    
+    let target_ticks = (ms * (TARGET_HZ as u64)) / 1000;
+    let start = get_ticks();
+    
+    while get_ticks().saturating_sub(start) < target_ticks {
+        unsafe {
+            asm!("hlt", options(nomem, nostack));
+        }
+    }
 }

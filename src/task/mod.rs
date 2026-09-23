@@ -1,13 +1,21 @@
 pub mod context;
 
 use alloc::boxed::Box;
+use alloc::string::String;
 use alloc::vec::Vec;
 use crate::arch::x86_64::interrupts::IS_RUNNING_PROGRAM;
 use crate::log_info;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-pub const TASK_STACK_SIZE: usize = 16 * 1024; // 16 KB لكل مهمة كيرنل
+pub const TASK_STACK_SIZE: usize = 16 * 1024;
+
+pub struct FileDescriptor {
+    #[allow(dead_code)]
+    pub path: String,
+    pub data: Vec<u8>,
+    pub offset: usize,
+}
 
 #[repr(C)]
 pub struct Task {
@@ -16,6 +24,8 @@ pub struct Task {
     pub name: &'static str,
     pub counter: u64,
     stack: Box<[u8; TASK_STACK_SIZE]>,
+    pub mmap_bump: u64,
+    pub fd_table: [Option<FileDescriptor>; 32],
 }
 
 impl Task {
@@ -27,22 +37,12 @@ impl Task {
 
         unsafe {
             current_sp &= !0xF;
-
-            current_sp -= 8;
-            *(current_sp as *mut u64) = 0x10;
-            current_sp -= 8;
-            *(current_sp as *mut u64) = stack_top - 16;
-            current_sp -= 8;
-            *(current_sp as *mut u64) = 0x202;
-            current_sp -= 8;
-            *(current_sp as *mut u64) = 0x08;
-            current_sp -= 8;
-            *(current_sp as *mut u64) = entry as usize as u64;
-
-            for _ in 0..15 {
-                current_sp -= 8;
-                *(current_sp as *mut u64) = 0;
-            }
+            current_sp -= 8; *(current_sp as *mut u64) = 0x10;
+            current_sp -= 8; *(current_sp as *mut u64) = stack_top - 16;
+            current_sp -= 8; *(current_sp as *mut u64) = 0x202;
+            current_sp -= 8; *(current_sp as *mut u64) = 0x08;
+            current_sp -= 8; *(current_sp as *mut u64) = entry as usize as u64;
+            for _ in 0..15 { current_sp -= 8; *(current_sp as *mut u64) = 0; }
         }
 
         Self {
@@ -51,6 +51,8 @@ impl Task {
             name,
             counter: 0,
             stack,
+            mmap_bump: 0x0000_0001_0000_0000,
+            fd_table: Default::default(),
         }
     }
 }
@@ -65,15 +67,13 @@ pub static mut SCHEDULER: Option<TaskScheduler> = None;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
 pub enum JobState {
-    Idle,
-    Submitted,
-    Running,
-    Finished,
+    Idle, Submitted, Running, Finished,
 }
 
 pub struct PerCoreJob {
     pub task_fn: Option<fn()>,
     pub state: JobState,
+    #[allow(dead_code)]
     pub result: u64,
 }
 
@@ -108,16 +108,11 @@ pub fn lock_job(core_id: usize) -> SpinLockGuard {
 }
 
 pub fn dispatch_job(core_id: usize, job: fn()) -> Result<(), &'static str> {
-    if core_id == 0 || core_id >= 8 {
-        return Err("Invalid target core ID (Must be between 1 and 7)");
-    }
-
+    if core_id == 0 || core_id >= 8 { return Err("Invalid core ID"); }
     let _guard = lock_job(core_id);
     unsafe {
         let slot = &mut CORE_JOBS[core_id];
-        if slot.state == JobState::Running || slot.state == JobState::Submitted {
-            return Err("Target core is busy with another job");
-        }
+        if slot.state == JobState::Running || slot.state == JobState::Submitted { return Err("Target core busy"); }
         slot.task_fn = Some(job);
         slot.state = JobState::Submitted;
     }
@@ -130,10 +125,7 @@ pub fn get_job_state(core_id: usize) -> JobState {
 }
 
 pub fn core_poll_and_execute(core_id: usize) {
-    if core_id == 0 || core_id >= 8 {
-        return;
-    }
-
+    if core_id == 0 || core_id >= 8 { return; }
     let mut to_run = None;
     {
         let _guard = lock_job(core_id);
@@ -145,7 +137,6 @@ pub fn core_poll_and_execute(core_id: usize) {
             }
         }
     }
-
     if let Some(func) = to_run {
         func();
         let _guard = lock_job(core_id);
@@ -162,11 +153,8 @@ pub fn init() {
         current_task_idx: 0,
         preemptive_enabled: false,
     };
-
-    unsafe {
-        *addr_of_mut!(SCHEDULER) = Some(scheduler);
-    }
-    log_info!("SCHED", "Task Scheduler: Multi-Core Job Offloading queues ready.");
+    unsafe { *addr_of_mut!(SCHEDULER) = Some(scheduler); }
+    log_info!("SCHED", "Task Scheduler ready with FD Tables initialized.");
 }
 
 pub fn spawn(id: u64, name: &'static str, entry: extern "C" fn()) {
@@ -181,22 +169,14 @@ pub fn spawn(id: u64, name: &'static str, entry: extern "C" fn()) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn schedule_preemptive(current_rsp: u64) -> u64 {
-    if IS_RUNNING_PROGRAM.load(Ordering::Relaxed) {
-        return current_rsp;
-    }
-
+    if IS_RUNNING_PROGRAM.load(Ordering::Relaxed) { return current_rsp; }
     unsafe {
         if let Some(sched) = &mut *addr_of_mut!(SCHEDULER) {
-            if !sched.preemptive_enabled || sched.tasks.len() <= 1 {
-                return current_rsp;
-            }
-
+            if !sched.preemptive_enabled || sched.tasks.len() <= 1 { return current_rsp; }
             let prev_idx = sched.current_task_idx;
             sched.tasks[prev_idx].rsp = current_rsp;
-
             let next_idx = (prev_idx + 1) % sched.tasks.len();
             sched.current_task_idx = next_idx;
-
             return sched.tasks[next_idx].rsp;
         }
     }
@@ -207,7 +187,6 @@ pub fn enable_preemption() {
     unsafe {
         if let Some(sched) = &mut *addr_of_mut!(SCHEDULER) {
             sched.preemptive_enabled = true;
-            log_info!("SCHED", "Preemptive Scheduling: ACTIVE (Timeslice: 10ms via PIT).");
         }
     }
 }
@@ -216,17 +195,12 @@ pub fn yield_now() {
     unsafe {
         if let Some(sched) = &mut *addr_of_mut!(SCHEDULER) {
             let total = sched.tasks.len();
-            if total <= 1 {
-                return;
-            }
-
+            if total <= 1 { return; }
             let prev_idx = sched.current_task_idx;
             let next_idx = (prev_idx + 1) % total;
             sched.current_task_idx = next_idx;
-
             let prev_rsp_ptr = &mut sched.tasks[prev_idx].rsp as *mut u64;
             let next_rsp = sched.tasks[next_idx].rsp;
-
             context::context_switch(prev_rsp_ptr, next_rsp);
         }
     }

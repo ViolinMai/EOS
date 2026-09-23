@@ -2,6 +2,7 @@ use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
 
 const KEYBOARD_PORT: u16 = 0x60;
+#[allow(dead_code)]
 const SERIAL_PORT: u16 = 0x3F8;
 
 static SHIFT_ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -39,6 +40,7 @@ unsafe fn inb(port: u16) -> u8 {
     val
 }
 
+#[allow(dead_code)]
 fn read_serial_char_if_available() -> Option<u8> {
     unsafe {
         let status = inb(SERIAL_PORT + 5);
@@ -55,6 +57,7 @@ fn read_serial_char_if_available() -> Option<u8> {
     }
 }
 
+#[allow(dead_code)]
 pub fn pop_char_from_buffer() -> Option<u8> {
     if let Some(c) = read_serial_char_if_available() {
         return Some(c);
@@ -87,7 +90,6 @@ pub enum KeyEvent {
     None,
 }
 
-// 💡 جدول فك شفرات Scancode كامل يدعم جميع علامات الترقيم والحروف الخاصة
 pub fn handle_scancode(scancode: u8) -> KeyEvent {
     if scancode == 0xE0 {
         EXTENDED_PREFIX.store(true, Ordering::Relaxed);
@@ -136,11 +138,11 @@ pub fn handle_scancode(scancode: u8) -> KeyEvent {
 
     if ctrl {
         return match scancode {
-            0x1F => KeyEvent::CtrlS, // S
-            0x10 => KeyEvent::CtrlQ, // Q
-            0x2E => KeyEvent::CtrlC, // C (Copy)
-            0x2F => KeyEvent::CtrlV, // V (Paste)
-            0x2D => KeyEvent::CtrlX, // X (Cut)
+            0x1F => KeyEvent::CtrlS,
+            0x10 => KeyEvent::CtrlQ,
+            0x2E => KeyEvent::CtrlC,
+            0x2F => KeyEvent::CtrlV,
+            0x2D => KeyEvent::CtrlX,
             _ => KeyEvent::None,
         };
     }
@@ -184,7 +186,7 @@ pub fn handle_scancode(scancode: u8) -> KeyEvent {
         0x26 => if shift { 'L' } else { 'l' },
         0x27 => if shift { ':' } else { ';' },
         0x28 => if shift { '"' } else { '\'' },
-        0x29 => if shift { '~' } else { '`' }, // 💡 دعم محرف المدة ~ وعلامة `
+        0x29 => if shift { '~' } else { '`' },
         0x2B => if shift { '|' } else { '\\' },
         0x2C => if shift { 'Z' } else { 'z' },
         0x2D => if shift { 'X' } else { 'x' },

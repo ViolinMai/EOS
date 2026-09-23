@@ -33,7 +33,6 @@ pub struct Ext2Superblock {
     pub rev_level: u32,
     pub def_resuid: u16,
     pub def_resgid: u16,
-    // Fields for EXT2_DYNAMIC_REV
     pub first_ino: u32,
     pub inode_size: u16,
     pub block_group_nr: u16,
@@ -81,6 +80,7 @@ pub struct Ext2Inode {
 pub struct Ext2Driver {
     pub drive: u8,
     pub block_size: usize,
+    #[allow(dead_code)]
     pub inodes_per_group: usize,
     pub inode_size: usize,
     pub inode_table_block: u32,
@@ -128,7 +128,6 @@ impl Ext2Driver {
         let mut remaining = inode_size;
         let mut block_buf = alloc::vec![0u8; self.block_size];
 
-        // قراءة البلوكات المباشرة (Direct Blocks: 0..12)
         for i in 0..12 {
             if remaining == 0 { break; }
             let blk = { inode.block[i] };
@@ -140,7 +139,6 @@ impl Ext2Driver {
             remaining -= to_copy;
         }
 
-        // قراءة البلوك غير المباشر الأحادي (Singly Indirect: Block 12)
         let block_12 = { inode.block[12] };
         if remaining > 0 && block_12 != 0 {
             let mut indirect_buf = alloc::vec![0u8; self.block_size];

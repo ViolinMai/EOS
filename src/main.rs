@@ -166,8 +166,6 @@ pub extern "C" fn _start() -> ! {
     drivers::mouse::init();
     log_info!("KERNEL", "PS/2 Mouse driver initialized (IRQ 12 active).");
 
-    arch::x86_64::syscall::init();
-
     let hhdm_offset = HHDM_REQUEST.response().expect("Limine HHDM missing").offset;
     
     if let Some(memmap) = MEMMAP_REQUEST.response() {
@@ -179,6 +177,9 @@ pub extern "C" fn _start() -> ! {
     unsafe {
         mm::paging::VirtualMemoryManager::init(hhdm_offset);
     }
+
+    // 💡 تفعيل الـ Syscalls بعد تجهيز الـ VMM والـ PMM بالكامل
+    arch::x86_64::syscall::init();
 
     drivers::pci::init();
     drivers::ata::init();
@@ -196,7 +197,7 @@ pub extern "C" fn _start() -> ! {
                 unsafe {
                     let raw_ptr = (*cpu) as *const MpInfo as *const u8;
                     let goto_addr_ptr = raw_ptr.add(16) as *mut usize;
-                    core::ptr::write_volatile(goto_addr_ptr, ap_entry as usize);
+                    core::ptr::write_volatile(goto_addr_ptr, ap_entry as *const () as usize);
                 }
             }
         }
@@ -249,15 +250,13 @@ pub extern "C" fn _start() -> ! {
     }
 }
 
-// 💡 نظام Panic مفصل يسجل كل معلومات الانهيار بدقة
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    let location_str = if let Some(loc) = info.location() {
+    if let Some(loc) = info.location() {
         serial_println!("\n\x1b[31;1m[PANIC OCCURRED]\x1b[0m File: {}:{}:{}", loc.file(), loc.line(), loc.column());
     } else {
         serial_println!("\n\x1b[31;1m[PANIC OCCURRED]\x1b[0m (Unknown Location)");
     };
-    let _ = location_str;
 
     serial_println!("\x1b[31m[REASON]: {}\x1b[0m", info.message());
     log_fatal!("PANIC", "CRASH: {}", info);

@@ -103,23 +103,24 @@ pub fn init() {
         };
 
         asm!(
-            "lgdt [{desc}]",
+            "sub rsp, 128",
+            "lgdt [{0}]",
             "push 0x08",
-            "lea rax, [2f + rip]",
+            "lea rax, [rip + 2f]",
             "push rax",
             "retfq",
             "2:",
+            "add rsp, 128",
             "mov ax, 0x10",
             "mov ds, ax",
             "mov es, ax",
             "mov fs, ax",
             "mov gs, ax",
             "mov ss, ax",
-            desc = in(reg) &desc,
+            in(reg) &desc,
             out("rax") _,
-            options(nomem, preserves_flags)
         );
 
-        asm!("ltr cx", in("cx") TSS_SELECTOR, options(nomem, nostack, preserves_flags));
+        asm!("ltr cx", in("cx") TSS_SELECTOR, options(nostack, preserves_flags));
     }
 }

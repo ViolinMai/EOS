@@ -69,6 +69,7 @@ impl TarArchive {
         Self { files }
     }
 
+    #[allow(dead_code)]
     pub fn read_file(&self, filename: &str) -> Option<&'static str> {
         let clean_name = filename.trim().strip_prefix("./").unwrap_or(filename.trim());
         for file in &self.files {
@@ -87,8 +88,6 @@ pub unsafe fn init(base_ptr: *const u8, total_size: usize) {
     let archive = unsafe { TarArchive::parse(base_ptr, total_size) };
     log_info!("TarFS: Ramdisk mounted ({} files found).", archive.files.len());
 
-    // 🔍 تشخيص: اطبع أول 33 بايت من icon.png زي ما هي بذاكرة الكيرنل،
-    // مباشرة بعد تحليل TAR وقبل أي تعامل مع userspace إطلاقًا
     unsafe {
         if let Some(icon) = archive.files.iter().find(|f| f.name == "icon.png") {
             let bytes = core::slice::from_raw_parts(icon.data_ptr, 33);

@@ -5,6 +5,7 @@ use core::mem::MaybeUninit;
 
 pub const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MB
 
+#[allow(dead_code)]
 #[repr(align(4096))]
 pub struct HeapStorage(pub [u8; HEAP_SIZE]);
 

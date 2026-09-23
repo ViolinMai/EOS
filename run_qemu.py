@@ -248,7 +248,6 @@ def make_uefi_fat32_disk(img_path, files):
     with open(img_path, "wb") as f:
         f.write(disk)
 
-# 💡 إنشاء قرص ext2 نموذجي نظيف ومتوافق مع معايير لينكس
 def make_ext2_disk(img_path):
     BLOCK_SIZE = 1024
     BLOCKS_COUNT = 8192      # 8 MB Disk
@@ -258,27 +257,25 @@ def make_ext2_disk(img_path):
     
     disk = bytearray(BLOCKS_COUNT * BLOCK_SIZE)
     
-    # 1. Superblock عند البايت 1024 (Block 1)
     sb_offset = 1024
     struct.pack_into("<I", disk, sb_offset + 0, INODES_COUNT)
     struct.pack_into("<I", disk, sb_offset + 4, BLOCKS_COUNT)
     struct.pack_into("<I", disk, sb_offset + 8, 0)
-    struct.pack_into("<I", disk, sb_offset + 12, BLOCKS_COUNT - 30) # Free blocks
-    struct.pack_into("<I", disk, sb_offset + 16, INODES_COUNT - 11) # Free inodes
-    struct.pack_into("<I", disk, sb_offset + 20, 1) # First Data Block
-    struct.pack_into("<I", disk, sb_offset + 24, 0) # Block size: 1024 << 0
-    struct.pack_into("<I", disk, sb_offset + 28, 0) # Fragment size
+    struct.pack_into("<I", disk, sb_offset + 12, BLOCKS_COUNT - 30)
+    struct.pack_into("<I", disk, sb_offset + 16, INODES_COUNT - 11)
+    struct.pack_into("<I", disk, sb_offset + 20, 1)
+    struct.pack_into("<I", disk, sb_offset + 24, 0)
+    struct.pack_into("<I", disk, sb_offset + 28, 0)
     struct.pack_into("<I", disk, sb_offset + 32, BLOCKS_PER_GROUP)
     struct.pack_into("<I", disk, sb_offset + 36, BLOCKS_PER_GROUP)
     struct.pack_into("<I", disk, sb_offset + 40, INODES_PER_GROUP)
-    struct.pack_into("<H", disk, sb_offset + 56, 0xEF53) # EXT2_MAGIC
-    struct.pack_into("<H", disk, sb_offset + 58, 1)      # State: Clean
-    struct.pack_into("<H", disk, sb_offset + 64, 0)      # Minor revision
-    struct.pack_into("<I", disk, sb_offset + 76, 1)      # Major revision (Dynamic)
-    struct.pack_into("<I", disk, sb_offset + 84, 11)     # First non-reserved Inode
-    struct.pack_into("<H", disk, sb_offset + 88, 128)    # Inode size: 128 bytes
+    struct.pack_into("<H", disk, sb_offset + 56, 0xEF53)
+    struct.pack_into("<H", disk, sb_offset + 58, 1)
+    struct.pack_into("<H", disk, sb_offset + 64, 0)
+    struct.pack_into("<I", disk, sb_offset + 76, 1)
+    struct.pack_into("<I", disk, sb_offset + 84, 11)
+    struct.pack_into("<H", disk, sb_offset + 88, 128)
     
-    # 2. Block Group Descriptor Table عند Block 2 (Offset 2048)
     bgd_offset = 2048
     block_bitmap = 3
     inode_bitmap = 4
@@ -288,44 +285,35 @@ def make_ext2_disk(img_path):
     struct.pack_into("<I", disk, bgd_offset + 8, inode_table)
     struct.pack_into("<H", disk, bgd_offset + 12, BLOCKS_COUNT - 30)
     struct.pack_into("<H", disk, bgd_offset + 14, INODES_COUNT - 11)
-    struct.pack_into("<H", disk, bgd_offset + 16, 2) # Used dirs count
+    struct.pack_into("<H", disk, bgd_offset + 16, 2)
     
-    # 3. Block Bitmap (Block 3) & Inode Bitmap (Block 4)
-    # حجز البلوكات من 0 إلى 25
     disk[3 * BLOCK_SIZE : 3 * BLOCK_SIZE + 4] = b"\xFF\xFF\xFF\x03"
-    # حجز الـ Inodes من 1 إلى 11
     disk[4 * BLOCK_SIZE : 4 * BLOCK_SIZE + 2] = b"\xFF\x07"
     
-    # 4. Inode Table (Starts at Block 5)
-    # Root Inode هو Inode #2
     inode2_offset = (inode_table * BLOCK_SIZE) + (1 * 128)
     root_data_block = 26
-    struct.pack_into("<H", disk, inode2_offset + 0, 0x41ED) # Mode: Directory | 0755
-    struct.pack_into("<I", disk, inode2_offset + 4, 1024)   # Size: 1024 bytes
-    struct.pack_into("<H", disk, inode2_offset + 26, 2)     # Links count: 2 (. and ..)
-    struct.pack_into("<I", disk, inode2_offset + 28, 2)     # Sectors count (512-byte sectors)
-    struct.pack_into("<I", disk, inode2_offset + 40, root_data_block) # Block pointer 0
+    struct.pack_into("<H", disk, inode2_offset + 0, 0x41ED)
+    struct.pack_into("<I", disk, inode2_offset + 4, 1024)
+    struct.pack_into("<H", disk, inode2_offset + 26, 2)
+    struct.pack_into("<I", disk, inode2_offset + 28, 2)
+    struct.pack_into("<I", disk, inode2_offset + 40, root_data_block)
     
-    # Inode 11: ملف ترحيبي welcome.txt
     file_data_block = 27
     file_content = b"Hello from native Linux EXT2 Filesystem mounted on EOS!\r\nInodes, Block Groups, and VFS abstraction online.\r\n"
     inode11_offset = (inode_table * BLOCK_SIZE) + (10 * 128)
-    struct.pack_into("<H", disk, inode11_offset + 0, 0x81A4) # Mode: Regular File | 0644
+    struct.pack_into("<H", disk, inode11_offset + 0, 0x81A4)
     struct.pack_into("<I", disk, inode11_offset + 4, len(file_content))
     struct.pack_into("<H", disk, inode11_offset + 26, 1)
     struct.pack_into("<I", disk, inode11_offset + 28, 2)
     struct.pack_into("<I", disk, inode11_offset + 40, file_data_block)
     
-    # 5. محتوى مجلد الجذر Root Directory (Block 26)
-    # Entry 1: . (Inode 2)
     r_off = root_data_block * BLOCK_SIZE
-    struct.pack_into("<I", disk, r_off + 0, 2)   # Inode
-    struct.pack_into("<H", disk, r_off + 4, 12)  # Rec len
-    struct.pack_into("<B", disk, r_off + 6, 1)   # Name len
-    struct.pack_into("<B", disk, r_off + 7, 2)   # Type: Dir
+    struct.pack_into("<I", disk, r_off + 0, 2)
+    struct.pack_into("<H", disk, r_off + 4, 12)
+    struct.pack_into("<B", disk, r_off + 6, 1)
+    struct.pack_into("<B", disk, r_off + 7, 2)
     disk[r_off + 8 : r_off + 9] = b"."
     
-    # Entry 2: .. (Inode 2)
     r_off += 12
     struct.pack_into("<I", disk, r_off + 0, 2)
     struct.pack_into("<H", disk, r_off + 4, 12)
@@ -333,17 +321,15 @@ def make_ext2_disk(img_path):
     struct.pack_into("<B", disk, r_off + 7, 2)
     disk[r_off + 8 : r_off + 10] = b".."
     
-    # Entry 3: welcome.txt (Inode 11)
     r_off += 12
     file_name = b"welcome.txt"
-    rec_len = BLOCK_SIZE - 24 # باقي البلوك
+    rec_len = BLOCK_SIZE - 24
     struct.pack_into("<I", disk, r_off + 0, 11)
     struct.pack_into("<H", disk, r_off + 4, rec_len)
     struct.pack_into("<B", disk, r_off + 6, len(file_name))
-    struct.pack_into("<B", disk, r_off + 7, 1) # Type: Reg
+    struct.pack_into("<B", disk, r_off + 7, 1)
     disk[r_off + 8 : r_off + 8 + len(file_name)] = file_name
     
-    # 6. محتوى الملف welcome.txt (Block 27)
     disk[file_data_block * BLOCK_SIZE : file_data_block * BLOCK_SIZE + len(file_content)] = file_content
     
     with open(img_path, "wb") as f:
@@ -358,13 +344,14 @@ def prepare_and_run():
         return
 
     print("[*] 2. Building Kernel Binary (EOS)...")
-    res = subprocess.run(["cargo", "build"], shell=True)
+    # 💡 بناء الكيرنل في وضع الـ Release ليطير بأقصى سرعة ولا يعلق في التصفير
+    res = subprocess.run(["cargo", "build", "--release"], shell=True)
     if res.returncode != 0:
         print("[-] Kernel build failed.")
         return
 
     target_dir = "target"
-    kernel_src = os.path.join(target_dir, "x86_64-unknown-none", "debug", "EOS")
+    kernel_src = os.path.join(target_dir, "x86_64-unknown-none", "release", "EOS")
     bootx64_path = os.path.join(target_dir, "BOOTX64.EFI")
 
     if not os.path.exists(bootx64_path) or os.path.getsize(bootx64_path) == 0:
@@ -425,10 +412,6 @@ def prepare_and_run():
 
     print(f"[✓] Booting QEMU with 8 Cores, FAT32 Storage + Native Linux ext2 RootFS...")
     
-    # 💡 3 أقراص متكاملة:
-    # 1. ide.0 unit 0: قرص الإقلاع (FAT32 EFI)
-    # 2. ide.0 unit 1: قرص المشاركة مع ويندوز (FAT32 VVFAT)
-    # 3. ide.1 unit 0: قرص لينكس الأصلي (Native ext2 RootFS)
     qemu_cmd = [
         "qemu-system-x86_64",
         "-M", "q35",

@@ -8,6 +8,7 @@ use core::ptr::addr_of_mut;
 
 #[derive(Clone)]
 pub struct Window {
+    #[allow(dead_code)]
     pub id: usize,
     pub x: usize,
     pub y: usize,
@@ -309,7 +310,6 @@ fn draw_glass_taskbar(buf: &mut [u32], fb_w: usize, fb_h: usize) {
     draw_text_rendered(buf, fb_w, fb_h, fb_w.saturating_sub(230), start_y.saturating_add(13), "[Core 1: 60 FPS Smooth]", 0xFF6EE7B7);
 }
 
-// 💡 دالة زر زجاجية بأنواع بيانات متطابقة (u32) لمنع أخطاء التطابق
 fn draw_glass_button(buf: &mut [u32], fb_w: usize, fb_h: usize, x: usize, y: usize, w: usize, h: usize, col_top: u32, col_bot: u32) {
     if h == 0 || w == 0 { return; }
     let max_y = y.saturating_add(h).min(fb_h);

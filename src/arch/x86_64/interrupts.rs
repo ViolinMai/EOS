@@ -12,7 +12,7 @@ use crate::fs::{vfs_list_all, vfs_read_bytes, VfsNode};
 use crate::mm::heap::{HEAP_ALLOCATOR, HEAP_SIZE};
 use crate::task::{dispatch_job, get_job_state, yield_now, JobState, SCHEDULER};
 use crate::writer::WRITER;
-use crate::{log_error, log_fatal, log_info, log_warn, CORES_ONLINE, CORE_HEARTBEAT};
+use crate::{log_error, log_fatal, log_info, log_warn, serial_println, CORES_ONLINE, CORE_HEARTBEAT};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::arch::{asm, naked_asm};
@@ -32,7 +32,6 @@ pub static IS_RUNNING_PROGRAM: AtomicBool = AtomicBool::new(false);
 pub static GUI_ACTIVE: AtomicBool = AtomicBool::new(false);
 static MOUSE_BLINK_STATE: AtomicBool = AtomicBool::new(true);
 
-// 💡 قناة الذاكرة الذرية المشتركة بين Core 0 و Core 1 Compositor
 pub static SHARED_MOUSE_X: AtomicIsize = AtomicIsize::new(200);
 pub static SHARED_MOUSE_Y: AtomicIsize = AtomicIsize::new(200);
 pub static SHARED_MOUSE_BUTTONS: AtomicU64 = AtomicU64::new(0);
@@ -243,9 +242,8 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: Interrupt
     unsafe {
         let scancode = read_scancode();
 
-        // 💡 إتاحة إغلاق الـ Compositor والعودة للشل بمفتاح Escape
         if GUI_ACTIVE.load(Ordering::Relaxed) {
-            if scancode == 0x01 { // Escape key
+            if scancode == 0x01 {
                 GUI_ACTIVE.store(false, Ordering::SeqCst);
                 if let Some(writer) = &mut *addr_of_mut!(WRITER) {
                     writer.restore_screen();
@@ -502,7 +500,6 @@ pub fn execute_command(cmd: &str) {
         "help" => {
             log_info!("SHELL", "Commands: gui, bench, cores, ls, cat <file>, view <file>, hana <file>, history, top, ps, uptime, reboot, clear");
         }
-        // 💡 أمر إطلاق سطح المكتب المنفصل على النواة المخصصة (Core 1)
         "gui" | "desktop" => {
             log_info!("DESKTOP", "Dispatching Dedicated GUI Compositor to Core 1...");
             unsafe {
@@ -763,9 +760,13 @@ pub extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFr
     loop { core::hint::spin_loop(); }
 }
 
+// 💡 طباعة مباشرة لعنوان الـ Page Fault ورقم الخطأ على Serial فوراً دون قفل
 pub extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
     let cr2: u64;
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)); }
+    serial_println!("\n\x1b[31;1m[PAGE FAULT EXCEPTION]\x1b[0m Address (CR2): {:#018x} | Code: {:#b} | RIP: {:#018x}",
+        cr2, error_code, stack_frame.instruction_pointer
+    );
     log_fatal!("MMU", "PAGE FAULT on Address {:#018x} (Error: {:#b}) at RIP {:#018x} | CS: {:#x}", cr2, error_code, stack_frame.instruction_pointer, stack_frame.code_segment);
 
     if (stack_frame.code_segment & 3) != 0 {

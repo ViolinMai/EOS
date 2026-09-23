@@ -1,3 +1,4 @@
+#![allow(unused_unsafe)]
 use crate::arch::x86_64::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::arch::x86_64::keyboard::clear_keyboard_buffer;
 use crate::arch::x86_64::syscall::ELF_EXIT_REQUESTED;
@@ -64,13 +65,15 @@ extern "C" fn jump_to_ring3(entry: u64, rsp: u64, user_cs: u64, user_ds: u64) {
 
         "mov [{kernel_sp}], rsp",
 
-        "push rcx",         // SS
-        "push rsi",         // RSP
-        "push 0x202",       // RFLAGS (IF=1)
-        "push rdx",         // CS
-        "push rdi",         // RIP
-        "iretq",
+        "push rcx",
+        "push rsi",
+        "push 0x202",
+        "push rdx",
+        "push rdi",
+        
+        "swapgs",
 
+        "iretq",
         kernel_sp = sym crate::arch::x86_64::syscall::KERNEL_SAVED_RSP,
     );
 }
@@ -109,9 +112,9 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
     let pdpt = unsafe { &mut *((pdpt_phys + vmm.hhdm_offset) as *mut PageTable) };
     let pd = unsafe { &mut *((pd_phys + vmm.hhdm_offset) as *mut PageTable) };
 
-    for i in 0..512 {
-        pdpt.entries[i].0 = 0;
-        pd.entries[i].0 = 0;
+    unsafe {
+        core::ptr::write_bytes(pdpt as *mut PageTable as *mut u8, 0, 4096);
+        core::ptr::write_bytes(pd as *mut PageTable as *mut u8, 0, 4096);
     }
 
     let user_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
@@ -146,7 +149,7 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
                 if !pd.entries[p2_idx].is_present() {
                     let pt_phys = frame_alloc.allocate_frame().ok_or("OOM: PT")?;
                     let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
-                    for j in 0..512 { pt.entries[j].0 = 0; }
+                    unsafe { core::ptr::write_bytes(pt as *mut PageTable as *mut u8, 0, 4096); }
                     pd.entries[p2_idx].set(pt_phys, user_flags);
                 }
 
@@ -156,9 +159,7 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
                 if !pt.entries[p1_idx].is_present() {
                     let frame_phys = frame_alloc.allocate_frame().ok_or("OOM: User Frame")?;
                     let frame_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
-                    unsafe {
-                        for k in 0..4096 { *frame_ptr.add(k) = 0; }
-                    }
+                    unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
                     pt.entries[p1_idx].set(frame_phys, user_flags);
                     unsafe { invalidate_tlb(curr_vaddr); }
                 }
@@ -196,7 +197,7 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
         }
     }
 
-    let stack_pages = 32;
+    let stack_pages = 64; 
     let stack_start = USER_STACK_TOP - (stack_pages * 4096);
     for i in 0..stack_pages {
         let curr_vaddr = stack_start + (i * 4096);
@@ -206,7 +207,7 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
         if !pd.entries[p2_idx].is_present() {
             let pt_phys = frame_alloc.allocate_frame().ok_or("OOM: PT Stack")?;
             let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
-            for j in 0..512 { pt.entries[j].0 = 0; }
+            unsafe { core::ptr::write_bytes(pt as *mut PageTable as *mut u8, 0, 4096); }
             pd.entries[p2_idx].set(pt_phys, user_flags);
         }
 
@@ -216,9 +217,7 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
         if !pt.entries[p1_idx].is_present() {
             let frame_phys = frame_alloc.allocate_frame().ok_or("OOM: Stack Frame")?;
             let frame_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
-            unsafe {
-                for k in 0..4096 { *frame_ptr.add(k) = 0; }
-            }
+            unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
             pt.entries[p1_idx].set(frame_phys, user_flags);
             unsafe { invalidate_tlb(curr_vaddr); }
         }
@@ -232,7 +231,7 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
         if !pd.entries[p2_idx].is_present() {
             let pt_phys = frame_alloc.allocate_frame().ok_or("OOM: PT IPC")?;
             let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
-            for j in 0..512 { pt.entries[j].0 = 0; }
+            unsafe { core::ptr::write_bytes(pt as *mut PageTable as *mut u8, 0, 4096); }
             pd.entries[p2_idx].set(pt_phys, user_flags);
         }
 
@@ -241,10 +240,10 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
 
         let frame_phys = frame_alloc.allocate_frame().ok_or("OOM: IPC Frame")?;
         let ipc_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
+        unsafe { core::ptr::write_bytes(ipc_ptr, 0, 4096); }
+        let bytes = arg.as_bytes();
+        let len = core::cmp::min(bytes.len(), 255);
         unsafe {
-            for k in 0..4096 { *ipc_ptr.add(k) = 0; }
-            let bytes = arg.as_bytes();
-            let len = core::cmp::min(bytes.len(), 255);
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), ipc_ptr, len);
         }
         pt.entries[p1_idx].set(frame_phys, user_flags);
