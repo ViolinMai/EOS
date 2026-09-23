@@ -1,0 +1,26 @@
+# Rust build artifacts
+target/
+userspace/target/
+**/*.rs.bk
+
+# Generated OS disk images and firmware variables
+*.img
+vars.fd
+
+# Logs and runtime dumps
+*.log
+qemu.log
+full_project_dump.txt
+patch.txt
+
+# Limine downloaded EFI binary (downloaded dynamically via run_qemu.py)
+BOOTX64.EFI
+
+# IDEs & System files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Live host share folder (do not push shared Windows files)
+disk_share/
