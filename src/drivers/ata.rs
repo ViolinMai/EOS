@@ -7,6 +7,7 @@ const ATA_PRIMARY_IO_BASE: u16 = 0x1F0;
 const ATA_SECONDARY_IO_BASE: u16 = 0x170;
 
 const ATA_REG_DATA: u16 = 0;
+#[allow(dead_code)]
 const ATA_REG_ERROR: u16 = 1;
 const ATA_REG_SECTOR_CNT: u16 = 2;
 const ATA_REG_LBA_LO: u16 = 3;

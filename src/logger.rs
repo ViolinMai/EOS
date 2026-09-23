@@ -1,6 +1,7 @@
 use crate::serial_print;
 use crate::writer::WRITER;
 use core::fmt;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 #[allow(dead_code)]
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -14,6 +15,8 @@ pub enum LogLevel {
 
 pub struct KernelLogger;
 
+static PRINT_LOCK: AtomicBool = AtomicBool::new(false);
+
 #[inline(always)]
 fn get_current_core_id() -> u32 {
     let cpuid = core::arch::x86_64::__cpuid(1);
@@ -22,6 +25,11 @@ fn get_current_core_id() -> u32 {
 
 impl KernelLogger {
     pub fn log(level: LogLevel, subsystem: &'static str, args: fmt::Arguments) {
+        // قفل ذري Spinlock لمنع التداخل بين الأنوية عند الطباعة
+        while PRINT_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+            core::hint::spin_loop();
+        }
+
         let (tag, color_prefix) = match level {
             LogLevel::Debug => ("[DEBUG]", "\x1b[36m"),
             LogLevel::Info  => ("[INFO] ", "\x1b[32m"),
@@ -49,17 +57,22 @@ impl KernelLogger {
 
         unsafe {
             if let Some(writer) = &mut *core::ptr::addr_of_mut!(WRITER) {
-                writer.write_str(tag, r, g, b);
-                writer.write_str(" [C", 100, 116, 139);
-                let c_char = (b'0' + (core_id as u8 % 10)) as char;
-                writer.write_char(c_char, 56, 189, 248);
-                writer.write_str("] [", 100, 116, 139);
-                writer.write_str(subsystem, 148, 163, 184);
-                writer.write_str("] ", 100, 116, 139);
-                writer.write_fmt(args, 241, 245, 249);
-                writer.write_char('\n', 255, 255, 255);
+                // إذا كانت الواجهة الرسومية نشطة لا نكتب في Framebuffer مباشرة لمنع تشويه الرسم
+                if !crate::arch::x86_64::interrupts::GUI_ACTIVE.load(Ordering::Relaxed) {
+                    writer.write_str(tag, r, g, b);
+                    writer.write_str(" [C", 100, 116, 139);
+                    let c_char = (b'0' + (core_id as u8 % 10)) as char;
+                    writer.write_char(c_char, 56, 189, 248);
+                    writer.write_str("] [", 100, 116, 139);
+                    writer.write_str(subsystem, 148, 163, 184);
+                    writer.write_str("] ", 100, 116, 139);
+                    writer.write_fmt(args, 241, 245, 249);
+                    writer.write_char('\n', 255, 255, 255);
+                }
             }
         }
+
+        PRINT_LOCK.store(false, Ordering::Release);
     }
 }
 

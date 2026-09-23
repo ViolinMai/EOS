@@ -20,9 +20,7 @@ unsafe fn outb(port: u16, val: u8) {
 
 #[inline]
 unsafe fn io_wait() {
-    unsafe {
-        outb(0x80, 0);
-    }
+    unsafe { outb(0x80, 0); }
 }
 
 pub unsafe fn remap() {
@@ -32,10 +30,8 @@ pub unsafe fn remap() {
         outb(PIC2_COMMAND, ICW1_INIT | ICW1_ICW4);
         io_wait();
 
-        // Master IRQs: 32..39
         outb(PIC1_DATA, 32);
         io_wait();
-        // Slave IRQs: 40..47
         outb(PIC2_DATA, 40);
         io_wait();
 
@@ -49,14 +45,8 @@ pub unsafe fn remap() {
         outb(PIC2_DATA, ICW4_8086);
         io_wait();
 
-        // تفعيل IRQ0 (Timer)، IRQ1 (Keyboard)، و IRQ2 (Cascade to Slave)
-        // Bit 0 = Timer (0)
-        // Bit 1 = Keyboard (0)
-        // Bit 2 = Slave Cascade (0)
-        outb(PIC1_DATA, 0b1111_1000);
-
-        // تفعيل IRQ12 على Slave (Mouse):
-        // IRQ12 يقابل Bit 4 في الـ Slave PIC (8 + 4 = 12)
+        // تفعيل IRQ0..IRQ4 لتعمل منافذ COM مع الـ Timer والـ Keyboard
+        outb(PIC1_DATA, 0b1110_0000);
         outb(PIC2_DATA, 0b1110_1111);
     }
 }

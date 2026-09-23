@@ -1,7 +1,7 @@
 #![allow(unused_unsafe)]
 use crate::arch::x86_64::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::arch::x86_64::keyboard::clear_keyboard_buffer;
-use crate::arch::x86_64::syscall::ELF_EXIT_REQUESTED;
+use crate::arch::x86_64::syscall::{ELF_EXIT_REQUESTED, reset_core2_process};
 use crate::log_info;
 use crate::mm::paging::{invalidate_tlb, read_cr3, PageTable, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
 use crate::mm::paging::VMM;
@@ -65,45 +65,32 @@ extern "C" fn jump_to_ring3(entry: u64, rsp: u64, user_cs: u64, user_ds: u64) {
 
         "mov [{kernel_sp}], rsp",
 
-        "push rcx",       // SS (User Data)
-        "push rsi",       // RSP (User Stack)
-        "push 0x202",     // RFLAGS (IF enabled)
-        "push rdx",       // CS (User Code)
-        "push rdi",       // RIP (User Entry Point)
+        "push rcx",       
+        "push rsi",       
+        "push 0x202",     
+        "push rdx",       
+        "push rdi",       
 
-        "swapgs",         // 💡 ضرورية جداً عند التحول إلى Ring 3
+        "swapgs",         
         "iretq",
         kernel_sp = sym crate::arch::x86_64::syscall::KERNEL_SAVED_RSP,
     );
 }
 
 pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
-    if data.len() < core::mem::size_of::<Elf64Header>() {
-        return Err("File smaller than ELF header");
-    }
-
+    if data.len() < core::mem::size_of::<Elf64Header>() { return Err("File smaller than ELF header"); }
     let header = unsafe { *(data.as_ptr() as *const Elf64Header) };
+    if header.magic != ELF_MAGIC { return Err("Invalid ELF magic identifier"); }
+    if header.class != 2 || header.machine != 0x3E { return Err("Binary is not x86_64 64-bit"); }
 
-    if header.magic != ELF_MAGIC {
-        return Err("Invalid ELF magic identifier");
-    }
-
-    if header.class != 2 || header.machine != 0x3E {
-        return Err("Binary is not x86_64 64-bit");
-    }
+    reset_core2_process(); // 💡 تهيئة فضاء الـ Process المعزول لتجنب الـ Race Condition
 
     let phoff = header.phoff as usize;
     let phnum = header.phnum as usize;
     let phentsize = header.phentsize as usize;
 
     let vmm = unsafe { (&*addr_of_mut!(VMM)).as_ref().ok_or("VMM not initialized")? };
-    
-    let frame_alloc = unsafe {
-        let alloc_ptr = addr_of_mut!(crate::mm::frame::FRAME_ALLOCATOR);
-        (*alloc_ptr).as_mut().ok_or("PMM not initialized")?
-    };
-
-    log_info!("ELF", "Allocating and mapping physical memory for Userspace...");
+    let frame_alloc = unsafe { (*addr_of_mut!(crate::mm::frame::FRAME_ALLOCATOR)).as_mut().ok_or("PMM not initialized")? };
 
     let pdpt_phys = frame_alloc.allocate_frame().ok_or("OOM: Failed to allocate PDPT")?;
     let pd_phys = frame_alloc.allocate_frame().ok_or("OOM: Failed to allocate PD")?;
@@ -117,7 +104,6 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
     }
 
     let user_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-
     let pml4_phys = read_cr3() & 0x000F_FFFF_FFFF_F000;
     let pml4 = unsafe { &mut *((pml4_phys + vmm.hhdm_offset) as *mut PageTable) };
     pml4.entries[0].set(pdpt_phys, user_flags);
@@ -125,9 +111,7 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
 
     for i in 0..phnum {
         let ph_offset = phoff + (i * phentsize);
-        if ph_offset + core::mem::size_of::<Elf64ProgramHeader>() > data.len() {
-            return Err("Program header out of bounds");
-        }
+        if ph_offset + core::mem::size_of::<Elf64ProgramHeader>() > data.len() { return Err("Program header out of bounds"); }
 
         let ph = unsafe { *(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
@@ -182,11 +166,7 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
                     let copy_size = core::cmp::min(remaining, 4096 - page_offset);
 
                     let dest_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
-                    core::ptr::copy_nonoverlapping(
-                        data.as_ptr().add(data_offset),
-                        dest_ptr.add(page_offset),
-                        copy_size
-                    );
+                    core::ptr::copy_nonoverlapping(data.as_ptr().add(data_offset), dest_ptr.add(page_offset), copy_size);
 
                     remaining -= copy_size;
                     data_offset += copy_size;
@@ -242,9 +222,7 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
         unsafe { core::ptr::write_bytes(ipc_ptr, 0, 4096); }
         let bytes = arg.as_bytes();
         let len = core::cmp::min(bytes.len(), 255);
-        unsafe {
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), ipc_ptr, len);
-        }
+        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ipc_ptr, len); }
         pt.entries[p1_idx].set(frame_phys, user_flags);
         unsafe { invalidate_tlb(curr_vaddr); }
     }
@@ -253,17 +231,12 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
 
     let actual_entry = header.entry;
     ELF_EXIT_REQUESTED.store(false, Ordering::SeqCst);
-    log_info!("ELF", "Executing Ring 3 Entry: {:#010x}", actual_entry);
+    log_info!("ELF", "Context Jump -> Ring 3 Entry: {:#010x}", actual_entry);
 
     unsafe {
-        jump_to_ring3(
-            actual_entry,
-            USER_STACK_TOP - 0x2000,
-            USER_CODE_SELECTOR as u64,
-            USER_DATA_SELECTOR as u64,
-        );
+        jump_to_ring3(actual_entry, USER_STACK_TOP - 0x2000, USER_CODE_SELECTOR as u64, USER_DATA_SELECTOR as u64);
     }
 
-    log_info!("ELF", "Process completed cleanly, returned to Kernel Shell.");
+    log_info!("ELF", "Process execution completed cleanly.");
     Ok(())
 }

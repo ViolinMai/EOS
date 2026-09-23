@@ -1,16 +1,16 @@
 use core::arch::asm;
-use core::ptr::{addr_of, addr_of_mut};
+use core::ptr::addr_of_mut;
 
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
-#[allow(dead_code)]
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
-#[allow(dead_code)]
 pub const USER_DATA_SELECTOR: u16 = 0x18 | 3;
-#[allow(dead_code)]
 pub const USER_CODE_SELECTOR: u16 = 0x20 | 3;
 pub const TSS_SELECTOR: u16 = 0x28;
 
+pub const MAX_CORES: usize = 8;
+
 #[repr(C, packed)]
+#[derive(Copy, Clone)]
 pub struct TaskStateSegment {
     reserved1: u32,
     pub rsp0: u64,
@@ -51,14 +51,11 @@ impl TaskStateSegment {
     }
 }
 
-pub static mut TSS: TaskStateSegment = TaskStateSegment::zeroed();
-
+#[derive(Copy, Clone)]
 #[repr(C, align(16))]
 pub struct Gdt {
     pub entries: [u64; 8],
 }
-
-pub static mut GDT: Gdt = Gdt { entries: [0; 8] };
 
 #[repr(C, packed)]
 struct GdtDescriptor {
@@ -66,24 +63,43 @@ struct GdtDescriptor {
     base: u64,
 }
 
-static mut EMERGENCY_STACK: [u8; 8192] = [0; 8192];
-static mut KERNEL_SYSCALL_STACK: [u8; 8192] = [0; 8192];
+#[derive(Copy, Clone)]
+#[repr(align(16))]
+struct CoreStacks {
+    emergency: [u8; 8192],
+    syscall: [u8; 8192],
+}
 
-pub fn init() {
+static mut GDTS: [Gdt; MAX_CORES] = [Gdt { entries: [0; 8] }; MAX_CORES];
+static mut TSSES: [TaskStateSegment; MAX_CORES] = [TaskStateSegment::zeroed(); MAX_CORES];
+static mut STACKS: [CoreStacks; MAX_CORES] = [CoreStacks { emergency: [0; 8192], syscall: [0; 8192] }; MAX_CORES];
+
+pub fn init_core(core_id: usize) {
+    if core_id >= MAX_CORES {
+        return;
+    }
+
     unsafe {
-        let stack_top = addr_of_mut!(EMERGENCY_STACK) as *mut u8 as u64 + 8192;
-        let syscall_stack_top = addr_of_mut!(KERNEL_SYSCALL_STACK) as *mut u8 as u64 + 8192;
+        let tss = &mut (*addr_of_mut!(TSSES))[core_id];
+        let st = &mut (*addr_of_mut!(STACKS))[core_id];
 
-        TSS.ist1 = stack_top;
-        TSS.rsp0 = syscall_stack_top;
+        let stack_top = st.emergency.as_ptr() as u64 + 8192;
+        let syscall_stack_top = st.syscall.as_ptr() as u64 + 8192;
 
-        GDT.entries[0] = 0;
-        GDT.entries[1] = 0x00AF9A000000FFFF;
-        GDT.entries[2] = 0x00CF92000000FFFF;
-        GDT.entries[3] = 0x00CFF2000000FFFF;
-        GDT.entries[4] = 0x00AFFA000000FFFF;
+        tss.ist1 = stack_top;
+        tss.rsp0 = syscall_stack_top;
 
-        let tss_base = addr_of!(TSS) as u64;
+        // مزامنة مكدس الـ Syscall للنواة المحددة
+        crate::arch::x86_64::syscall::KERNEL_SYSCALL_STACKS[core_id] = syscall_stack_top;
+
+        let gdt = &mut (*addr_of_mut!(GDTS))[core_id];
+        gdt.entries[0] = 0;
+        gdt.entries[1] = 0x00AF9A000000FFFF; // Kernel Code
+        gdt.entries[2] = 0x00CF92000000FFFF; // Kernel Data
+        gdt.entries[3] = 0x00CFF2000000FFFF; // User Data
+        gdt.entries[4] = 0x00AFFA000000FFFF; // User Code
+
+        let tss_base = tss as *const _ as u64;
         let tss_limit = (core::mem::size_of::<TaskStateSegment>() - 1) as u64;
 
         let mut tss_low = 0x0000890000000000u64;
@@ -91,15 +107,13 @@ pub fn init() {
         tss_low |= (tss_base & 0xFFFFFF) << 16;
         tss_low |= (tss_base & 0xFF000000) << 32;
 
-        let tss_high = tss_base >> 32;
-
-        GDT.entries[5] = tss_low;
-        GDT.entries[6] = tss_high;
-        GDT.entries[7] = 0;
+        gdt.entries[5] = tss_low;
+        gdt.entries[6] = tss_base >> 32;
+        gdt.entries[7] = 0;
 
         let desc = GdtDescriptor {
             limit: (core::mem::size_of::<Gdt>() - 1) as u16,
-            base: addr_of!(GDT) as u64,
+            base: gdt as *const _ as u64,
         };
 
         asm!(

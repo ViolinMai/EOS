@@ -63,36 +63,6 @@ pub static CORE_HEARTBEAT: [AtomicU64; 8] = [
 
 extern "C" fn main_shell_entry() {}
 
-extern "C" fn background_worker_one() {
-    loop {
-        unsafe {
-            if let Some(sched) = &mut *core::ptr::addr_of_mut!(task::SCHEDULER) {
-                if sched.tasks.len() > 1 {
-                    sched.tasks[1].counter += 1;
-                }
-            }
-        }
-        for _ in 0..100_000 {
-            core::hint::spin_loop();
-        }
-    }
-}
-
-extern "C" fn background_worker_two() {
-    loop {
-        unsafe {
-            if let Some(sched) = &mut *core::ptr::addr_of_mut!(task::SCHEDULER) {
-                if sched.tasks.len() > 2 {
-                    sched.tasks[2].counter += 1;
-                }
-            }
-        }
-        for _ in 0..100_000 {
-            core::hint::spin_loop();
-        }
-    }
-}
-
 unsafe fn extract_limine_file_info(file_ref: &limine::file::File) -> (*const u8, usize) {
     let raw_ptr = file_ref as *const _ as *const u8;
     unsafe {
@@ -104,93 +74,75 @@ unsafe fn extract_limine_file_info(file_ref: &limine::file::File) -> (*const u8,
 
 extern "C" fn ap_entry(info: &MpInfo) -> ! {
     let cpu_id = info.lapic_id as usize;
-    
+
+    // 💡 تحميل الـ GDT والـ TSS المستقل فوراً لكل AP
+    arch::x86_64::gdt::init_core(cpu_id);
+
     unsafe { 
-        arch::x86_64::idt::InterruptDescriptorTable::load_raw(
-            core::ptr::addr_of!(arch::x86_64::interrupts::IDT)
-        );
+        arch::x86_64::idt::InterruptDescriptorTable::load_raw(core::ptr::addr_of!(arch::x86_64::interrupts::IDT));
     };
 
-    CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
+    // 💡 إعداد الـ Syscalls الخاص بهذه النواة
+    arch::x86_64::syscall::init_core_syscall(cpu_id);
 
+    CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
+    
     loop {
         if cpu_id < 8 {
             CORE_HEARTBEAT[cpu_id].fetch_add(1, Ordering::Relaxed);
             task::core_poll_and_execute(cpu_id);
         }
-        for _ in 0..500 {
-            core::hint::spin_loop();
-        }
+        for _ in 0..200 { core::hint::spin_loop(); }
     }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     serial::SERIAL1.init();
+    serial::SERIAL2.init(); 
+    
     serial_println!("\n==========================================");
     serial_println!("[EOS] SERIAL CONSOLE INITIALIZED");
-
-    let mut fb_w = 0usize;
-    let mut fb_h = 0usize;
 
     if let Some(fb_response) = FRAMEBUFFER_REQUEST.response() {
         if let Some(&framebuffer) = fb_response.framebuffers().first() {
             let buffer_ptr = framebuffer.address() as *mut u8;
-            fb_w = framebuffer.width as usize;
-            fb_h = framebuffer.height as usize;
+            let fb_w = framebuffer.width as usize;
+            let fb_h = framebuffer.height as usize;
             let pitch = framebuffer.pitch as usize;
 
             unsafe {
                 let mut w = FrameWriter::new(buffer_ptr, fb_w, fb_h, pitch);
-                w.clear(15, 23, 42);
+                w.clear(10, 15, 26);
                 *core::ptr::addr_of_mut!(WRITER) = Some(w);
             }
         }
     }
 
-    log_info!("KERNEL", "EOS KERNEL (x86_64) ONLINE");
-    log_info!("KERNEL", "Framebuffer Initialized: {}x{} (Pitch: {})", fb_w, fb_h, fb_w * 4);
-
-    arch::x86_64::gdt::init();
-    log_info!("KERNEL", "GDT & TSS loaded with Ring 3 User Segments.");
+    // 💡 تهيئة GDT و TSS النواة الرئيسية (Core 0)
+    arch::x86_64::gdt::init_core(0);
 
     arch::x86_64::interrupts::init();
-    log_info!("KERNEL", "IDT initialized (Timer, Keyboard, Mouse).");
-
     unsafe {
         arch::x86_64::pic::remap();
         arch::x86_64::pit::init();
     }
-    log_info!("KERNEL", "PIT Timer configured @ 100Hz.");
-
     drivers::mouse::init();
-    log_info!("KERNEL", "PS/2 Mouse driver initialized (IRQ 12 active).");
 
     let hhdm_offset = HHDM_REQUEST.response().expect("Limine HHDM missing").offset;
-    
     if let Some(memmap) = MEMMAP_REQUEST.response() {
-        unsafe {
-            *core::ptr::addr_of_mut!(mm::frame::FRAME_ALLOCATOR) = Some(mm::frame::BitmapFrameAllocator::init(memmap.entries(), hhdm_offset));
-        }
+        unsafe { *core::ptr::addr_of_mut!(mm::frame::FRAME_ALLOCATOR) = Some(mm::frame::BitmapFrameAllocator::init(memmap.entries(), hhdm_offset)); }
     }
 
-    unsafe {
-        mm::paging::VirtualMemoryManager::init(hhdm_offset);
-    }
-
+    unsafe { mm::paging::VirtualMemoryManager::init(hhdm_offset); }
     arch::x86_64::syscall::init();
-
     drivers::pci::init();
     drivers::ata::init();
-
     fs::ext2::init(2);
 
     if let Some(mp_resp) = MP_REQUEST.response() {
         let bsp_id = mp_resp.bsp_lapic_id;
         let cpus = mp_resp.cpus();
-        let cpu_count = cpus.len();
-        log_info!("SMP", "Symmetric Multiprocessing: Detected {} Cores (BSP ID: {}).", cpu_count, bsp_id);
-
         for cpu in cpus {
             if cpu.lapic_id != bsp_id {
                 unsafe {
@@ -203,64 +155,44 @@ pub extern "C" fn _start() -> ! {
     }
 
     if let Some(mod_resp) = MODULES_REQUEST.response() {
-        let modules = mod_resp.modules();
-        if let Some(&first_mod) = modules.first() {
+        if let Some(&first_mod) = mod_resp.modules().first() {
             let (mod_ptr, mod_size) = unsafe { extract_limine_file_info(first_mod) };
-            log_info!("KERNEL", "Initrd module found: Base={:p}, Size={} bytes", mod_ptr, mod_size);
-            unsafe {
-                fs::tar::init(mod_ptr, mod_size);
-            }
-        } else {
-            log_warn!("KERNEL", "No modules found in Limine response.");
+            unsafe { fs::tar::init(mod_ptr, mod_size); }
         }
     }
 
     task::init();
-
     unsafe {
         if let Some(sched) = &mut *core::ptr::addr_of_mut!(task::SCHEDULER) {
-            let main_task = task::Task::new(0, "Main Kernel Shell", main_shell_entry);
-            sched.tasks.push(main_task);
+            sched.tasks.push(task::Task::new(0, "Kernel Master Task", main_shell_entry));
         }
     }
 
-    task::spawn(1, "Background Worker 1", background_worker_one);
-    task::spawn(2, "Background Worker 2", background_worker_two);
+    unsafe { asm!("sti", options(nomem, nostack)); }
 
-    log_info!("KERNEL", "Enabling Hardware Interrupts (STI)...");
+    log_info!("SMP", "Architecture Assigned: Core 0 [Kernel/Syscalls], Core 1 [Dedicated GUI], Cores 2-7 [Worker Pool]");
     unsafe {
-        asm!("sti", options(nomem, nostack));
+        if let Some(writer) = &mut *core::ptr::addr_of_mut!(WRITER) {
+            writer.save_screen();
+        }
     }
-
-    log_info!("KERNEL", "Kernel Interactive Terminal Active. Type 'gui' to launch Genesis.");
-    arch::x86_64::interrupts::print_prompt();
+    crate::arch::x86_64::interrupts::GUI_ACTIVE.store(true, Ordering::SeqCst);
+    if let Err(e) = task::dispatch_job(1, crate::compositor::compositor_core_entry) {
+        log_error!("DESKTOP", "Failed to pin GUI to Core 1: {}", e);
+    }
 
     loop {
         CORE_HEARTBEAT[0].fetch_add(1, Ordering::Relaxed);
-        
         if let Some(cmd) = arch::x86_64::interrupts::take_pending_command() {
             arch::x86_64::interrupts::execute_command(&cmd);
             arch::x86_64::interrupts::print_prompt();
         }
-
-        unsafe {
-            asm!("hlt", options(nomem, nostack));
-        }
+        unsafe { asm!("hlt", options(nomem, nostack)); }
     }
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    if let Some(loc) = info.location() {
-        serial_println!("\n\x1b[31;1m[PANIC OCCURRED]\x1b[0m File: {}:{}:{}", loc.file(), loc.line(), loc.column());
-    } else {
-        serial_println!("\n\x1b[31;1m[PANIC OCCURRED]\x1b[0m (Unknown Location)");
-    };
-
-    serial_println!("\x1b[31m[REASON]: {}\x1b[0m", info.message());
-    log_fatal!("PANIC", "CRASH: {}", info);
-
-    loop {
-        core::hint::spin_loop();
-    }
+    serial_println!("\x1b[31m[PANIC]: {}\x1b[0m", info);
+    loop { core::hint::spin_loop(); }
 }

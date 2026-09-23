@@ -5,6 +5,8 @@ import shutil
 import struct
 import tarfile
 import io
+import sys
+import time
 
 LIMINE_BOOTX64_URL = "https://raw.githubusercontent.com/limine-bootloader/limine/v8.x-binary/BOOTX64.EFI"
 
@@ -201,7 +203,6 @@ def make_uefi_fat32_disk(img_path, files):
     chk_c = lfn_checksum(short_conf)
     lfn_conf_entry = make_lfn_entry(1, "limine.conf", chk_c, is_last=True)
     short_conf_entry = make_entry("LIMINE~1CON", 0x20, conf_cluster, len(files["limine.conf"]))
-
     short_tar_entry = make_entry("INITRD  TAR", 0x20, tar_cluster, len(files["initrd.tar"]))
 
     boot_dir = bytearray(CLUSTER_SIZE)
@@ -250,7 +251,7 @@ def make_uefi_fat32_disk(img_path, files):
 
 def make_ext2_disk(img_path):
     BLOCK_SIZE = 1024
-    BLOCKS_COUNT = 8192      # 8 MB Disk
+    BLOCKS_COUNT = 8192
     INODES_COUNT = 256
     BLOCKS_PER_GROUP = 8192
     INODES_PER_GROUP = 256
@@ -260,29 +261,22 @@ def make_ext2_disk(img_path):
     sb_offset = 1024
     struct.pack_into("<I", disk, sb_offset + 0, INODES_COUNT)
     struct.pack_into("<I", disk, sb_offset + 4, BLOCKS_COUNT)
-    struct.pack_into("<I", disk, sb_offset + 8, 0)
     struct.pack_into("<I", disk, sb_offset + 12, BLOCKS_COUNT - 30)
     struct.pack_into("<I", disk, sb_offset + 16, INODES_COUNT - 11)
     struct.pack_into("<I", disk, sb_offset + 20, 1)
-    struct.pack_into("<I", disk, sb_offset + 24, 0)
-    struct.pack_into("<I", disk, sb_offset + 28, 0)
     struct.pack_into("<I", disk, sb_offset + 32, BLOCKS_PER_GROUP)
     struct.pack_into("<I", disk, sb_offset + 36, BLOCKS_PER_GROUP)
     struct.pack_into("<I", disk, sb_offset + 40, INODES_PER_GROUP)
     struct.pack_into("<H", disk, sb_offset + 56, 0xEF53)
     struct.pack_into("<H", disk, sb_offset + 58, 1)
-    struct.pack_into("<H", disk, sb_offset + 64, 0)
     struct.pack_into("<I", disk, sb_offset + 76, 1)
     struct.pack_into("<I", disk, sb_offset + 84, 11)
     struct.pack_into("<H", disk, sb_offset + 88, 128)
     
     bgd_offset = 2048
-    block_bitmap = 3
-    inode_bitmap = 4
-    inode_table = 5
-    struct.pack_into("<I", disk, bgd_offset + 0, block_bitmap)
-    struct.pack_into("<I", disk, bgd_offset + 4, inode_bitmap)
-    struct.pack_into("<I", disk, bgd_offset + 8, inode_table)
+    struct.pack_into("<I", disk, bgd_offset + 0, 3)
+    struct.pack_into("<I", disk, bgd_offset + 4, 4)
+    struct.pack_into("<I", disk, bgd_offset + 8, 5)
     struct.pack_into("<H", disk, bgd_offset + 12, BLOCKS_COUNT - 30)
     struct.pack_into("<H", disk, bgd_offset + 14, INODES_COUNT - 11)
     struct.pack_into("<H", disk, bgd_offset + 16, 2)
@@ -290,24 +284,14 @@ def make_ext2_disk(img_path):
     disk[3 * BLOCK_SIZE : 3 * BLOCK_SIZE + 4] = b"\xFF\xFF\xFF\x03"
     disk[4 * BLOCK_SIZE : 4 * BLOCK_SIZE + 2] = b"\xFF\x07"
     
-    inode2_offset = (inode_table * BLOCK_SIZE) + (1 * 128)
-    root_data_block = 26
+    inode2_offset = (5 * BLOCK_SIZE) + (1 * 128)
     struct.pack_into("<H", disk, inode2_offset + 0, 0x41ED)
     struct.pack_into("<I", disk, inode2_offset + 4, 1024)
     struct.pack_into("<H", disk, inode2_offset + 26, 2)
     struct.pack_into("<I", disk, inode2_offset + 28, 2)
-    struct.pack_into("<I", disk, inode2_offset + 40, root_data_block)
+    struct.pack_into("<I", disk, inode2_offset + 40, 26)
     
-    file_data_block = 27
-    file_content = b"Hello from native Linux EXT2 Filesystem mounted on EOS!\r\nInodes, Block Groups, and VFS abstraction online.\r\n"
-    inode11_offset = (inode_table * BLOCK_SIZE) + (10 * 128)
-    struct.pack_into("<H", disk, inode11_offset + 0, 0x81A4)
-    struct.pack_into("<I", disk, inode11_offset + 4, len(file_content))
-    struct.pack_into("<H", disk, inode11_offset + 26, 1)
-    struct.pack_into("<I", disk, inode11_offset + 28, 2)
-    struct.pack_into("<I", disk, inode11_offset + 40, file_data_block)
-    
-    r_off = root_data_block * BLOCK_SIZE
+    r_off = 26 * BLOCK_SIZE
     struct.pack_into("<I", disk, r_off + 0, 2)
     struct.pack_into("<H", disk, r_off + 4, 12)
     struct.pack_into("<B", disk, r_off + 6, 1)
@@ -321,55 +305,28 @@ def make_ext2_disk(img_path):
     struct.pack_into("<B", disk, r_off + 7, 2)
     disk[r_off + 8 : r_off + 10] = b".."
     
-    r_off += 12
-    file_name = b"welcome.txt"
-    rec_len = BLOCK_SIZE - 24
-    struct.pack_into("<I", disk, r_off + 0, 11)
-    struct.pack_into("<H", disk, r_off + 4, rec_len)
-    struct.pack_into("<B", disk, r_off + 6, len(file_name))
-    struct.pack_into("<B", disk, r_off + 7, 1)
-    disk[r_off + 8 : r_off + 8 + len(file_name)] = file_name
-    
-    disk[file_data_block * BLOCK_SIZE : file_data_block * BLOCK_SIZE + len(file_content)] = file_content
-    
     with open(img_path, "wb") as f:
         f.write(disk)
-    print(f"[✓] Created standard Linux ext2 root filesystem disk: {img_path}")
 
 def prepare_and_run():
-    print("[*] 1. Building Userspace Rust Application (release mode)...")
     user_elf = build_userspace_app()
-    if user_elf is None:
-        print("[-] Build aborted: Userspace binary generation failed.")
-        return
-
-    print("[*] 2. Building Kernel Binary (EOS)...")
-    # 💡 بناء الكيرنل في وضع الـ Release ليطير بأقصى سرعة ولا يعلق في التصفير
     res = subprocess.run(["cargo", "build", "--release"], shell=True)
-    if res.returncode != 0:
-        print("[-] Kernel build failed.")
-        return
+    if res.returncode != 0: return
 
     target_dir = "target"
     kernel_src = os.path.join(target_dir, "x86_64-unknown-none", "release", "EOS")
     bootx64_path = os.path.join(target_dir, "BOOTX64.EFI")
 
-    if not os.path.exists(bootx64_path) or os.path.getsize(bootx64_path) == 0:
-        print("[*] Downloading Limine BOOTX64.EFI...")
+    if not os.path.exists(bootx64_path):
         urllib.request.urlretrieve(LIMINE_BOOTX64_URL, bootx64_path)
 
-    with open(kernel_src, "rb") as f:
-        kernel_data = f.read()
-    with open("limine.conf", "rb") as f:
-        conf_data = f.read()
-    with open(bootx64_path, "rb") as f:
-        bootx64_data = f.read()
+    with open(kernel_src, "rb") as f: kernel_data = f.read()
+    with open("limine.conf", "rb") as f: conf_data = f.read()
+    with open(bootx64_path, "rb") as f: bootx64_data = f.read()
 
-    print(f"[*] Kernel binary size: {len(kernel_data)} bytes")
     tar_data = create_demo_tar(user_elf)
 
     img_path = os.path.join(target_dir, "uefi_hdd.img")
-    print("[*] 3. Packaging Solid MBR + FAT32 Boot Disk...")
     make_uefi_fat32_disk(img_path, {
         "EOS": kernel_data,
         "limine.conf": conf_data,
@@ -380,26 +337,10 @@ def prepare_and_run():
     ext2_img_path = os.path.join(target_dir, "rootfs.ext2")
     make_ext2_disk(ext2_img_path)
 
-    share_dir = r"C:\EOS_SHARE"
-    if not os.path.exists(share_dir):
-        try:
-            os.makedirs(share_dir, exist_ok=True)
-            readme_path = os.path.join(share_dir, "hello.txt")
-            with open(readme_path, "w", encoding="utf-8") as f:
-                f.write("Hello from Windows Direct Share Folder!\r\nAdd any files here and type 'ls' in EOS.\r\n")
-        except Exception:
-            pass
-
     qemu_share = r"C:\Program Files\qemu\share"
     code_fd = os.path.join(qemu_share, "edk2-x86_64-code.fd")
     vars_src = os.path.join(qemu_share, "edk2-i386-vars.fd")
     vars_dst = os.path.join(target_dir, "vars.fd")
-
-    if os.path.exists(vars_dst):
-        try:
-            os.remove(vars_dst)
-        except Exception:
-            pass
 
     if os.path.exists(vars_src):
         shutil.copy(vars_src, vars_dst)
@@ -408,10 +349,7 @@ def prepare_and_run():
             f.write(b"\x00" * (128 * 1024))
 
     log_path = os.path.join(target_dir, "qemu.log")
-    print(f"[*] Debug logging enabled -> {log_path}")
 
-    print(f"[✓] Booting QEMU with 8 Cores, FAT32 Storage + Native Linux ext2 RootFS...")
-    
     qemu_cmd = [
         "qemu-system-x86_64",
         "-M", "q35",
@@ -422,17 +360,28 @@ def prepare_and_run():
         "-device", "piix3-ide,id=ide",
         "-drive", f"id=disk0,file={img_path},format=raw,if=none",
         "-device", "ide-hd,bus=ide.0,unit=0,drive=disk0",
-        "-drive", f"id=disk1,file=fat:rw:{share_dir},format=raw,if=none",
-        "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
         "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none",
         "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",
         "-serial", "stdio",
+        "-serial", "tcp:127.0.0.1:4444,server,nowait",
         "-d", "int,cpu_reset,guest_errors",
         "-D", log_path,
         "-no-reboot",
         "-no-shutdown"
     ]
-    subprocess.run(qemu_cmd)
+    
+    print("[*] Launching QEMU...")
+    qemu_proc = subprocess.Popen(qemu_cmd)
+
+    # تشغيل الـ Bridge بعد تأخير زمني بسيط للتأكد من إقلاع النواة وفتح الـ Port
+    time.sleep(1.5)
+    print("[*] Starting Gamepad IPC Bridge...")
+    bridge_proc = subprocess.Popen([sys.executable, "gamepad_bridge.py"])
+
+    try:
+        qemu_proc.wait()
+    finally:
+        bridge_proc.terminate()
 
 if __name__ == "__main__":
     prepare_and_run()

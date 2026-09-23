@@ -86,11 +86,23 @@ pub fn init() {
         (*idt_ptr).entries[8].set_handler(double_fault_handler as *const () as usize, KERNEL_CODE_SELECTOR, 1, 0x8E);
         (*idt_ptr).entries[13].set_handler(general_protection_fault_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
         (*idt_ptr).entries[14].set_handler(page_fault_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
+        
         (*idt_ptr).entries[32].set_handler(timer_interrupt_preempt_entry as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
         (*idt_ptr).entries[33].set_handler(keyboard_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
+        (*idt_ptr).entries[35].set_handler(com2_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
         (*idt_ptr).entries[44].set_handler(mouse_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
 
         InterruptDescriptorTable::load_raw(idt_ptr);
+    }
+}
+
+pub extern "x86-interrupt" fn com2_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    unsafe {
+        while (crate::serial::SERIAL2.read_status() & 1) != 0 {
+            let byte = crate::serial::SERIAL2.read_byte();
+            crate::drivers::gamepad::process_serial_byte(byte);
+        }
+        pic::send_eoi(3);
     }
 }
 
@@ -508,8 +520,16 @@ pub fn execute_command(cmd: &str) {
     }
 
     match trimmed {
+        "gamepad" => {
+            unsafe {
+                if let Some(writer) = &mut *addr_of_mut!(WRITER) {
+                    writer.clear(15, 23, 42);
+                }
+            }
+            crate::drivers::gamepad::run_terminal_test();
+        }
         "help" => {
-            log_info!("SHELL", "Commands: gui, bench, cores, ls, cat <file>, view <file>, hana <file>, history, top, ps, uptime, reboot, clear");
+            log_info!("SHELL", "Commands: gamepad, gui, bench, cores, ls, cat <file>, view <file>, hana <file>, history, top, ps, uptime, reboot, clear");
         }
         "gui" | "desktop" => {
             log_info!("DESKTOP", "Dispatching Dedicated GUI Compositor to Core 1...");
@@ -575,6 +595,7 @@ pub fn execute_command(cmd: &str) {
                 let role = match i {
                     0 => "BSP (Master / Shell / IRQ)",
                     1 => "AP  (Dedicated GUI Compositor)",
+                    2 => "AP  (Dedicated Process Runner)",
                     _ => "AP  (Worker Core)",
                 };
                 let queue_state = if i == 0 {
@@ -585,6 +606,7 @@ pub fn execute_command(cmd: &str) {
                         JobState::Submitted => "QUEUED",
                         JobState::Running => "BUSY",
                         JobState::Finished => "DONE",
+                        JobState::Failed => "FAIL",
                     }
                 };
                 log_info!("SMP", "  Core #{}: [{:<6}] | Queue: [{:<7}] | Ticks: {:<12} | Role: {}", 

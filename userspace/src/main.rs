@@ -14,8 +14,8 @@ use core::alloc::Layout;
 use core::panic::PanicInfo;
 use linked_list_allocator::LockedHeap;
 use syscall::{
-    print_num, print_str, sys_blit_image_ptr, sys_clear_screen, sys_close, sys_exit,
-    sys_lseek, sys_mmap, sys_open, sys_read, sys_sleep, sys_clock_gettime, TimeSpec,
+    print_num, print_str, sys_blit_image_ptr, sys_close, sys_exit,
+    sys_lseek, sys_mmap, sys_open, sys_read, sys_clock_gettime, TimeSpec,
     SEEK_END, SEEK_SET,
 };
 
@@ -161,8 +161,8 @@ fn try_render_png(path: &str) -> Result<(), &'static str> {
         return Err("Truncated stream");
     }
 
-    // لضمان ملائمة الشاشة (1280x800) بدون تجاوز الذاكرة
-    let step = if width > 1200 || height > 750 { 2 } else { 1 };
+    // تجهيز البكسلات للنافذة العائمة
+    let step = if width > 600 || height > 400 { 2 } else { 1 };
     let out_w = width / step;
     let out_h = height / step;
     let total_pixels = out_w * out_h;
@@ -233,11 +233,11 @@ fn try_render_png(path: &str) -> Result<(), &'static str> {
     print_num((t_filter - t_inflate) as usize);
     print_str(" ms\n");
 
-    sys_clear_screen();
-    sys_blit_image_ptr(pixels.as_ptr(), 40, 30, out_w, out_h);
+    // إرسال الصورة للنافذة العائمة دون حجب الشاشة
+    sys_blit_image_ptr(pixels.as_ptr(), 0, 0, out_w, out_h);
 
     let t_blit = get_time_ms();
-    print_str("[Benchmark] Blit to Screen: ");
+    print_str("[Benchmark] Dispatched to Floating Window: ");
     print_num((t_blit - t_filter) as usize);
     print_str(" ms\n");
 
@@ -269,7 +269,7 @@ extern "C" fn app_main() {
 
     let target_file = get_passed_argument();
     match try_render_png(target_file) {
-        Ok(()) => print_str("[Viewer] Render Complete.\n"),
+        Ok(()) => print_str("[Viewer] Image Rendered Successfully in Overlay.\n"),
         Err(err) => {
             print_str("[Viewer] Error: ");
             print_str(err);
@@ -277,9 +277,7 @@ extern "C" fn app_main() {
         }
     }
 
-    print_str("[Viewer] Auto-exiting in 3 seconds...\n");
-    sys_sleep(3000);
-    sys_clear_screen();
+    // الخروج فوراً ليعود Core 2 إلى وضع الخمول فور الانتهاء من المعالجة
     sys_exit(0);
 }
 

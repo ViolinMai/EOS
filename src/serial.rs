@@ -1,7 +1,8 @@
 use core::arch::asm;
 use core::fmt;
 
-const COM1: u16 = 0x3F8;
+pub const COM1: u16 = 0x3F8;
+pub const COM2: u16 = 0x2F8;
 
 #[inline]
 unsafe fn outb(port: u16, val: u8) {
@@ -20,7 +21,7 @@ unsafe fn inb(port: u16) -> u8 {
 }
 
 pub struct SerialPort {
-    base: u16,
+    pub base: u16,
 }
 
 impl SerialPort {
@@ -30,14 +31,23 @@ impl SerialPort {
 
     pub fn init(&self) {
         unsafe {
-            outb(self.base + 1, 0x00); // إيقاف كل المقاطعات
-            outb(self.base + 3, 0x80); // تفعيل DLAB (لضبط Baud Rate)
-            outb(self.base + 0, 0x03); // Divisor = 3 (Baud rate = 38400)
+            outb(self.base + 1, 0x00); 
+            outb(self.base + 3, 0x80); 
+            outb(self.base + 0, 0x03); 
             outb(self.base + 1, 0x00);
-            outb(self.base + 3, 0x03); // 8 bits, no parity, one stop bit
-            outb(self.base + 2, 0xC7); // تفعيل الـ FIFO ومسح الـ Buffers
-            outb(self.base + 4, 0x0B); // IRQs enabled, RTS/DSR set
+            outb(self.base + 3, 0x03); 
+            outb(self.base + 2, 0xC7); 
+            outb(self.base + 1, 0x01); // تفعيل مقاطعات استقبال البيانات Data Available
+            outb(self.base + 4, 0x0B); 
         }
+    }
+
+    pub fn read_status(&self) -> u8 {
+        unsafe { inb(self.base + 5) }
+    }
+
+    pub fn read_byte(&self) -> u8 {
+        unsafe { inb(self.base) }
     }
 
     fn is_transmit_empty(&self) -> bool {
@@ -48,18 +58,14 @@ impl SerialPort {
         while !self.is_transmit_empty() {
             core::hint::spin_loop();
         }
-        unsafe {
-            outb(self.base, byte);
-        }
+        unsafe { outb(self.base, byte); }
     }
 }
 
 impl fmt::Write for SerialPort {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         for byte in s.bytes() {
-            if byte == b'\n' {
-                self.send_byte(b'\r');
-            }
+            if byte == b'\n' { self.send_byte(b'\r'); }
             self.send_byte(byte);
         }
         Ok(())
@@ -67,6 +73,7 @@ impl fmt::Write for SerialPort {
 }
 
 pub static SERIAL1: SerialPort = SerialPort::new(COM1);
+pub static SERIAL2: SerialPort = SerialPort::new(COM2);
 
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
@@ -77,15 +84,11 @@ pub fn _print(args: fmt::Arguments) {
 
 #[macro_export]
 macro_rules! serial_print {
-    ($($arg:tt)*) => {
-        $crate::serial::_print(format_args!($($arg)*))
-    };
+    ($($arg:tt)*) => { $crate::serial::_print(format_args!($($arg)*)) };
 }
 
 #[macro_export]
 macro_rules! serial_println {
     () => ($crate::serial_print!("\n"));
-    ($($arg:tt)*) => {
-        $crate::serial::_print(format_args!("{}\n", format_args!($($arg)*)))
-    };
+    ($($arg:tt)*) => { $crate::serial::_print(format_args!("{}\n", format_args!($($arg)*))) };
 }
