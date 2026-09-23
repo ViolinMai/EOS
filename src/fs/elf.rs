@@ -1,18 +1,18 @@
 use crate::arch::x86_64::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::arch::x86_64::keyboard::clear_keyboard_buffer;
-use crate::arch::x86_64::syscall::{ELF_EXIT_REQUESTED, KERNEL_SAVED_RSP};
+use crate::arch::x86_64::syscall::ELF_EXIT_REQUESTED;
 use crate::log_info;
 use crate::mm::paging::{invalidate_tlb, read_cr3, PageTable, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
 use crate::mm::paging::VMM;
 use core::arch::naked_asm;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;
-use core::mem::MaybeUninit;
 
 pub const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 pub const PT_LOAD: u32 = 1;
 
 pub const USER_STACK_TOP: u64 = 0x0000_0000_2040_0000;
+pub const USER_IPC_PAGE: u64  = 0x0000_0000_2050_0000;
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -52,21 +52,6 @@ pub struct Elf64ProgramHeader {
     pub p_align: u64,
 }
 
-#[repr(align(4096))]
-pub struct PageAlignedTable(pub [u64; 512]);
-
-static mut USER_PDPT: PageAlignedTable = PageAlignedTable([0; 512]);
-static mut USER_PD: PageAlignedTable = PageAlignedTable([0; 512]);
-
-pub const PT_COUNT: usize = 256;
-static mut USER_PTS: MaybeUninit<[PageAlignedTable; PT_COUNT]> = MaybeUninit::uninit();
-
-pub const USER_MEM_SIZE: usize = 512 * 1024 * 1024;
-#[repr(align(4096))]
-pub struct UserPhysicalStorage(pub [u8; USER_MEM_SIZE]);
-
-static mut USER_MEMORY_BLOCK: MaybeUninit<UserPhysicalStorage> = MaybeUninit::uninit();
-
 #[unsafe(naked)]
 extern "C" fn jump_to_ring3(entry: u64, rsp: u64, user_cs: u64, user_ds: u64) {
     naked_asm!(
@@ -86,11 +71,11 @@ extern "C" fn jump_to_ring3(entry: u64, rsp: u64, user_cs: u64, user_ds: u64) {
         "push rdi",         // RIP
         "iretq",
 
-        kernel_sp = sym KERNEL_SAVED_RSP,
+        kernel_sp = sym crate::arch::x86_64::syscall::KERNEL_SAVED_RSP,
     );
 }
 
-pub fn load_and_run_elf(data: &[u8]) -> Result<(), &'static str> {
+pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
     if data.len() < core::mem::size_of::<Elf64Header>() {
         return Err("File smaller than ELF header");
     }
@@ -109,10 +94,32 @@ pub fn load_and_run_elf(data: &[u8]) -> Result<(), &'static str> {
     let phnum = header.phnum as usize;
     let phentsize = header.phentsize as usize;
 
-    let storage_ptr = addr_of_mut!(USER_MEMORY_BLOCK) as *mut u8;
-    unsafe {
-        core::ptr::write_bytes(storage_ptr, 0, USER_MEM_SIZE);
+    let vmm = unsafe { (&*addr_of_mut!(VMM)).as_ref().ok_or("VMM not initialized")? };
+    
+    let frame_alloc = unsafe {
+        let alloc_ptr = addr_of_mut!(crate::mm::frame::FRAME_ALLOCATOR);
+        (*alloc_ptr).as_mut().ok_or("PMM not initialized")?
+    };
+
+    log_info!("ELF", "Allocating and mapping physical memory for Userspace...");
+
+    let pdpt_phys = frame_alloc.allocate_frame().ok_or("OOM: Failed to allocate PDPT")?;
+    let pd_phys = frame_alloc.allocate_frame().ok_or("OOM: Failed to allocate PD")?;
+
+    let pdpt = unsafe { &mut *((pdpt_phys + vmm.hhdm_offset) as *mut PageTable) };
+    let pd = unsafe { &mut *((pd_phys + vmm.hhdm_offset) as *mut PageTable) };
+
+    for i in 0..512 {
+        pdpt.entries[i].0 = 0;
+        pd.entries[i].0 = 0;
     }
+
+    let user_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
+
+    let pml4_phys = read_cr3() & 0x000F_FFFF_FFFF_F000;
+    let pml4 = unsafe { &mut *((pml4_phys + vmm.hhdm_offset) as *mut PageTable) };
+    pml4.entries[0].set(pdpt_phys, user_flags);
+    pdpt.entries[0].set(pd_phys, user_flags);
 
     for i in 0..phnum {
         let ph_offset = phoff + (i * phentsize);
@@ -123,79 +130,142 @@ pub fn load_and_run_elf(data: &[u8]) -> Result<(), &'static str> {
         let ph = unsafe { *(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
         if ph.p_type == PT_LOAD {
-            let file_off = ph.p_offset as usize;
-            let file_sz = ph.p_filesz as usize;
+            let vaddr = ph.p_vaddr;
             let mem_sz = ph.p_memsz as usize;
-            let vaddr_offset = (ph.p_vaddr.saturating_sub(0x00400000)) as usize;
+            let file_sz = ph.p_filesz as usize;
+            let file_off = ph.p_offset as usize;
 
-            if file_off + file_sz > data.len() {
-                return Err("Segment exceeds file boundary");
-            }
-            if vaddr_offset + mem_sz > USER_MEM_SIZE {
-                return Err("ELF memory footprint exceeds allocated buffer (512MB)");
+            let start_page = vaddr & !0xFFF;
+            let end_page = (vaddr + mem_sz as u64 + 0xFFF) & !0xFFF;
+            
+            let mut curr_vaddr = start_page;
+            while curr_vaddr < end_page {
+                let p2_idx = ((curr_vaddr >> 21) & 0x1FF) as usize;
+                let p1_idx = ((curr_vaddr >> 12) & 0x1FF) as usize;
+
+                if !pd.entries[p2_idx].is_present() {
+                    let pt_phys = frame_alloc.allocate_frame().ok_or("OOM: PT")?;
+                    let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
+                    for j in 0..512 { pt.entries[j].0 = 0; }
+                    pd.entries[p2_idx].set(pt_phys, user_flags);
+                }
+
+                let pt_phys = pd.entries[p2_idx].physical_address();
+                let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
+
+                if !pt.entries[p1_idx].is_present() {
+                    let frame_phys = frame_alloc.allocate_frame().ok_or("OOM: User Frame")?;
+                    let frame_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
+                    unsafe {
+                        for k in 0..4096 { *frame_ptr.add(k) = 0; }
+                    }
+                    pt.entries[p1_idx].set(frame_phys, user_flags);
+                    unsafe { invalidate_tlb(curr_vaddr); }
+                }
+                curr_vaddr += 4096;
             }
 
             unsafe {
-                let dest = storage_ptr.add(vaddr_offset);
-                core::ptr::copy_nonoverlapping(data.as_ptr().add(file_off), dest, file_sz);
-                if mem_sz > file_sz {
-                    core::ptr::write_bytes(dest.add(file_sz), 0, mem_sz - file_sz);
+                let mut remaining = file_sz;
+                let mut data_offset = file_off;
+                let mut dest_vaddr = vaddr;
+
+                while remaining > 0 {
+                    let p2_idx = ((dest_vaddr >> 21) & 0x1FF) as usize;
+                    let p1_idx = ((dest_vaddr >> 12) & 0x1FF) as usize;
+
+                    let pt_phys = pd.entries[p2_idx].physical_address();
+                    let pt = &*((pt_phys + vmm.hhdm_offset) as *const PageTable);
+                    let frame_phys = pt.entries[p1_idx].physical_address();
+
+                    let page_offset = (dest_vaddr & 0xFFF) as usize;
+                    let copy_size = core::cmp::min(remaining, 4096 - page_offset);
+
+                    let dest_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(data_offset),
+                        dest_ptr.add(page_offset),
+                        copy_size
+                    );
+
+                    remaining -= copy_size;
+                    data_offset += copy_size;
+                    dest_vaddr += copy_size as u64;
                 }
             }
         }
     }
 
-    unsafe {
-        let vmm = (&*addr_of_mut!(VMM)).as_ref().ok_or("VMM not initialized")?;
+    let stack_pages = 32;
+    let stack_start = USER_STACK_TOP - (stack_pages * 4096);
+    for i in 0..stack_pages {
+        let curr_vaddr = stack_start + (i * 4096);
+        let p2_idx = ((curr_vaddr >> 21) & 0x1FF) as usize;
+        let p1_idx = ((curr_vaddr >> 12) & 0x1FF) as usize;
 
-        let pdpt_virt = addr_of_mut!(USER_PDPT) as u64;
-        let pd_virt   = addr_of_mut!(USER_PD) as u64;
-        let code_data_virt = storage_ptr as u64;
-
-        let (pdpt_phys, _) = vmm.translate(pdpt_virt).ok_or("Failed translate PDPT")?;
-        let (pd_phys, _)   = vmm.translate(pd_virt).ok_or("Failed translate PD")?;
-        let (code_phys, _) = vmm.translate(code_data_virt).ok_or("Failed translate CODE DATA")?;
-
-        core::ptr::write_bytes(addr_of_mut!(USER_PDPT) as *mut u8, 0, 4096);
-        core::ptr::write_bytes(addr_of_mut!(USER_PD) as *mut u8, 0, 4096);
-
-        let user_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
-
-        let pml4_phys = read_cr3() & 0x000F_FFFF_FFFF_F000;
-        let pml4 = &mut *((pml4_phys + vmm.hhdm_offset) as *mut PageTable);
-        pml4.entries[0].set(pdpt_phys, user_flags);
-
-        USER_PDPT.0[0] = pd_phys | user_flags;
-
-        let pts_ptr = addr_of_mut!(USER_PTS) as *mut PageAlignedTable;
-
-        for pt_idx in 0..PT_COUNT {
-            let pt_ptr = pts_ptr.add(pt_idx);
-            core::ptr::write_bytes(pt_ptr as *mut u8, 0, 4096);
-            let (pt_phys, _) = vmm.translate(pt_ptr as u64).ok_or("Failed translate PT")?;
-            USER_PD.0[2 + pt_idx] = pt_phys | user_flags;
-
-            for page in 0..512 {
-                let frame_offset = ((pt_idx * 512) + page) as u64 * 4096;
-                let frame = code_phys + frame_offset;
-                (*pt_ptr).0[page] = frame | user_flags;
-                invalidate_tlb(0x00400000 + frame_offset);
-            }
+        if !pd.entries[p2_idx].is_present() {
+            let pt_phys = frame_alloc.allocate_frame().ok_or("OOM: PT Stack")?;
+            let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
+            for j in 0..512 { pt.entries[j].0 = 0; }
+            pd.entries[p2_idx].set(pt_phys, user_flags);
         }
 
-        clear_keyboard_buffer();
+        let pt_phys = pd.entries[p2_idx].physical_address();
+        let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
+
+        if !pt.entries[p1_idx].is_present() {
+            let frame_phys = frame_alloc.allocate_frame().ok_or("OOM: Stack Frame")?;
+            let frame_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
+            unsafe {
+                for k in 0..4096 { *frame_ptr.add(k) = 0; }
+            }
+            pt.entries[p1_idx].set(frame_phys, user_flags);
+            unsafe { invalidate_tlb(curr_vaddr); }
+        }
     }
+
+    {
+        let curr_vaddr = USER_IPC_PAGE;
+        let p2_idx = ((curr_vaddr >> 21) & 0x1FF) as usize;
+        let p1_idx = ((curr_vaddr >> 12) & 0x1FF) as usize;
+
+        if !pd.entries[p2_idx].is_present() {
+            let pt_phys = frame_alloc.allocate_frame().ok_or("OOM: PT IPC")?;
+            let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
+            for j in 0..512 { pt.entries[j].0 = 0; }
+            pd.entries[p2_idx].set(pt_phys, user_flags);
+        }
+
+        let pt_phys = pd.entries[p2_idx].physical_address();
+        let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
+
+        let frame_phys = frame_alloc.allocate_frame().ok_or("OOM: IPC Frame")?;
+        let ipc_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
+        unsafe {
+            for k in 0..4096 { *ipc_ptr.add(k) = 0; }
+            let bytes = arg.as_bytes();
+            let len = core::cmp::min(bytes.len(), 255);
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), ipc_ptr, len);
+        }
+        pt.entries[p1_idx].set(frame_phys, user_flags);
+        unsafe { invalidate_tlb(curr_vaddr); }
+    }
+
+    clear_keyboard_buffer();
 
     let actual_entry = header.entry;
     ELF_EXIT_REQUESTED.store(false, Ordering::SeqCst);
-    log_info!("ELF: Launching entry point at {:#010x} (RAM: 512MB, Stack: {:#010x})...", actual_entry, USER_STACK_TOP);
+    log_info!("ELF", "Executing Ring 3 Entry: {:#010x}", actual_entry);
 
-    jump_to_ring3(
-        actual_entry,
-        USER_STACK_TOP - 0x1000,
-        USER_CODE_SELECTOR as u64,
-        USER_DATA_SELECTOR as u64,
-    );
+    unsafe {
+        jump_to_ring3(
+            actual_entry,
+            USER_STACK_TOP - 0x2000,
+            USER_CODE_SELECTOR as u64,
+            USER_DATA_SELECTOR as u64,
+        );
+    }
 
+    log_info!("ELF", "Process completed cleanly, returned to Kernel Shell.");
     Ok(())
 }

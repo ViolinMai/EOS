@@ -3,6 +3,10 @@ use core::fmt;
 pub const FONT_WIDTH: usize = 8;
 pub const FONT_HEIGHT: usize = 16;
 
+const SAVED_SCREEN_SIZE: usize = 1280 * 800;
+static mut SCREEN_SAVE_BUFFER: [u32; SAVED_SCREEN_SIZE] = [0; SAVED_SCREEN_SIZE];
+static mut SCREEN_SAVED: bool = false;
+
 pub struct FramebufferWriter {
     pub buffer: *mut u8,
     pub width: usize,
@@ -11,12 +15,12 @@ pub struct FramebufferWriter {
     pub cursor_x: usize,
     pub cursor_y: usize,
     pub scale: usize,
-    pub select_start_x: Option<usize>,
-    pub select_end_x: Option<usize>,
     pub mouse_prev_x: usize,
     pub mouse_prev_y: usize,
     pub mouse_saved_pixels: [u32; 16 * 16],
     pub mouse_drawn: bool,
+    pub select_start: Option<(usize, usize)>,
+    pub select_end: Option<(usize, usize)>,
 }
 
 pub type FrameWriter = FramebufferWriter;
@@ -33,15 +37,42 @@ impl FramebufferWriter {
             cursor_x: 24,
             cursor_y: 24,
             scale: 2,
-            select_start_x: None,
-            select_end_x: None,
             mouse_prev_x: 0,
             mouse_prev_y: 0,
             mouse_saved_pixels: [0; 16 * 16],
             mouse_drawn: false,
+            select_start: None,
+            select_end: None,
         }
     }
 
+    pub fn save_screen(&mut self) {
+        unsafe {
+            self.erase_mouse_cursor();
+            let total = core::cmp::min(self.width * self.height, SAVED_SCREEN_SIZE);
+            let fb_ptr = self.buffer as *const u32;
+            for i in 0..total {
+                SCREEN_SAVE_BUFFER[i] = *fb_ptr.add(i);
+            }
+            SCREEN_SAVED = true;
+        }
+    }
+
+    pub fn restore_screen(&mut self) {
+        unsafe {
+            if SCREEN_SAVED {
+                let total = core::cmp::min(self.width * self.height, SAVED_SCREEN_SIZE);
+                let fb_ptr = self.buffer as *mut u32;
+                for i in 0..total {
+                    *fb_ptr.add(i) = SCREEN_SAVE_BUFFER[i];
+                }
+                SCREEN_SAVED = false;
+                self.mouse_drawn = false;
+            }
+        }
+    }
+
+    #[inline]
     pub fn put_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) {
         if x >= self.width || y >= self.height {
             return;
@@ -53,6 +84,7 @@ impl FramebufferWriter {
         }
     }
 
+    #[inline]
     pub fn get_pixel(&self, x: usize, y: usize) -> u32 {
         if x >= self.width || y >= self.height {
             return 0;
@@ -64,7 +96,28 @@ impl FramebufferWriter {
         }
     }
 
+    pub fn erase_mouse_cursor(&mut self) {
+        if self.mouse_drawn {
+            for y in 0..16 {
+                let sy = self.mouse_prev_y + y;
+                if sy >= self.height { break; }
+                for x in 0..16 {
+                    let sx = self.mouse_prev_x + x;
+                    if sx >= self.width { break; }
+                    let old_color = self.mouse_saved_pixels[y * 16 + x];
+                    let r = ((old_color >> 16) & 0xFF) as u8;
+                    let g = ((old_color >> 8) & 0xFF) as u8;
+                    let b = (old_color & 0xFF) as u8;
+                    self.put_pixel(sx, sy, r, g, b);
+                }
+            }
+            self.mouse_drawn = false;
+        }
+    }
+
     pub fn scroll_up(&mut self) {
+        self.erase_mouse_cursor();
+
         let line_height = FONT_HEIGHT * self.scale;
         let bytes_per_line = self.pitch * line_height;
         let total_bytes = self.height * self.pitch;
@@ -74,7 +127,6 @@ impl FramebufferWriter {
         }
 
         unsafe {
-            self.mouse_drawn = false;
             let src = self.buffer.add(bytes_per_line);
             let dst = self.buffer;
             let copy_bytes = total_bytes - bytes_per_line;
@@ -94,6 +146,14 @@ impl FramebufferWriter {
         }
     }
 
+    pub fn scroll_view_up(&mut self, lines: usize) {
+        for _ in 0..lines {
+            self.scroll_up();
+        }
+    }
+
+    pub fn scroll_view_down(&mut self, _lines: usize) {}
+
     pub fn check_scroll(&mut self) {
         let line_height = FONT_HEIGHT * self.scale;
         while self.cursor_y + line_height >= self.height - 12 {
@@ -101,20 +161,29 @@ impl FramebufferWriter {
         }
     }
 
-    // محرك المزج اللوني الحقيقي (True Alpha Blending)
     pub fn blit_buffer_alpha(&mut self, buf: &[u32], dest_x: usize, dest_y: usize, w: usize, h: usize) {
-        for y in 0..h {
+        self.erase_mouse_cursor();
+
+        if dest_x >= self.width || dest_y >= self.height || w == 0 || h == 0 {
+            return;
+        }
+
+        let render_w = core::cmp::min(w, self.width - dest_x);
+        let render_h = core::cmp::min(h, self.height - dest_y);
+
+        for y in 0..render_h {
             let screen_y = dest_y + y;
-            if screen_y >= self.height {
-                break;
-            }
-            for x in 0..w {
+            let row_offset = y * w;
+
+            for x in 0..render_w {
                 let screen_x = dest_x + x;
-                if screen_x >= self.width {
-                    break;
+                let buf_idx = row_offset + x;
+
+                if buf_idx >= buf.len() {
+                    return;
                 }
 
-                let pixel = buf[y * w + x];
+                let pixel = buf[buf_idx];
                 let alpha = ((pixel >> 24) & 0xFF) as u32;
 
                 if alpha == 0 {
@@ -148,28 +217,17 @@ impl FramebufferWriter {
         &mut self,
         new_x: usize,
         new_y: usize,
-        _left_click: bool,
+        left_click: bool,
         _current_input: &str,
         _cursor_idx: usize,
     ) {
-        if self.mouse_drawn {
-            for y in 0..16 {
-                let sy = self.mouse_prev_y + y;
-                if sy >= self.height {
-                    break;
-                }
-                for x in 0..16 {
-                    let sx = self.mouse_prev_x + x;
-                    if sx >= self.width {
-                        break;
-                    }
-                    let old_color = self.mouse_saved_pixels[y * 16 + x];
-                    let r = ((old_color >> 16) & 0xFF) as u8;
-                    let g = ((old_color >> 8) & 0xFF) as u8;
-                    let b = (old_color & 0xFF) as u8;
-                    self.put_pixel(sx, sy, r, g, b);
-                }
+        self.erase_mouse_cursor();
+
+        if left_click {
+            if self.select_start.is_none() {
+                self.select_start = Some((new_x, new_y));
             }
+            self.select_end = Some((new_x, new_y));
         }
 
         self.mouse_prev_x = new_x;
@@ -177,14 +235,10 @@ impl FramebufferWriter {
 
         for y in 0..16 {
             let sy = new_y + y;
-            if sy >= self.height {
-                break;
-            }
+            if sy >= self.height { break; }
             for x in 0..16 {
                 let sx = new_x + x;
-                if sx >= self.width {
-                    break;
-                }
+                if sx >= self.width { break; }
                 self.mouse_saved_pixels[y * 16 + x] = self.get_pixel(sx, sy);
 
                 if x <= y && (x + y) < 18 {
@@ -200,6 +254,8 @@ impl FramebufferWriter {
     }
 
     pub fn write_char(&mut self, c: char, r: u8, g: u8, b: u8) {
+        self.erase_mouse_cursor();
+
         let char_w = FONT_WIDTH * self.scale;
         let char_h = FONT_HEIGHT * self.scale;
 
@@ -262,6 +318,7 @@ impl FramebufferWriter {
     }
 
     pub fn clear(&mut self, r: u8, g: u8, b: u8) {
+        self.erase_mouse_cursor();
         for y in 0..self.height {
             for x in 0..self.width {
                 self.put_pixel(x, y, r, g, b);
@@ -269,7 +326,6 @@ impl FramebufferWriter {
         }
         self.cursor_x = 24;
         self.cursor_y = 24;
-        self.mouse_drawn = false;
     }
 
     pub fn redraw_line_text(&mut self, text: &str, cursor_idx: usize) {
@@ -282,6 +338,7 @@ impl FramebufferWriter {
     }
 
     pub fn clear_current_line(&mut self, skip_chars: usize) {
+        self.erase_mouse_cursor();
         let char_w = FONT_WIDTH * self.scale;
         let char_h = FONT_HEIGHT * self.scale;
         let start_x = 24 + (skip_chars * char_w);

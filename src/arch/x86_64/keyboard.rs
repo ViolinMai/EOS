@@ -39,13 +39,10 @@ unsafe fn inb(port: u16) -> u8 {
     val
 }
 
-// فحص وجود محارف من منفذ الـ Serial Console أيضاً
 fn read_serial_char_if_available() -> Option<u8> {
     unsafe {
-        // Line Status Register (LSR) at 0x3F8 + 5
         let status = inb(SERIAL_PORT + 5);
         if (status & 1) != 0 {
-            // Data Ready
             let c = inb(SERIAL_PORT);
             if c == b'\r' {
                 Some(b'\n')
@@ -59,12 +56,10 @@ fn read_serial_char_if_available() -> Option<u8> {
 }
 
 pub fn pop_char_from_buffer() -> Option<u8> {
-    // 1. فحص هل يوجد حرف قادم من الـ Serial (PowerShell)
     if let Some(c) = read_serial_char_if_available() {
         return Some(c);
     }
 
-    // 2. فحص مخزن لوحة المفاتيح PS/2 (QEMU Window)
     unsafe {
         if KBD_HEAD == KBD_TAIL {
             None
@@ -83,12 +78,16 @@ pub enum KeyEvent {
     DownArrow,
     LeftArrow,
     RightArrow,
-    Copy,
-    Paste,
-    Cut,
+    CtrlS,
+    CtrlQ,
+    CtrlC,
+    CtrlV,
+    CtrlX,
+    Escape,
     None,
 }
 
+// 💡 جدول فك شفرات Scancode كامل يدعم جميع علامات الترقيم والحروف الخاصة
 pub fn handle_scancode(scancode: u8) -> KeyEvent {
     if scancode == 0xE0 {
         EXTENDED_PREFIX.store(true, Ordering::Relaxed);
@@ -116,10 +115,6 @@ pub fn handle_scancode(scancode: u8) -> KeyEvent {
             CTRL_ACTIVE.store(false, Ordering::Relaxed);
             return KeyEvent::None;
         }
-        _ => {}
-    }
-
-    match scancode {
         0x2A | 0x36 => {
             SHIFT_ACTIVE.store(true, Ordering::Relaxed);
             return KeyEvent::None;
@@ -128,6 +123,7 @@ pub fn handle_scancode(scancode: u8) -> KeyEvent {
             SHIFT_ACTIVE.store(false, Ordering::Relaxed);
             return KeyEvent::None;
         }
+        0x01 => return KeyEvent::Escape,
         _ => {}
     }
 
@@ -140,9 +136,11 @@ pub fn handle_scancode(scancode: u8) -> KeyEvent {
 
     if ctrl {
         return match scancode {
-            0x2E => KeyEvent::Copy,
-            0x2F => KeyEvent::Paste,
-            0x2D => KeyEvent::Cut,
+            0x1F => KeyEvent::CtrlS, // S
+            0x10 => KeyEvent::CtrlQ, // Q
+            0x2E => KeyEvent::CtrlC, // C (Copy)
+            0x2F => KeyEvent::CtrlV, // V (Paste)
+            0x2D => KeyEvent::CtrlX, // X (Cut)
             _ => KeyEvent::None,
         };
     }
@@ -161,6 +159,7 @@ pub fn handle_scancode(scancode: u8) -> KeyEvent {
         0x0C => if shift { '_' } else { '-' },
         0x0D => if shift { '+' } else { '=' },
         0x0E => '\x08',
+        0x0F => '\t',
         0x10 => if shift { 'Q' } else { 'q' },
         0x11 => if shift { 'W' } else { 'w' },
         0x12 => if shift { 'E' } else { 'e' },
@@ -171,6 +170,9 @@ pub fn handle_scancode(scancode: u8) -> KeyEvent {
         0x17 => if shift { 'I' } else { 'i' },
         0x18 => if shift { 'O' } else { 'o' },
         0x19 => if shift { 'P' } else { 'p' },
+        0x1A => if shift { '{' } else { '[' },
+        0x1B => if shift { '}' } else { ']' },
+        0x1C => '\n',
         0x1E => if shift { 'A' } else { 'a' },
         0x1F => if shift { 'S' } else { 's' },
         0x20 => if shift { 'D' } else { 'd' },
@@ -182,6 +184,7 @@ pub fn handle_scancode(scancode: u8) -> KeyEvent {
         0x26 => if shift { 'L' } else { 'l' },
         0x27 => if shift { ':' } else { ';' },
         0x28 => if shift { '"' } else { '\'' },
+        0x29 => if shift { '~' } else { '`' }, // 💡 دعم محرف المدة ~ وعلامة `
         0x2B => if shift { '|' } else { '\\' },
         0x2C => if shift { 'Z' } else { 'z' },
         0x2D => if shift { 'X' } else { 'x' },
@@ -194,12 +197,10 @@ pub fn handle_scancode(scancode: u8) -> KeyEvent {
         0x34 => if shift { '>' } else { '.' },
         0x35 => if shift { '?' } else { '/' },
         0x39 => ' ',
-        0x1C => '\n',
         _ => return KeyEvent::None,
     };
 
     push_char_to_buffer(c as u8);
-
     KeyEvent::Char(c)
 }
 

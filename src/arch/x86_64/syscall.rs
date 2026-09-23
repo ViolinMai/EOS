@@ -1,7 +1,7 @@
 use core::arch::{asm, naked_asm};
 use crate::arch::x86_64::keyboard::pop_char_from_buffer;
 use crate::arch::x86_64::pit;
-use crate::fs::tar::INITRD;
+use crate::fs::vfs_read_bytes;
 use crate::log_info;
 use crate::writer::WRITER;
 use core::ptr::addr_of_mut;
@@ -16,6 +16,7 @@ pub static ELF_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 pub static mut KERNEL_SAVED_RSP: u64 = 0;
 pub static mut USER_TEMP_RSP: u64 = 0;
 
+#[allow(dead_code)]
 #[repr(align(4096))]
 struct KernelSyscallStack([u8; 16384]);
 static mut SYSCALL_KERNEL_STACK: KernelSyscallStack = KernelSyscallStack([0; 16384]);
@@ -51,12 +52,13 @@ pub fn init() {
 
         wrmsr(IA32_FMASK, 1 << 9);
 
-        log_info!("Syscall: Extended Graphics Interface (BLIT_BUFFER) ready.");
+        log_info!("SYSCALL", "Extended Graphics Interface (BLIT_BUFFER) & VFS ready.");
     }
 }
 
+// 💡 توسيع Syscall Dispatcher ليقبل المعامل الرابع (arg4) لتأمين الـ Bounds
 #[unsafe(no_mangle)]
-extern "C" fn syscall_dispatcher(id: u64, arg1: u64, arg2: u64, arg3: u64) -> u64 {
+extern "C" fn syscall_dispatcher(id: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> u64 {
     match id {
         0 => {
             let buf_ptr = arg2 as *mut u8;
@@ -106,7 +108,6 @@ extern "C" fn syscall_dispatcher(id: u64, arg1: u64, arg2: u64, arg3: u64) -> u6
         }
         2 => pit::get_uptime_seconds(),
 
-        // SYS_BLIT_BUFFER: arg1 = *const u32, arg2 = (w << 32) | h, arg3 = (x << 32) | y
         10 => {
             let buf_ptr = arg1 as *const u32;
             let width = (arg2 >> 32) as usize;
@@ -114,12 +115,13 @@ extern "C" fn syscall_dispatcher(id: u64, arg1: u64, arg2: u64, arg3: u64) -> u6
             let x = (arg3 >> 32) as usize;
             let y = (arg3 & 0xFFFF_FFFF) as usize;
 
-            if buf_ptr.is_null() || width == 0 || height == 0 {
+            if buf_ptr.is_null() || width == 0 || height == 0 || width > 2048 || height > 2048 {
                 return 0xFFFF_FFFF_FFFF_FFFF;
             }
 
             unsafe {
-                let slice = core::slice::from_raw_parts(buf_ptr, width * height);
+                let total_pixels = width * height;
+                let slice = core::slice::from_raw_parts(buf_ptr, total_pixels);
                 if let Some(w) = &mut *addr_of_mut!(WRITER) {
                     w.blit_buffer_alpha(slice, x, y, width, height);
                 }
@@ -127,11 +129,20 @@ extern "C" fn syscall_dispatcher(id: u64, arg1: u64, arg2: u64, arg3: u64) -> u6
             0
         }
 
-        // SYS_READ_FILE: arg1 = *const u8 (filename), arg2 = len, arg3 = *mut u8 (dest_buf)
+        11 => {
+            unsafe {
+                if let Some(w) = &mut *addr_of_mut!(WRITER) {
+                    w.clear(15, 23, 42);
+                }
+            }
+            0
+        }
+
         20 => {
             let name_ptr = arg1 as *const u8;
             let name_len = arg2 as usize;
             let dest_ptr = arg3 as *mut u8;
+            let dest_max_len = arg4 as usize;
 
             if name_ptr.is_null() || dest_ptr.is_null() || name_len == 0 {
                 return 0xFFFF_FFFF_FFFF_FFFF;
@@ -139,13 +150,14 @@ extern "C" fn syscall_dispatcher(id: u64, arg1: u64, arg2: u64, arg3: u64) -> u6
 
             unsafe {
                 let name_slice = core::slice::from_raw_parts(name_ptr, name_len);
-                if let Ok(raw_name_str) = core::str::from_utf8(name_slice) {
-                    let target_name = raw_name_str.trim().strip_prefix("./").unwrap_or(raw_name_str.trim());
-                    if let Some(archive) = &*addr_of_mut!(INITRD) {
-                        if let Some(file) = archive.files.iter().find(|f| f.name == target_name) {
-                            core::ptr::copy_nonoverlapping(file.data_ptr, dest_ptr, file.size);
-                            return file.size as u64;
+                if let Ok(path) = core::str::from_utf8(name_slice) {
+                    if let Ok(file_bytes) = vfs_read_bytes(path) {
+                        if file_bytes.len() > dest_max_len {
+                            crate::log_error!("SYSCALL", "sys_read_file: User buffer too small ({} < {})", dest_max_len, file_bytes.len());
+                            return 0xFFFF_FFFF_FFFF_FFFF;
                         }
+                        core::ptr::copy_nonoverlapping(file_bytes.as_ptr(), dest_ptr, file_bytes.len());
+                        return file_bytes.len() as u64;
                     }
                 }
             }
@@ -162,18 +174,18 @@ extern "C" fn syscall_dispatcher(id: u64, arg1: u64, arg2: u64, arg3: u64) -> u6
         }
         39 => 1001,
         60 => {
-            log_info!("Syscall: Process exited with status code {}.", arg1);
+            log_info!("SYSCALL", "Process exited with status code {}.", arg1);
             ELF_EXIT_REQUESTED.store(true, Ordering::SeqCst);
             0
         }
         _ => {
-            log_info!("Syscall: Unknown ID {}", id);
+            log_info!("SYSCALL", "Unknown ID {}", id);
             0xFFFF_FFFF_FFFF_FFFF
         }
     }
 }
 
-// 🔧 إصلاح الكارثة: الحفاظ على مسجل RBX بالكامل!
+// 💡 تعديل ربط مسجلات معمارية x86_64 لتدعم حتى 4 معاملات (arg4 في مسجل r10)
 #[unsafe(naked)]
 extern "C" fn syscall_entry() {
     naked_asm!(
@@ -189,25 +201,26 @@ extern "C" fn syscall_entry() {
         "push r14",
         "push r15",
 
+        "mov r8, r10",
         "mov rcx, rdx",
         "mov rdx, rsi",
         "mov rsi, rdi",
         "mov rdi, rax",
         "call {dispatcher}",
 
-        "push rax", // حفظ قيمة الاسترجاع مؤقتاً لتفادي تدمير مسجلات المستخدم
+        "push rax",
 
         "cmp qword ptr [{exit_flag}], 0",
         "jne 2f",
 
-        "pop rax",  // استعادة قيمة الاسترجاع لترسل للمستخدم
+        "pop rax",
 
         "pop r15",
         "pop r14",
         "pop r13",
         "pop r12",
         "pop rbp",
-        "pop rbx",  // استرجاع RBX المستخدم بدقة
+        "pop rbx",
         "pop r11",
         "pop rcx",
         "pop rsp",
@@ -220,7 +233,7 @@ extern "C" fn syscall_entry() {
         "pop r14",
         "pop r13",
         "pop r12",
-        "pop rbx",  // استرجاع RBX المستخدم بدقة قبل الخروج للكيرنل
+        "pop rbx",
         "pop rbp",
         "sti",
         "ret",
@@ -231,25 +244,4 @@ extern "C" fn syscall_entry() {
         user_rsp_temp = sym USER_TEMP_RSP,
         kstack = sym SYSCALL_KERNEL_STACK,
     );
-}
-
-pub fn trigger_test_syscall(msg: &str) -> u64 {
-    let id: u64 = 1;
-    let ptr = msg.as_ptr() as u64;
-    let len = msg.len() as u64;
-    let ret: u64;
-
-    unsafe {
-        asm!(
-            "syscall",
-            inlateout("rax") id => ret,
-            in("rdi") 1u64,
-            in("rsi") ptr,
-            in("rdx") len,
-            out("rcx") _,
-            out("r11") _,
-            options(nostack)
-        );
-    }
-    ret
 }

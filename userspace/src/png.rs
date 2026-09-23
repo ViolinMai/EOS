@@ -12,34 +12,36 @@ pub struct PngImage {
 
 struct BitReader<'a> {
     data: &'a [u8],
-    bit_pos: usize,
+    byte_pos: usize,
+    bit_buffer: u32,
+    bits_in_buffer: u8,
 }
 
 impl<'a> BitReader<'a> {
     fn new(data: &'a [u8]) -> Self {
-        Self { data, bit_pos: 0 }
+        Self { data, byte_pos: 0, bit_buffer: 0, bits_in_buffer: 0 }
     }
 
+    #[inline(always)]
     fn read_bits(&mut self, n: usize) -> Option<u32> {
-        let mut res = 0u32;
-        for i in 0..n {
-            let byte_idx = self.bit_pos >> 3;
-            let bit_idx = self.bit_pos & 7;
-            if byte_idx >= self.data.len() {
+        while (self.bits_in_buffer as usize) < n {
+            if self.byte_pos >= self.data.len() {
                 return None;
             }
-            let bit = (self.data[byte_idx] >> bit_idx) & 1;
-            res |= (bit as u32) << i;
-            self.bit_pos += 1;
+            self.bit_buffer |= (self.data[self.byte_pos] as u32) << self.bits_in_buffer;
+            self.bits_in_buffer += 8;
+            self.byte_pos += 1;
         }
+        let res = self.bit_buffer & ((1u32 << n) - 1);
+        self.bit_buffer >>= n;
+        self.bits_in_buffer -= n as u8;
         Some(res)
     }
 
     fn align_byte(&mut self) {
-        let rem = self.bit_pos & 7;
-        if rem != 0 {
-            self.bit_pos += 8 - rem;
-        }
+        let rem = self.bits_in_buffer % 8;
+        self.bit_buffer >>= rem;
+        self.bits_in_buffer -= rem;
     }
 }
 
@@ -57,6 +59,7 @@ fn decompress_zlib(data: &[u8], expected_len: usize) -> Result<Vec<u8>, &'static
     let mut out = Vec::with_capacity(expected_len);
 
     let mut is_final = false;
+
     while !is_final {
         let bfinal = match reader.read_bits(1) {
             Some(b) => b,
@@ -93,7 +96,6 @@ fn decompress_zlib(data: &[u8], expected_len: usize) -> Result<Vec<u8>, &'static
             _ => return Err("Invalid Deflate block type\n"),
         }
     }
-
     Ok(out)
 }
 
@@ -124,6 +126,7 @@ impl FastHuffman {
         Self { counts, symbols }
     }
 
+    #[inline(always)]
     fn decode(&self, reader: &mut BitReader) -> Option<u16> {
         let mut code = 0u16;
         let mut first = 0u16;
@@ -141,7 +144,7 @@ impl FastHuffman {
                 }
             }
 
-            if rev_code < first + count {
+            if rev_code >= first && rev_code < first + count {
                 return Some(self.symbols[index + (rev_code - first) as usize]);
             }
             index += count as usize;
@@ -302,104 +305,97 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
     }
 }
 
+// 💡 فك تشفير فائق السرعة مع التحجيم المسبق (On-the-fly Downsampling) لدعم صور 4K/2K بأمان تام
 pub fn decode_png(data: &[u8]) -> Result<PngImage, &'static str> {
     if data.len() < 33 {
         return Err("File too small for PNG header\n");
     }
 
-    // 1. تحقق مباشر وصارم من بداية الملف عند البايت 0 تماماً
     const PNG_SIG: [u8; 8] = [0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
     if &data[0..8] != &PNG_SIG {
-        return Err("Invalid PNG signature at offset 0\n");
+        return Err("Invalid PNG signature\n");
     }
 
-    // 2. التحقق من IHDR (من البايت 12 إلى 16)
-    if &data[12..16] != b"IHDR" {
-        return Err("First chunk is not IHDR\n");
-    }
-
-    // 3. قراءة الحقول بالـ Offsets الثابتة المطلقة
     let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as usize;
     let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]) as usize;
-    let bit_depth = data[24];
     let color_type = data[25];
 
-    print_str("[User App] Exact Header: ");
-    print_num(width);
-    print_str("x");
-    print_num(height);
-    print_str(" | Depth=");
-    print_num(bit_depth as usize);
-    print_str(" | ColorType=");
-    print_num(color_type as usize);
-    print_str("\n");
-
-    if bit_depth != 8 {
-        return Err("Only 8-bit depth PNG is supported\n");
+    // السماح بالصور حتى 16 ميجابكسل (4K UHD)
+    if width * height > 16_000_000 {
+        return Err("Image exceeds 16MP maximum limit\n");
     }
 
     let bpp = match color_type {
-        2 => 3, // Truecolor RGB
-        6 => 4, // Truecolor with Alpha RGBA
-        _ => return Err("Only Truecolor RGB(2) or RGBA(6) is supported\n"),
+        2 => 3,
+        6 => 4,
+        _ => return Err("Unsupported Color Type\n"),
     };
 
-    // 4. تجميع قطع IDAT من بعد نهاية IHDR (Byte 33: 8 sig + 4 len + 4 type + 13 data + 4 crc)
+    print_str("[PNG] Image Specs: ");
+    print_num(width);
+    print_str("x");
+    print_num(height);
+    print_str(" (BPP: ");
+    print_num(bpp);
+    print_str(")\n");
+
     let mut offset = 33;
     let mut idat_data = Vec::with_capacity(data.len());
-    let mut idat_count = 0usize;
 
     while offset + 8 <= data.len() {
         let length = u32::from_be_bytes([data[offset], data[offset + 1], data[offset + 2], data[offset + 3]]) as usize;
         let chunk_type = &data[offset + 4..offset + 8];
         let chunk_data_offset = offset + 8;
 
-        if chunk_data_offset + length > data.len() {
-            break;
-        }
+        if chunk_data_offset + length > data.len() { break; }
 
         if chunk_type == b"IDAT" {
             let slice = &data[chunk_data_offset..chunk_data_offset + length];
-            for i in 0..length {
-                idat_data.push(slice[i]);
-            }
-            idat_count += 1;
+            idat_data.extend_from_slice(slice);
         } else if chunk_type == b"IEND" {
             break;
         }
 
-        offset = chunk_data_offset + length + 4; // تخطي Data و CRC
+        offset = chunk_data_offset + length + 4;
     }
-
-    if idat_data.is_empty() {
-        return Err("No IDAT chunk found\n");
-    }
-
-    print_str("[User App] IDAT Chunks Found: ");
-    print_num(idat_count);
-    print_str(" (Total compressed size: ");
-    print_num(idat_data.len());
-    print_str(" bytes)\n");
 
     let stride = width * bpp;
     let expected_uncompressed = (stride + 1) * height;
 
-    print_str("[User App] Starting zlib decompression...\n");
+    print_str("[PNG] Decompressing Deflate stream...\n");
     let raw_decompressed = decompress_zlib(&idat_data, expected_uncompressed)?;
+    
     if raw_decompressed.len() < expected_uncompressed {
-        return Err("Decompressed IDAT shorter than expected\n");
+        return Err("Decompressed stream shorter than expected\n");
     }
 
-    print_str("[User App] Decompression complete! Rendering pixels...\n");
+    // 💡 حساب معامل التصغير المباشر لحماية الذاكرة وضمان سرعة العرض
+    let max_target_w = 640usize;
+    let step = if width > max_target_w {
+        (width + max_target_w - 1) / max_target_w
+    } else {
+        1
+    };
 
-    let mut pixels = Vec::with_capacity(width * height);
+    let out_w = width / step;
+    let out_h = height / step;
+    let mut pixels = Vec::with_capacity(out_w * out_h);
+
+    print_str("[PNG] Downsampling with factor ");
+    print_num(step);
+    print_str(" -> ");
+    print_num(out_w);
+    print_str("x");
+    print_num(out_h);
+    print_str("\n");
+
     let mut prev_row = vec![0u8; stride];
+    let mut curr_row = vec![0u8; stride];
     let mut in_cursor = 0usize;
 
-    for _ in 0..height {
+    for y in 0..height {
         let filter = raw_decompressed[in_cursor];
         in_cursor += 1;
-        let mut curr_row = vec![0u8; stride];
 
         for x in 0..stride {
             let raw = raw_decompressed[in_cursor + x];
@@ -418,18 +414,21 @@ pub fn decode_png(data: &[u8]) -> Result<PngImage, &'static str> {
             curr_row[x] = filtered;
         }
 
-        for x in 0..width {
-            let offset = x * bpp;
-            let r = curr_row[offset] as u32;
-            let g = curr_row[offset + 1] as u32;
-            let b = curr_row[offset + 2] as u32;
-            let a = if bpp == 4 { curr_row[offset + 3] as u32 } else { 255u32 };
-            pixels.push((a << 24) | (r << 16) | (g << 8) | b);
+        // أخذ العينات فقط في الأسطر المطابقة لمعدل التصغير
+        if y % step == 0 {
+            for x in (0..width).step_by(step) {
+                let off = x * bpp;
+                let r = curr_row[off] as u32;
+                let g = curr_row[off + 1] as u32;
+                let b = curr_row[off + 2] as u32;
+                let a = if bpp == 4 { curr_row[off + 3] as u32 } else { 255u32 };
+                pixels.push((a << 24) | (r << 16) | (g << 8) | b);
+            }
         }
 
-        prev_row = curr_row;
+        prev_row.copy_from_slice(&curr_row);
         in_cursor += stride;
     }
 
-    Ok(PngImage { width, height, pixels })
+    Ok(PngImage { width: out_w, height: out_h, pixels })
 }

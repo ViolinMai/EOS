@@ -1,6 +1,8 @@
 use core::arch::asm;
+use crate::arch::x86_64::interrupts::{GUI_ACTIVE, SHARED_MOUSE_BUTTONS, SHARED_MOUSE_X, SHARED_MOUSE_Y};
 use crate::writer::WRITER;
 use core::ptr::addr_of_mut;
+use core::sync::atomic::Ordering;
 
 const MOUSE_PORT: u16 = 0x60;
 const MOUSE_STATUS: u16 = 0x64;
@@ -56,17 +58,19 @@ pub struct MouseState {
     pub y: isize,
     pub left_button: bool,
     pub right_button: bool,
+    pub has_wheel: bool,
     cycle: u8,
-    bytes: [u8; 3],
+    bytes: [u8; 4],
 }
 
 pub static mut MOUSE: MouseState = MouseState {
-    x: 100,
-    y: 100,
+    x: 200,
+    y: 200,
     left_button: false,
     right_button: false,
+    has_wheel: false,
     cycle: 0,
-    bytes: [0; 3],
+    bytes: [0; 4],
 };
 
 pub fn init() {
@@ -87,6 +91,20 @@ pub fn init() {
 
         mouse_write(0xF6);
         let _ = mouse_read();
+
+        mouse_write(0xF3); let _ = mouse_read();
+        mouse_write(200);  let _ = mouse_read();
+        mouse_write(0xF3); let _ = mouse_read();
+        mouse_write(100);  let _ = mouse_read();
+        mouse_write(0xF3); let _ = mouse_read();
+        mouse_write(80);   let _ = mouse_read();
+
+        mouse_write(0xF2);
+        let _ = mouse_read();
+        let mouse_id = mouse_read();
+        if mouse_id == 3 || mouse_id == 4 {
+            (*addr_of_mut!(MOUSE)).has_wheel = true;
+        }
 
         mouse_write(0xF4);
         let _ = mouse_read();
@@ -110,35 +128,64 @@ pub unsafe fn on_mouse_interrupt(current_input: &str, cursor_idx: usize) {
         }
         2 => {
             mouse.bytes[2] = raw;
-            mouse.cycle = 0;
-
-            let flags = mouse.bytes[0];
-            let mut dx = mouse.bytes[1] as isize;
-            let mut dy = mouse.bytes[2] as isize;
-
-            if (flags & 0x10) != 0 {
-                dx |= !0xFF;
-            }
-            if (flags & 0x20) != 0 {
-                dy |= !0xFF;
-            }
-
-            mouse.left_button = (flags & 0x01) != 0;
-            mouse.right_button = (flags & 0x02) != 0;
-
-            let (max_w, max_h) = if let Some(writer) = unsafe { &*addr_of_mut!(WRITER) } {
-                (writer.width as isize, writer.height as isize)
+            if mouse.has_wheel {
+                mouse.cycle = 3;
             } else {
-                (1920, 1080)
-            };
-
-            mouse.x = (mouse.x + dx).clamp(0, max_w - 12);
-            mouse.y = (mouse.y - dy).clamp(0, max_h - 18);
-
-            if let Some(writer) = unsafe { &mut *addr_of_mut!(WRITER) } {
-                writer.update_mouse_cursor(mouse.x as usize, mouse.y as usize, mouse.left_button, current_input, cursor_idx);
+                mouse.cycle = 0;
+                unsafe {
+                    process_mouse_packet(mouse, current_input, cursor_idx, 0);
+                }
+            }
+        }
+        3 => {
+            mouse.bytes[3] = raw;
+            mouse.cycle = 0;
+            let wheel = (raw & 0x0F) as i8;
+            let dz = if (raw & 0x08) != 0 { wheel | !0x0F } else { wheel };
+            unsafe {
+                process_mouse_packet(mouse, current_input, cursor_idx, dz);
             }
         }
         _ => mouse.cycle = 0,
+    }
+}
+
+unsafe fn process_mouse_packet(mouse: &mut MouseState, current_input: &str, cursor_idx: usize, dz: i8) {
+    let flags = mouse.bytes[0];
+    let mut dx = mouse.bytes[1] as isize;
+    let mut dy = mouse.bytes[2] as isize;
+
+    if (flags & 0x10) != 0 { dx |= !0xFF; }
+    if (flags & 0x20) != 0 { dy |= !0xFF; }
+
+    mouse.left_button = (flags & 0x01) != 0;
+    mouse.right_button = (flags & 0x02) != 0;
+
+    let (max_w, max_h) = if let Some(writer) = unsafe { &*addr_of_mut!(WRITER) } {
+        (writer.width as isize, writer.height as isize)
+    } else {
+        (1280, 800)
+    };
+
+    mouse.x = (mouse.x + dx).clamp(0, max_w - 12);
+    mouse.y = (mouse.y - dy).clamp(0, max_h - 18);
+
+    // 💡 نقل سريع ومباشر للأزرار والحركة بدون أي تعطيل
+    SHARED_MOUSE_X.store(mouse.x, Ordering::Relaxed);
+    SHARED_MOUSE_Y.store(mouse.y, Ordering::Relaxed);
+    let mut btn_mask: u64 = 0;
+    if mouse.left_button { btn_mask |= 1; }
+    if mouse.right_button { btn_mask |= 2; }
+    SHARED_MOUSE_BUTTONS.store(btn_mask, Ordering::Relaxed);
+
+    if !GUI_ACTIVE.load(Ordering::Relaxed) {
+        if let Some(writer) = unsafe { &mut *addr_of_mut!(WRITER) } {
+            if dz > 0 {
+                writer.scroll_view_up(3);
+            } else if dz < 0 {
+                writer.scroll_view_down(3);
+            }
+            writer.update_mouse_cursor(mouse.x as usize, mouse.y as usize, mouse.left_button, current_input, cursor_idx);
+        }
     }
 }

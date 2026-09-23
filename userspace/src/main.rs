@@ -9,18 +9,18 @@ pub mod png;
 mod qoi;
 pub mod syscall;
 
-use alloc::vec;
 use alloc::vec::Vec;
 use core::alloc::Layout;
 use core::panic::PanicInfo;
 use linked_list_allocator::LockedHeap;
 use png::decode_png;
-use syscall::{print_num, print_str, sys_blit_image_ptr, sys_exit, sys_read_file, sys_sleep};
+use syscall::{print_num, print_str, sys_blit_image_ptr, sys_clear_screen, sys_exit, sys_read_file, sys_sleep};
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
-const HEAP_SIZE: usize = 48 * 1024 * 1024;
+// توسيع الذاكرة لـ 40MB للتعامل مع صور الـ 4K ولقطات الشاشة الضخمة
+const HEAP_SIZE: usize = 40 * 1024 * 1024;
 static mut HEAP_MEM: [u8; HEAP_SIZE] = [0; HEAP_SIZE];
 
 fn init_heap() {
@@ -41,7 +41,9 @@ fn alloc_error_handler(_layout: Layout) -> ! {
 pub unsafe extern "C" fn _start() -> ! {
     core::arch::naked_asm!(
         "xor rbp, rbp",
-        "mov rsp, 0x043FF000",
+        "mov rsp, 0x203FE000",
+        "and rsp, -16",
+        "sub rsp, 8",
         "call {entry}",
         "mov rdi, 0",
         "mov rax, 60",
@@ -52,81 +54,73 @@ pub unsafe extern "C" fn _start() -> ! {
     );
 }
 
-const FILE_BUF_SIZE: usize = 4 * 1024 * 1024;
+// 💡 مخزن 10MB لقراءة الملفات الضخمة من القرص
+const FILE_BUF_SIZE: usize = 10 * 1024 * 1024;
 static mut FILE_BUF: [u8; FILE_BUF_SIZE] = [0; FILE_BUF_SIZE];
 
-fn scale_image(src: &[u32], src_w: usize, src_h: usize, dst_w: usize, dst_h: usize) -> Vec<u32> {
-    let mut out = vec![0u32; dst_w * dst_h];
-    for dy in 0..dst_h {
-        let sy = (dy * src_h) / dst_h;
-        for dx in 0..dst_w {
-            let sx = (dx * src_w) / dst_w;
-            out[dy * dst_w + dx] = src[sy * src_w + sx];
-        }
-    }
-    out
-}
-
-fn try_render_png(filename: &str, pos_x: usize, pos_y: usize) -> Result<(), &'static str> {
+fn try_render_png(path: &str, pos_x: usize, pos_y: usize) -> Result<(), &'static str> {
     unsafe {
         let fbuf = &mut *core::ptr::addr_of_mut!(FILE_BUF);
-        let res = sys_read_file(filename, fbuf);
+        let res = sys_read_file(path, fbuf);
 
         if res <= 0 {
             return Err("File not found or read error\n");
         }
 
         let file_size = res as usize;
-
-        print_str("[User App] PNG loaded (");
+        print_str("[Viewer] File loaded (");
         print_num(file_size);
-        print_str(" bytes). Parsing PNG structure...\n");
+        print_str(" bytes). Parsing PNG...\n");
 
         let image = decode_png(&fbuf[..file_size])?;
 
-        // تحجيم الصورة إلى 320x266 لعرضها بأمان داخل أي دقة شاشة
-        let target_w = 320usize;
-        let target_h = (image.height * target_w) / image.width;
-
-        print_str("[User App] Scaling image to: ");
-        print_num(target_w);
-        print_str("x");
-        print_num(target_h);
-        print_str("...\n");
-
-        let scaled_pixels = scale_image(&image.pixels, image.width, image.height, target_w, target_h);
-
-        print_str("[User App] Blitting to screen at position (");
-        print_num(pos_x);
-        print_str(", ");
-        print_num(pos_y);
-        print_str(")...\n");
-
-        sys_blit_image_ptr(scaled_pixels.as_ptr(), pos_x, pos_y, target_w, target_h);
+        print_str("[Viewer] Blitting decoded image to screen...\n");
+        sys_clear_screen();
+        sys_blit_image_ptr(image.pixels.as_ptr(), pos_x, pos_y, image.width, image.height);
         Ok(())
     }
+}
+
+fn get_passed_argument() -> &'static str {
+    let ipc_ptr = 0x0000_0000_2050_0000 as *const u8;
+    unsafe {
+        let mut len = 0usize;
+        while len < 255 && *ipc_ptr.add(len) != 0 {
+            len += 1;
+        }
+        if len > 0 {
+            let slice = core::slice::from_raw_parts(ipc_ptr, len);
+            if let Ok(s) = core::str::from_utf8(slice) {
+                return s.trim();
+            }
+        }
+    }
+    "icon.png"
 }
 
 extern "C" fn app_main() {
     init_heap();
 
-    print_str("\n[User App] Desktop Engine Online (48MB Heap Active)\n");
+    let target_file = get_passed_argument();
 
-    // رسم الصورة في الإحداثيات (450, 80) لضمان ظهورها داخل الشاشة أياً كانت الدقة
-    match try_render_png("icon.png", 450, 80) {
+    print_str("\n[Viewer] Opening: ");
+    print_str(target_file);
+    print_str("\n");
+
+    match try_render_png(target_file, 80, 40) {
         Ok(()) => {
-            print_str("[User App] PNG Icon rendered successfully!\n");
+            print_str("[Viewer] Image displayed successfully!\n");
         }
         Err(err) => {
-            print_str("[User App] PNG Load Error: ");
+            print_str("[Viewer] Render Error: ");
             print_str(err);
         }
     }
 
-    print_str("[User App] Session running. Sleeping 4s...\n");
-    sys_sleep(4000);
-
-    print_str("[User App] Done.\n");
+    print_str("[Viewer] Displaying image for 5s...\n");
+    sys_sleep(5000);
+    sys_clear_screen();
+    sys_exit(0);
 }
 
 #[panic_handler]

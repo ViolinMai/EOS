@@ -1,28 +1,50 @@
 use core::arch::asm;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::log_info;
+use crate::{log_error, log_info};
 
-const ATA_PRIMARY_DATA_PORT: u16 = 0x1F0;
-const ATA_PRIMARY_SECTOR_CNT_PORT: u16 = 0x1F2;
-const ATA_PRIMARY_LBA_LO_PORT: u16 = 0x1F3;
-const ATA_PRIMARY_LBA_MID_PORT: u16 = 0x1F4;
-const ATA_PRIMARY_LBA_HI_PORT: u16 = 0x1F5;
-const ATA_PRIMARY_DRIVE_PORT: u16 = 0x1F6;
-const ATA_PRIMARY_COMMAND_PORT: u16 = 0x1F7;
-const ATA_PRIMARY_STATUS_PORT: u16 = 0x1F7;
+// 💡 دعم القناتين الأساسية والثانوية (Primary & Secondary IDE Channels)
+const ATA_PRIMARY_IO_BASE: u16 = 0x1F0;
+const ATA_SECONDARY_IO_BASE: u16 = 0x170;
+
+const ATA_REG_DATA: u16 = 0;
+const ATA_REG_ERROR: u16 = 1;
+const ATA_REG_SECTOR_CNT: u16 = 2;
+const ATA_REG_LBA_LO: u16 = 3;
+const ATA_REG_LBA_MID: u16 = 4;
+const ATA_REG_LBA_HI: u16 = 5;
+const ATA_REG_DRIVE: u16 = 6;
+const ATA_REG_STATUS: u16 = 7;
+const ATA_REG_COMMAND: u16 = 7;
 
 const ATA_CMD_READ_SECTORS: u8 = 0x20;
+const ATA_CMD_WRITE_SECTORS: u8 = 0x30;
+const ATA_CMD_CACHE_FLUSH: u8 = 0xE7;
 
 const STATUS_BSY: u8 = 0x80;
+const STATUS_DRDY: u8 = 0x40;
 const STATUS_DRQ: u8 = 0x08;
 const STATUS_ERR: u8 = 0x01;
+const STATUS_DF: u8 = 0x20;
+
+#[inline]
+fn get_drive_io_base_and_head(drive: u8) -> (u16, u8) {
+    match drive {
+        0 => (ATA_PRIMARY_IO_BASE, 0xE0),   // Primary Master
+        1 => (ATA_PRIMARY_IO_BASE, 0xF0),   // Primary Slave
+        2 => (ATA_SECONDARY_IO_BASE, 0xE0), // Secondary Master (ext2)
+        3 => (ATA_SECONDARY_IO_BASE, 0xF0), // Secondary Slave
+        _ => (ATA_PRIMARY_IO_BASE, 0xE0),
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct DiskFileInfo {
     pub name: String,
     pub size: u32,
     pub first_cluster: u32,
+    pub dir_entry_lba: u32,
+    pub dir_entry_offset: usize,
 }
 
 #[inline]
@@ -51,22 +73,42 @@ unsafe fn inw(port: u16) -> u16 {
 }
 
 #[inline]
-unsafe fn io_wait() {
+unsafe fn outw(port: u16, val: u16) {
     unsafe {
-        for _ in 0..15 {
-            let _ = inb(ATA_PRIMARY_STATUS_PORT);
-        }
+        asm!("out dx, ax", in("dx") port, in("ax") val, options(nomem, nostack, preserves_flags));
     }
 }
 
-fn wait_ready() -> Result<(), &'static str> {
+#[inline]
+unsafe fn ata_io_wait(io_base: u16) {
+    unsafe {
+        let _ = inb(io_base + ATA_REG_STATUS);
+        let _ = inb(io_base + ATA_REG_STATUS);
+        let _ = inb(io_base + ATA_REG_STATUS);
+        let _ = inb(io_base + ATA_REG_STATUS);
+    }
+}
+
+fn poll_drive_ready(io_base: u16, expect_drq: bool) -> Result<(), &'static str> {
     for _ in 0..100_000 {
-        let status = unsafe { inb(ATA_PRIMARY_STATUS_PORT) };
+        let status = unsafe { inb(io_base + ATA_REG_STATUS) };
+
+        if status == 0xFF {
+            return Err("ATA Floating Bus: No device attached on port");
+        }
+
         if (status & STATUS_BSY) == 0 {
-            if (status & STATUS_ERR) != 0 {
-                return Err("ATA Drive error detected in status register");
+            if (status & (STATUS_ERR | STATUS_DF)) != 0 {
+                let err_reg = unsafe { inb(io_base + ATA_REG_ERROR) };
+                log_error!("ATA", "Hardware Error Register: {:#04x}, Status: {:#04x}", err_reg, status);
+                return Err("ATA Drive hardware error detected");
             }
-            if (status & STATUS_DRQ) != 0 {
+
+            if expect_drq {
+                if (status & STATUS_DRQ) != 0 {
+                    return Ok(());
+                }
+            } else if (status & STATUS_DRDY) != 0 {
                 return Ok(());
             }
         }
@@ -79,22 +121,25 @@ pub fn read_sector_drive(drive: u8, lba: u32, buffer: &mut [u8; 512]) -> Result<
         return Err("LBA out of range for 28-bit addressing");
     }
 
+    let (io_base, drive_head) = get_drive_io_base_and_head(drive);
+
     unsafe {
-        // drive 0 = Master (0xE0), drive 1 = Slave (0xF0)
-        let drive_head = if drive == 0 { 0xE0 } else { 0xF0 };
-        outb(ATA_PRIMARY_DRIVE_PORT, drive_head | (((lba >> 24) & 0x0F) as u8));
-        io_wait();
+        outb(io_base + ATA_REG_DRIVE, drive_head | (((lba >> 24) & 0x0F) as u8));
+        ata_io_wait(io_base);
 
-        outb(ATA_PRIMARY_SECTOR_CNT_PORT, 1);
-        outb(ATA_PRIMARY_LBA_LO_PORT, (lba & 0xFF) as u8);
-        outb(ATA_PRIMARY_LBA_MID_PORT, ((lba >> 8) & 0xFF) as u8);
-        outb(ATA_PRIMARY_LBA_HI_PORT, ((lba >> 16) & 0xFF) as u8);
-        outb(ATA_PRIMARY_COMMAND_PORT, ATA_CMD_READ_SECTORS);
+        poll_drive_ready(io_base, false)?;
 
-        wait_ready()?;
+        outb(io_base + ATA_REG_SECTOR_CNT, 1);
+        outb(io_base + ATA_REG_LBA_LO, (lba & 0xFF) as u8);
+        outb(io_base + ATA_REG_LBA_MID, ((lba >> 8) & 0xFF) as u8);
+        outb(io_base + ATA_REG_LBA_HI, ((lba >> 16) & 0xFF) as u8);
+        outb(io_base + ATA_REG_COMMAND, ATA_CMD_READ_SECTORS);
+        ata_io_wait(io_base);
+
+        poll_drive_ready(io_base, true)?;
 
         for i in 0..256 {
-            let word = inw(ATA_PRIMARY_DATA_PORT);
+            let word = inw(io_base + ATA_REG_DATA);
             buffer[i * 2] = (word & 0xFF) as u8;
             buffer[i * 2 + 1] = ((word >> 8) & 0xFF) as u8;
         }
@@ -103,13 +148,60 @@ pub fn read_sector_drive(drive: u8, lba: u32, buffer: &mut [u8; 512]) -> Result<
     Ok(())
 }
 
-pub fn read_sector(lba: u32, buffer: &mut [u8; 512]) -> Result<(), &'static str> {
-    read_sector_drive(0, lba, buffer)
+pub fn write_sector_drive(drive: u8, lba: u32, buffer: &[u8; 512]) -> Result<(), &'static str> {
+    if lba >= 0x1000_0000 {
+        return Err("LBA out of range for 28-bit addressing");
+    }
+
+    let (io_base, drive_head) = get_drive_io_base_and_head(drive);
+
+    unsafe {
+        outb(io_base + ATA_REG_DRIVE, drive_head | (((lba >> 24) & 0x0F) as u8));
+        ata_io_wait(io_base);
+
+        poll_drive_ready(io_base, false)?;
+
+        outb(io_base + ATA_REG_SECTOR_CNT, 1);
+        outb(io_base + ATA_REG_LBA_LO, (lba & 0xFF) as u8);
+        outb(io_base + ATA_REG_LBA_MID, ((lba >> 8) & 0xFF) as u8);
+        outb(io_base + ATA_REG_LBA_HI, ((lba >> 16) & 0xFF) as u8);
+        outb(io_base + ATA_REG_COMMAND, ATA_CMD_WRITE_SECTORS);
+        ata_io_wait(io_base);
+
+        poll_drive_ready(io_base, true)?;
+
+        for i in 0..256 {
+            let word = (buffer[i * 2] as u16) | ((buffer[i * 2 + 1] as u16) << 8);
+            outw(io_base + ATA_REG_DATA, word);
+        }
+
+        outb(io_base + ATA_REG_COMMAND, ATA_CMD_CACHE_FLUSH);
+        ata_io_wait(io_base);
+        poll_drive_ready(io_base, false)?;
+    }
+
+    Ok(())
 }
 
-pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
+#[derive(Clone, Copy, Debug)]
+pub enum FatType {
+    Fat12,
+    Fat16,
+    Fat32,
+}
+
+pub struct FatLayout {
+    pub fat_type: FatType,
+    pub spc: u32,
+    pub fat_start_lba: u32,
+    pub data_start_lba: u32,
+    pub root_dir_lba: u32,
+    pub root_dir_sectors: u32,
+}
+
+pub fn get_fat_layout(drive: u8) -> Result<FatLayout, &'static str> {
     let mut sector = [0u8; 512];
-    read_sector_drive(1, 0, &mut sector)?;
+    read_sector_drive(drive, 0, &mut sector)?;
 
     let mut start_lba = 0u32;
     if sector[510] == 0x55 && sector[511] == 0xAA {
@@ -118,57 +210,168 @@ pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
             let p_lba = u32::from_le_bytes([sector[446 + 8], sector[446 + 9], sector[446 + 10], sector[446 + 11]]);
             if p_lba > 0 && p_lba < 0x1000_0000 {
                 start_lba = p_lba;
-                read_sector_drive(1, start_lba, &mut sector)?;
+                read_sector_drive(drive, start_lba, &mut sector)?;
             }
         }
     }
 
     let bytes_per_sector = u16::from_le_bytes([sector[11], sector[12]]) as u32;
     if bytes_per_sector != 512 {
-        return Err("Unsupported sector size or unformatted share disk");
+        return Err("Unsupported sector size");
     }
 
     let spc = sector[13] as u32;
+    if spc == 0 {
+        return Err("Invalid sectors per cluster");
+    }
+
     let reserved_sectors = u16::from_le_bytes([sector[14], sector[15]]) as u32;
     let num_fats = sector[16] as u32;
     let root_entries = u16::from_le_bytes([sector[17], sector[18]]) as u32;
+
+    let mut total_sectors = u16::from_le_bytes([sector[19], sector[20]]) as u32;
+    if total_sectors == 0 {
+        total_sectors = u32::from_le_bytes([sector[32], sector[33], sector[34], sector[35]]);
+    }
+
     let mut fat_size = u16::from_le_bytes([sector[22], sector[23]]) as u32;
+    let is_fat32 = fat_size == 0 && root_entries == 0;
 
-    let is_fat32 = root_entries == 0 && fat_size == 0;
-
-    let (root_dir_lba, root_dir_sectors) = if is_fat32 {
+    let (_fat_sz, root_dir_lba, root_dir_sectors, data_start_lba, fat_type) = if is_fat32 {
         let fat_sz32 = u32::from_le_bytes([sector[36], sector[37], sector[38], sector[39]]);
         let root_cluster = u32::from_le_bytes([sector[44], sector[45], sector[46], sector[47]]);
         let data_start = start_lba + reserved_sectors + (num_fats * fat_sz32);
-        let cluster_lba = data_start + ((root_cluster.saturating_sub(2)) * spc);
-        (cluster_lba, spc)
+        let cluster_offset = (root_cluster.saturating_sub(2)).saturating_mul(spc);
+        let root_lba = data_start + cluster_offset;
+        (fat_sz32, root_lba, spc, data_start, FatType::Fat32)
     } else {
         if fat_size == 0 {
             fat_size = u32::from_le_bytes([sector[36], sector[37], sector[38], sector[39]]);
         }
+        let root_sectors = ((root_entries * 32) + 511) / 512;
         let root_lba = start_lba + reserved_sectors + (num_fats * fat_size);
-        let root_secs = ((root_entries * 32) + 511) / 512;
-        (root_lba, root_secs)
+        let data_start = root_lba + root_sectors;
+        
+        let data_sectors = total_sectors.saturating_sub(reserved_sectors + (num_fats * fat_size) + root_sectors);
+        let total_clusters = data_sectors / spc;
+        let f_type = if total_clusters < 4085 {
+            FatType::Fat12
+        } else {
+            FatType::Fat16
+        };
+        (fat_size, root_lba, root_sectors, data_start, f_type)
     };
 
+    let fat_start_lba = start_lba + reserved_sectors;
+
+    Ok(FatLayout {
+        fat_type,
+        spc,
+        fat_start_lba,
+        data_start_lba,
+        root_dir_lba,
+        root_dir_sectors,
+    })
+}
+
+pub fn get_next_cluster(drive: u8, layout: &FatLayout, cluster: u32) -> Result<u32, &'static str> {
+    let mut buf = [0u8; 512];
+
+    match layout.fat_type {
+        FatType::Fat32 => {
+            let fat_offset = cluster * 4;
+            let fat_sector_lba = layout.fat_start_lba + (fat_offset / 512);
+            let entry_offset = (fat_offset % 512) as usize;
+            read_sector_drive(drive, fat_sector_lba, &mut buf)?;
+            let next_c = u32::from_le_bytes([
+                buf[entry_offset],
+                buf[entry_offset + 1],
+                buf[entry_offset + 2],
+                buf[entry_offset + 3],
+            ]) & 0x0FFF_FFFF;
+            Ok(next_c)
+        }
+        FatType::Fat16 => {
+            let fat_offset = cluster * 2;
+            let fat_sector_lba = layout.fat_start_lba + (fat_offset / 512);
+            let entry_offset = (fat_offset % 512) as usize;
+            read_sector_drive(drive, fat_sector_lba, &mut buf)?;
+            let next_c = u16::from_le_bytes([buf[entry_offset], buf[entry_offset + 1]]) as u32;
+            Ok(next_c)
+        }
+        FatType::Fat12 => {
+            let fat_offset = cluster + (cluster / 2);
+            let fat_sector_lba = layout.fat_start_lba + (fat_offset / 512);
+            let entry_offset = (fat_offset % 512) as usize;
+            read_sector_drive(drive, fat_sector_lba, &mut buf)?;
+            
+            let val = if entry_offset == 511 {
+                let low = buf[511] as u16;
+                let mut next_buf = [0u8; 512];
+                read_sector_drive(drive, fat_sector_lba + 1, &mut next_buf)?;
+                low | ((next_buf[0] as u16) << 8)
+            } else {
+                u16::from_le_bytes([buf[entry_offset], buf[entry_offset + 1]])
+            };
+
+            let next_c = if (cluster & 1) != 0 {
+                val >> 4
+            } else {
+                val & 0x0FFF
+            } as u32;
+            Ok(next_c)
+        }
+    }
+}
+
+pub fn read_entire_file(drive: u8, file_info: &DiskFileInfo) -> Result<Vec<u8>, &'static str> {
+    let layout = get_fat_layout(drive)?;
+    let mut data = Vec::with_capacity(file_info.size as usize);
+    let mut current_cluster = file_info.first_cluster;
+    let mut remaining = file_info.size as usize;
+    let mut buf = [0u8; 512];
+
+    let end_marker = match layout.fat_type {
+        FatType::Fat12 => 0x0FF8,
+        FatType::Fat16 => 0xFFF8,
+        FatType::Fat32 => 0x0FFF_FFF8,
+    };
+
+    while current_cluster >= 2 && current_cluster < end_marker && remaining > 0 {
+        let cluster_offset = (current_cluster.saturating_sub(2)).saturating_mul(layout.spc);
+        let cluster_lba = layout.data_start_lba + cluster_offset;
+
+        for s in 0..layout.spc {
+            if remaining == 0 {
+                break;
+            }
+            read_sector_drive(drive, cluster_lba + s, &mut buf)?;
+            let to_copy = core::cmp::min(remaining, 512);
+            data.extend_from_slice(&buf[..to_copy]);
+            remaining -= to_copy;
+        }
+        current_cluster = get_next_cluster(drive, &layout, current_cluster)?;
+    }
+
+    Ok(data)
+}
+
+pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
+    let layout = get_fat_layout(1)?;
+    let mut sector = [0u8; 512];
     let mut files = Vec::new();
 
-    for s in 0..root_dir_sectors {
-        read_sector_drive(1, root_dir_lba + s, &mut sector)?;
+    for s in 0..layout.root_dir_sectors {
+        let dir_lba = layout.root_dir_lba + s;
+        read_sector_drive(1, dir_lba, &mut sector)?;
         for entry_idx in 0..16 {
             let offset = entry_idx * 32;
             let first_byte = sector[offset];
-            if first_byte == 0x00 {
-                break;
-            }
-            if first_byte == 0xE5 {
-                continue;
-            }
+            if first_byte == 0x00 { break; }
+            if first_byte == 0xE5 { continue; }
 
             let attr = sector[offset + 11];
-            if attr == 0x0F || (attr & 0x08) != 0 || (attr & 0x10) != 0 {
-                continue;
-            }
+            if attr == 0x0F || (attr & 0x08) != 0 || (attr & 0x10) != 0 { continue; }
 
             let name_raw = &sector[offset..offset + 8];
             let ext_raw = &sector[offset + 8..offset + 11];
@@ -188,7 +391,10 @@ pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
             }
 
             let first_cluster_low = u16::from_le_bytes([sector[offset + 26], sector[offset + 27]]) as u32;
-            let first_cluster_high = u16::from_le_bytes([sector[offset + 20], sector[offset + 21]]) as u32;
+            let first_cluster_high = match layout.fat_type {
+                FatType::Fat32 => u16::from_le_bytes([sector[offset + 20], sector[offset + 21]]) as u32,
+                _ => 0,
+            };
             let first_cluster = (first_cluster_high << 16) | first_cluster_low;
             let file_size = u32::from_le_bytes([
                 sector[offset + 28],
@@ -201,6 +407,8 @@ pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
                 name: filename,
                 size: file_size,
                 first_cluster,
+                dir_entry_lba: dir_lba,
+                dir_entry_offset: offset,
             });
         }
     }
@@ -208,6 +416,29 @@ pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
     Ok(files)
 }
 
+pub fn write_file_content(drive: u8, filename: &str, content: &[u8]) -> Result<(), &'static str> {
+    let layout = get_fat_layout(drive)?;
+    let files = scan_shared_disk()?;
+    let target = files.iter().find(|f| f.name.eq_ignore_ascii_case(filename))
+        .ok_or("File not found on drive")?;
+
+    let cluster_offset = (target.first_cluster.saturating_sub(2)).saturating_mul(layout.spc);
+    let cluster_lba = layout.data_start_lba + cluster_offset;
+
+    let mut sector_buf = [0u8; 512];
+    let to_write = core::cmp::min(content.len(), 512);
+    sector_buf[..to_write].copy_from_slice(&content[..to_write]);
+    write_sector_drive(drive, cluster_lba, &sector_buf)?;
+
+    let mut dir_buf = [0u8; 512];
+    read_sector_drive(drive, target.dir_entry_lba, &mut dir_buf)?;
+    let size_bytes = (content.len() as u32).to_le_bytes();
+    dir_buf[target.dir_entry_offset + 28..target.dir_entry_offset + 32].copy_from_slice(&size_bytes);
+    write_sector_drive(drive, target.dir_entry_lba, &dir_buf)?;
+
+    Ok(())
+}
+
 pub fn init() {
-    log_info!("ATA: Primary IDE Controller (Master/Slave) initialized with FAT16/FAT32 support.");
+    log_info!("ATA", "Primary & Secondary IDE Channels initialized (4 Drives Active).");
 }

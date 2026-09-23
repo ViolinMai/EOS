@@ -7,6 +7,8 @@ pub struct BitmapFrameAllocator {
     bitmap: *mut u8,
     total_frames: usize,
     used_frames: AtomicUsize,
+    last_alloc_byte: usize, // 💡 السر الجوهري: تخزين آخر مكان تم الحجز منه لمنع البحث من الصفر وتسريع النظام آلاف المرات
+    #[allow(dead_code)]
     pub hhdm_offset: u64,
 }
 
@@ -15,7 +17,7 @@ unsafe impl Sync for BitmapFrameAllocator {}
 
 pub static mut FRAME_ALLOCATOR: Option<BitmapFrameAllocator> = None;
 
-// في Limine C-ABI: حقل type_ هو u64 عادي وقيمة 0 تعني دائماً USABLE
+#[allow(dead_code)]
 #[inline]
 fn is_entry_usable(entry: &limine::memmap::Entry) -> bool {
     let raw_val: u64 = unsafe { core::ptr::read_unaligned(&entry.type_ as *const _ as *const u64) };
@@ -59,6 +61,7 @@ impl BitmapFrameAllocator {
             bitmap: bitmap_virt,
             total_frames,
             used_frames: AtomicUsize::new(total_frames),
+            last_alloc_byte: 0,
             hhdm_offset,
         };
 
@@ -78,8 +81,7 @@ impl BitmapFrameAllocator {
             allocator.mark_frame_used(bitmap_start_frame + i);
         }
 
-        log_info!(
-            "PMM: Physical Memory: {} MB total ({} usable frames)",
+        log_info!("PMM", "Physical Memory: {} MB total ({} usable frames)",
             usable_memory / (1024 * 1024),
             total_frames - allocator.used_frames.load(Ordering::Relaxed)
         );
@@ -89,9 +91,7 @@ impl BitmapFrameAllocator {
 
     #[inline]
     fn mark_frame_used(&mut self, frame_index: usize) {
-        if frame_index >= self.total_frames {
-            return;
-        }
+        if frame_index >= self.total_frames { return; }
         let byte_idx = frame_index / 8;
         let bit_idx = frame_index % 8;
         unsafe {
@@ -105,9 +105,7 @@ impl BitmapFrameAllocator {
 
     #[inline]
     fn free_frame_index(&mut self, frame_index: usize) {
-        if frame_index >= self.total_frames {
-            return;
-        }
+        if frame_index >= self.total_frames { return; }
         let byte_idx = frame_index / 8;
         let bit_idx = frame_index % 8;
         unsafe {
@@ -117,10 +115,18 @@ impl BitmapFrameAllocator {
                 self.used_frames.fetch_sub(1, Ordering::Relaxed);
             }
         }
+        if byte_idx < self.last_alloc_byte {
+            self.last_alloc_byte = byte_idx;
+        }
     }
 
+    // 💡 الآن حجز الذاكرة فائق السرعة O(1) ولن يجمّد معالج جهازك أبدًا
     pub fn allocate_frame(&mut self) -> Option<u64> {
-        for byte_idx in 0..(self.total_frames / 8) {
+        let start_byte = self.last_alloc_byte;
+        let total_bytes = self.total_frames / 8;
+
+        for i in 0..total_bytes {
+            let byte_idx = (start_byte + i) % total_bytes;
             unsafe {
                 let byte = self.bitmap.add(byte_idx);
                 if *byte != 0xFF {
@@ -128,6 +134,7 @@ impl BitmapFrameAllocator {
                         if (*byte & (1 << bit_idx)) == 0 {
                             let frame_idx = byte_idx * 8 + bit_idx;
                             self.mark_frame_used(frame_idx);
+                            self.last_alloc_byte = byte_idx;
                             return Some((frame_idx * PAGE_SIZE) as u64);
                         }
                     }

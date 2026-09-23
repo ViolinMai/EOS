@@ -68,7 +68,6 @@ def create_demo_tar(user_elf_data):
             ti3 = tarfile.TarInfo(name="app.elf")
             ti3.size = len(user_elf_data)
             tar.addfile(ti3, io.BytesIO(user_elf_data))
-            print(f"[✓] Packaged app.elf into initrd.tar ({len(user_elf_data)} bytes)")
 
         icon_path = os.path.abspath("icon.png")
         if os.path.exists(icon_path):
@@ -77,21 +76,18 @@ def create_demo_tar(user_elf_data):
             ti_icon = tarfile.TarInfo(name="icon.png")
             ti_icon.size = len(icon_data)
             tar.addfile(ti_icon, io.BytesIO(icon_data))
-            print(f"[✓] Packaged full icon.png into initrd.tar ({len(icon_data)} bytes)")
-        else:
-            print("[-] CRITICAL ERROR: icon.png not found at root directory!")
 
     return buf.getvalue()
 
 def make_uefi_fat32_disk(img_path, files):
     SECTOR_SIZE = 512
-    SECTORS_PER_CLUSTER = 8          # 4KB Cluster
+    SECTORS_PER_CLUSTER = 8
     CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE
     RESERVED_SECTORS = 32
     NUM_FATS = 2
 
     PART_START_SECTOR = 2048
-    PART_SECTORS = 2097152           # 1 GB Partition
+    PART_SECTORS = 2097152
     TOTAL_SECTORS = PART_START_SECTOR + PART_SECTORS
 
     FAT_SIZE_SECTORS = 2048
@@ -252,6 +248,108 @@ def make_uefi_fat32_disk(img_path, files):
     with open(img_path, "wb") as f:
         f.write(disk)
 
+# 💡 إنشاء قرص ext2 نموذجي نظيف ومتوافق مع معايير لينكس
+def make_ext2_disk(img_path):
+    BLOCK_SIZE = 1024
+    BLOCKS_COUNT = 8192      # 8 MB Disk
+    INODES_COUNT = 256
+    BLOCKS_PER_GROUP = 8192
+    INODES_PER_GROUP = 256
+    
+    disk = bytearray(BLOCKS_COUNT * BLOCK_SIZE)
+    
+    # 1. Superblock عند البايت 1024 (Block 1)
+    sb_offset = 1024
+    struct.pack_into("<I", disk, sb_offset + 0, INODES_COUNT)
+    struct.pack_into("<I", disk, sb_offset + 4, BLOCKS_COUNT)
+    struct.pack_into("<I", disk, sb_offset + 8, 0)
+    struct.pack_into("<I", disk, sb_offset + 12, BLOCKS_COUNT - 30) # Free blocks
+    struct.pack_into("<I", disk, sb_offset + 16, INODES_COUNT - 11) # Free inodes
+    struct.pack_into("<I", disk, sb_offset + 20, 1) # First Data Block
+    struct.pack_into("<I", disk, sb_offset + 24, 0) # Block size: 1024 << 0
+    struct.pack_into("<I", disk, sb_offset + 28, 0) # Fragment size
+    struct.pack_into("<I", disk, sb_offset + 32, BLOCKS_PER_GROUP)
+    struct.pack_into("<I", disk, sb_offset + 36, BLOCKS_PER_GROUP)
+    struct.pack_into("<I", disk, sb_offset + 40, INODES_PER_GROUP)
+    struct.pack_into("<H", disk, sb_offset + 56, 0xEF53) # EXT2_MAGIC
+    struct.pack_into("<H", disk, sb_offset + 58, 1)      # State: Clean
+    struct.pack_into("<H", disk, sb_offset + 64, 0)      # Minor revision
+    struct.pack_into("<I", disk, sb_offset + 76, 1)      # Major revision (Dynamic)
+    struct.pack_into("<I", disk, sb_offset + 84, 11)     # First non-reserved Inode
+    struct.pack_into("<H", disk, sb_offset + 88, 128)    # Inode size: 128 bytes
+    
+    # 2. Block Group Descriptor Table عند Block 2 (Offset 2048)
+    bgd_offset = 2048
+    block_bitmap = 3
+    inode_bitmap = 4
+    inode_table = 5
+    struct.pack_into("<I", disk, bgd_offset + 0, block_bitmap)
+    struct.pack_into("<I", disk, bgd_offset + 4, inode_bitmap)
+    struct.pack_into("<I", disk, bgd_offset + 8, inode_table)
+    struct.pack_into("<H", disk, bgd_offset + 12, BLOCKS_COUNT - 30)
+    struct.pack_into("<H", disk, bgd_offset + 14, INODES_COUNT - 11)
+    struct.pack_into("<H", disk, bgd_offset + 16, 2) # Used dirs count
+    
+    # 3. Block Bitmap (Block 3) & Inode Bitmap (Block 4)
+    # حجز البلوكات من 0 إلى 25
+    disk[3 * BLOCK_SIZE : 3 * BLOCK_SIZE + 4] = b"\xFF\xFF\xFF\x03"
+    # حجز الـ Inodes من 1 إلى 11
+    disk[4 * BLOCK_SIZE : 4 * BLOCK_SIZE + 2] = b"\xFF\x07"
+    
+    # 4. Inode Table (Starts at Block 5)
+    # Root Inode هو Inode #2
+    inode2_offset = (inode_table * BLOCK_SIZE) + (1 * 128)
+    root_data_block = 26
+    struct.pack_into("<H", disk, inode2_offset + 0, 0x41ED) # Mode: Directory | 0755
+    struct.pack_into("<I", disk, inode2_offset + 4, 1024)   # Size: 1024 bytes
+    struct.pack_into("<H", disk, inode2_offset + 26, 2)     # Links count: 2 (. and ..)
+    struct.pack_into("<I", disk, inode2_offset + 28, 2)     # Sectors count (512-byte sectors)
+    struct.pack_into("<I", disk, inode2_offset + 40, root_data_block) # Block pointer 0
+    
+    # Inode 11: ملف ترحيبي welcome.txt
+    file_data_block = 27
+    file_content = b"Hello from native Linux EXT2 Filesystem mounted on EOS!\r\nInodes, Block Groups, and VFS abstraction online.\r\n"
+    inode11_offset = (inode_table * BLOCK_SIZE) + (10 * 128)
+    struct.pack_into("<H", disk, inode11_offset + 0, 0x81A4) # Mode: Regular File | 0644
+    struct.pack_into("<I", disk, inode11_offset + 4, len(file_content))
+    struct.pack_into("<H", disk, inode11_offset + 26, 1)
+    struct.pack_into("<I", disk, inode11_offset + 28, 2)
+    struct.pack_into("<I", disk, inode11_offset + 40, file_data_block)
+    
+    # 5. محتوى مجلد الجذر Root Directory (Block 26)
+    # Entry 1: . (Inode 2)
+    r_off = root_data_block * BLOCK_SIZE
+    struct.pack_into("<I", disk, r_off + 0, 2)   # Inode
+    struct.pack_into("<H", disk, r_off + 4, 12)  # Rec len
+    struct.pack_into("<B", disk, r_off + 6, 1)   # Name len
+    struct.pack_into("<B", disk, r_off + 7, 2)   # Type: Dir
+    disk[r_off + 8 : r_off + 9] = b"."
+    
+    # Entry 2: .. (Inode 2)
+    r_off += 12
+    struct.pack_into("<I", disk, r_off + 0, 2)
+    struct.pack_into("<H", disk, r_off + 4, 12)
+    struct.pack_into("<B", disk, r_off + 6, 2)
+    struct.pack_into("<B", disk, r_off + 7, 2)
+    disk[r_off + 8 : r_off + 10] = b".."
+    
+    # Entry 3: welcome.txt (Inode 11)
+    r_off += 12
+    file_name = b"welcome.txt"
+    rec_len = BLOCK_SIZE - 24 # باقي البلوك
+    struct.pack_into("<I", disk, r_off + 0, 11)
+    struct.pack_into("<H", disk, r_off + 4, rec_len)
+    struct.pack_into("<B", disk, r_off + 6, len(file_name))
+    struct.pack_into("<B", disk, r_off + 7, 1) # Type: Reg
+    disk[r_off + 8 : r_off + 8 + len(file_name)] = file_name
+    
+    # 6. محتوى الملف welcome.txt (Block 27)
+    disk[file_data_block * BLOCK_SIZE : file_data_block * BLOCK_SIZE + len(file_content)] = file_content
+    
+    with open(img_path, "wb") as f:
+        f.write(disk)
+    print(f"[✓] Created standard Linux ext2 root filesystem disk: {img_path}")
+
 def prepare_and_run():
     print("[*] 1. Building Userspace Rust Application (release mode)...")
     user_elf = build_userspace_app()
@@ -284,7 +382,7 @@ def prepare_and_run():
     tar_data = create_demo_tar(user_elf)
 
     img_path = os.path.join(target_dir, "uefi_hdd.img")
-    print("[*] 3. Packaging Solid MBR + FAT32 Disk with Kernel & Userspace Rust ELF...")
+    print("[*] 3. Packaging Solid MBR + FAT32 Boot Disk...")
     make_uefi_fat32_disk(img_path, {
         "EOS": kernel_data,
         "limine.conf": conf_data,
@@ -292,13 +390,16 @@ def prepare_and_run():
         "initrd.tar": tar_data
     })
 
+    ext2_img_path = os.path.join(target_dir, "rootfs.ext2")
+    make_ext2_disk(ext2_img_path)
+
     share_dir = r"C:\EOS_SHARE"
     if not os.path.exists(share_dir):
         try:
             os.makedirs(share_dir, exist_ok=True)
             readme_path = os.path.join(share_dir, "hello.txt")
             with open(readme_path, "w", encoding="utf-8") as f:
-                f.write("Hello from Windows Direct Share Folder!\r\nAdd any files here and type 'lsdisk' in EOS.\r\n")
+                f.write("Hello from Windows Direct Share Folder!\r\nAdd any files here and type 'ls' in EOS.\r\n")
         except Exception:
             pass
 
@@ -322,19 +423,28 @@ def prepare_and_run():
     log_path = os.path.join(target_dir, "qemu.log")
     print(f"[*] Debug logging enabled -> {log_path}")
 
-    print(f"[✓] Booting QEMU into EOS Kernel (RAM: 2048M, Windows Share: {share_dir})...")
+    print(f"[✓] Booting QEMU with 8 Cores, FAT32 Storage + Native Linux ext2 RootFS...")
     
-    # محاكاة صحيحة لعتاد IDE الحقيقي في QEMU عبر ناقل isa-ide الصريح لمنافذ 0x1F0
+    # 💡 3 أقراص متكاملة:
+    # 1. ide.0 unit 0: قرص الإقلاع (FAT32 EFI)
+    # 2. ide.0 unit 1: قرص المشاركة مع ويندوز (FAT32 VVFAT)
+    # 3. ide.1 unit 0: قرص لينكس الأصلي (Native ext2 RootFS)
     qemu_cmd = [
         "qemu-system-x86_64",
         "-M", "q35",
         "-m", "2048M",
+        "-smp", "8",
         "-drive", f"if=pflash,format=raw,readonly=on,file={code_fd}",
         "-drive", f"if=pflash,format=raw,file={vars_dst}",
-        "-drive", f"file={img_path},format=raw,if=ide,index=0,media=disk",
-        "-drive", f"file=fat:rw:{share_dir},format=raw,if=ide,index=1,media=disk",
+        "-device", "piix3-ide,id=ide",
+        "-drive", f"id=disk0,file={img_path},format=raw,if=none",
+        "-device", "ide-hd,bus=ide.0,unit=0,drive=disk0",
+        "-drive", f"id=disk1,file=fat:rw:{share_dir},format=raw,if=none",
+        "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
+        "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none",
+        "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",
         "-serial", "stdio",
-        "-d", "int,cpu_reset",
+        "-d", "int,cpu_reset,guest_errors",
         "-D", log_path,
         "-no-reboot",
         "-no-shutdown"

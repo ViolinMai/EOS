@@ -5,6 +5,7 @@
 extern crate alloc;
 
 mod arch;
+mod compositor;
 mod drivers;
 mod font;
 mod fs;
@@ -16,7 +17,9 @@ mod writer;
 
 use core::arch::asm;
 use core::panic::PanicInfo;
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest};
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest};
+use limine::mp::MpInfo;
 use limine::BaseRevision;
 use writer::{FrameWriter, WRITER};
 
@@ -45,8 +48,18 @@ static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
 static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
 
 #[used]
+#[unsafe(link_section = ".requests")]
+static MP_REQUEST: MpRequest = MpRequest::new(0);
+
+#[used]
 #[unsafe(link_section = ".requests_end_marker")]
 static _END_MARKER: () = ();
+
+pub static CORES_ONLINE: AtomicUsize = AtomicUsize::new(1);
+pub static CORE_HEARTBEAT: [AtomicU64; 8] = [
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
+];
 
 extern "C" fn main_shell_entry() {}
 
@@ -89,6 +102,28 @@ unsafe fn extract_limine_file_info(file_ref: &limine::file::File) -> (*const u8,
     }
 }
 
+extern "C" fn ap_entry(info: &MpInfo) -> ! {
+    let cpu_id = info.lapic_id as usize;
+    
+    unsafe { 
+        arch::x86_64::idt::InterruptDescriptorTable::load_raw(
+            core::ptr::addr_of!(arch::x86_64::interrupts::IDT)
+        );
+    };
+
+    CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
+
+    loop {
+        if cpu_id < 8 {
+            CORE_HEARTBEAT[cpu_id].fetch_add(1, Ordering::Relaxed);
+            task::core_poll_and_execute(cpu_id);
+        }
+        for _ in 0..500 {
+            core::hint::spin_loop();
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     serial::SERIAL1.init();
@@ -104,7 +139,6 @@ pub extern "C" fn _start() -> ! {
             fb_w = framebuffer.width as usize;
             fb_h = framebuffer.height as usize;
             let pitch = framebuffer.pitch as usize;
-            let _bpp = framebuffer.bpp as usize;
 
             unsafe {
                 let mut w = FrameWriter::new(buffer_ptr, fb_w, fb_h, pitch);
@@ -114,54 +148,73 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    log_info!("EOS KERNEL (x86_64) ONLINE");
-    log_info!("Framebuffer Initialized: {}x{} (Pitch: {})", fb_w, fb_h, fb_w * 4);
+    log_info!("KERNEL", "EOS KERNEL (x86_64) ONLINE");
+    log_info!("KERNEL", "Framebuffer Initialized: {}x{} (Pitch: {})", fb_w, fb_h, fb_w * 4);
 
-    // 1. الأساسيات المعمارية
     arch::x86_64::gdt::init();
-    log_info!("GDT & TSS loaded with Ring 3 User Segments.");
+    log_info!("KERNEL", "GDT & TSS loaded with Ring 3 User Segments.");
 
     arch::x86_64::interrupts::init();
-    log_info!("IDT initialized (Timer, Keyboard, Mouse).");
+    log_info!("KERNEL", "IDT initialized (Timer, Keyboard, Mouse).");
 
-    // 2. متحكم المقاطعات والمؤقت
     unsafe {
         arch::x86_64::pic::remap();
         arch::x86_64::pit::init();
     }
-    log_info!("PIT Timer configured @ 100Hz.");
+    log_info!("KERNEL", "PIT Timer configured @ 100Hz.");
 
-    // 3. تهيئة الفأرة PS/2
     drivers::mouse::init();
-    log_info!("PS/2 Mouse driver initialized (IRQ 12 active).");
+    log_info!("KERNEL", "PS/2 Mouse driver initialized (IRQ 12 active).");
 
-    // 4. تهيئة تعليمات syscall / sysret
     arch::x86_64::syscall::init();
 
-    // 5. إدارة الذاكرة الافتراضية
     let hhdm_offset = HHDM_REQUEST.response().expect("Limine HHDM missing").offset;
+    
+    if let Some(memmap) = MEMMAP_REQUEST.response() {
+        unsafe {
+            *core::ptr::addr_of_mut!(mm::frame::FRAME_ALLOCATOR) = Some(mm::frame::BitmapFrameAllocator::init(memmap.entries(), hhdm_offset));
+        }
+    }
+
     unsafe {
         mm::paging::VirtualMemoryManager::init(hhdm_offset);
     }
 
-    // 6. مشغلات العتاد: فحص الـ PCI
     drivers::pci::init();
+    drivers::ata::init();
 
-    // 7. تحميل وتركيب الـ Ramdisk (TarFS)
+    fs::ext2::init(2);
+
+    if let Some(mp_resp) = MP_REQUEST.response() {
+        let bsp_id = mp_resp.bsp_lapic_id;
+        let cpus = mp_resp.cpus();
+        let cpu_count = cpus.len();
+        log_info!("SMP", "Symmetric Multiprocessing: Detected {} Cores (BSP ID: {}).", cpu_count, bsp_id);
+
+        for cpu in cpus {
+            if cpu.lapic_id != bsp_id {
+                unsafe {
+                    let raw_ptr = (*cpu) as *const MpInfo as *const u8;
+                    let goto_addr_ptr = raw_ptr.add(16) as *mut usize;
+                    core::ptr::write_volatile(goto_addr_ptr, ap_entry as usize);
+                }
+            }
+        }
+    }
+
     if let Some(mod_resp) = MODULES_REQUEST.response() {
         let modules = mod_resp.modules();
         if let Some(&first_mod) = modules.first() {
             let (mod_ptr, mod_size) = unsafe { extract_limine_file_info(first_mod) };
-            log_info!("Initrd module found: Base={:p}, Size={} bytes", mod_ptr, mod_size);
+            log_info!("KERNEL", "Initrd module found: Base={:p}, Size={} bytes", mod_ptr, mod_size);
             unsafe {
                 fs::tar::init(mod_ptr, mod_size);
             }
         } else {
-            log_warn!("No modules found in Limine response.");
+            log_warn!("KERNEL", "No modules found in Limine response.");
         }
     }
 
-    // 8. تهيئة نظام تعدد المهام
     task::init();
 
     unsafe {
@@ -174,26 +227,41 @@ pub extern "C" fn _start() -> ! {
     task::spawn(1, "Background Worker 1", background_worker_one);
     task::spawn(2, "Background Worker 2", background_worker_two);
 
-    // 9. تفعيل المقاطعات العتادية (sti)
-    log_info!("Enabling Hardware Interrupts (STI)...");
+    log_info!("KERNEL", "Enabling Hardware Interrupts (STI)...");
     unsafe {
         asm!("sti", options(nomem, nostack));
     }
 
-    log_info!("Kernel Interactive Terminal Active.");
+    log_info!("KERNEL", "Kernel Interactive Terminal Active. Type 'gui' to launch Genesis.");
     arch::x86_64::interrupts::print_prompt();
 
     loop {
+        CORE_HEARTBEAT[0].fetch_add(1, Ordering::Relaxed);
+        
+        if let Some(cmd) = arch::x86_64::interrupts::take_pending_command() {
+            arch::x86_64::interrupts::execute_command(&cmd);
+            arch::x86_64::interrupts::print_prompt();
+        }
+
         unsafe {
             asm!("hlt", options(nomem, nostack));
         }
     }
 }
 
+// 💡 نظام Panic مفصل يسجل كل معلومات الانهيار بدقة
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial_println!("\n[KERNEL PANIC]: {}", info);
-    log_error!("KERNEL PANIC: {}", info);
+    let location_str = if let Some(loc) = info.location() {
+        serial_println!("\n\x1b[31;1m[PANIC OCCURRED]\x1b[0m File: {}:{}:{}", loc.file(), loc.line(), loc.column());
+    } else {
+        serial_println!("\n\x1b[31;1m[PANIC OCCURRED]\x1b[0m (Unknown Location)");
+    };
+    let _ = location_str;
+
+    serial_println!("\x1b[31m[REASON]: {}\x1b[0m", info.message());
+    log_fatal!("PANIC", "CRASH: {}", info);
+
     loop {
         core::hint::spin_loop();
     }

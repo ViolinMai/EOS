@@ -5,6 +5,8 @@ use crate::log_info;
 const PCI_CONFIG_ADDRESS: u16 = 0xCF8;
 const PCI_CONFIG_DATA: u16 = 0xCFC;
 
+// 💡 حماية الهيكل لمنع تحذير (الحقول غير مقروءة) بشكل سليم
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub struct PciDevice {
     pub bus: u8,
@@ -57,6 +59,7 @@ pub unsafe fn pci_read_u16(bus: u8, device: u8, func: u8, offset: u8) -> u16 {
     }
 }
 
+#[allow(dead_code)]
 pub fn class_name(class: u8, subclass: u8) -> &'static str {
     match (class, subclass) {
         (0x01, 0x01) => "IDE Controller",
@@ -107,7 +110,7 @@ pub fn init() {
             }
         }
 
-        log_info!("PCI: Enumeration complete. Found {} devices.", list.len());
+        log_info!("PCI", "Enumeration complete. Found {} devices.", list.len());
         *core::ptr::addr_of_mut!(PCI_DEVICES) = Some(list);
     }
 }

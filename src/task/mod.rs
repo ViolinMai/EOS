@@ -5,7 +5,7 @@ use alloc::vec::Vec;
 use crate::arch::x86_64::interrupts::IS_RUNNING_PROGRAM;
 use crate::log_info;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{AtomicBool, Ordering};
 
 pub const TASK_STACK_SIZE: usize = 16 * 1024; // 16 KB لكل مهمة كيرنل
 
@@ -63,6 +63,99 @@ pub struct TaskScheduler {
 
 pub static mut SCHEDULER: Option<TaskScheduler> = None;
 
+#[derive(Copy, Clone, PartialEq, Eq)]
+pub enum JobState {
+    Idle,
+    Submitted,
+    Running,
+    Finished,
+}
+
+pub struct PerCoreJob {
+    pub task_fn: Option<fn()>,
+    pub state: JobState,
+    pub result: u64,
+}
+
+static JOB_LOCKS: [AtomicBool; 8] = [
+    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
+];
+
+static mut CORE_JOBS: [PerCoreJob; 8] = [
+    PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 },
+    PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 },
+    PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 },
+    PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 },
+    PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 },
+    PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 },
+    PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 },
+    PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 },
+];
+
+pub struct SpinLockGuard(usize);
+impl Drop for SpinLockGuard {
+    fn drop(&mut self) {
+        JOB_LOCKS[self.0].store(false, Ordering::Release);
+    }
+}
+
+pub fn lock_job(core_id: usize) -> SpinLockGuard {
+    while JOB_LOCKS[core_id].compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    SpinLockGuard(core_id)
+}
+
+pub fn dispatch_job(core_id: usize, job: fn()) -> Result<(), &'static str> {
+    if core_id == 0 || core_id >= 8 {
+        return Err("Invalid target core ID (Must be between 1 and 7)");
+    }
+
+    let _guard = lock_job(core_id);
+    unsafe {
+        let slot = &mut CORE_JOBS[core_id];
+        if slot.state == JobState::Running || slot.state == JobState::Submitted {
+            return Err("Target core is busy with another job");
+        }
+        slot.task_fn = Some(job);
+        slot.state = JobState::Submitted;
+    }
+    Ok(())
+}
+
+pub fn get_job_state(core_id: usize) -> JobState {
+    let _guard = lock_job(core_id);
+    unsafe { CORE_JOBS[core_id].state }
+}
+
+pub fn core_poll_and_execute(core_id: usize) {
+    if core_id == 0 || core_id >= 8 {
+        return;
+    }
+
+    let mut to_run = None;
+    {
+        let _guard = lock_job(core_id);
+        unsafe {
+            let slot = &mut CORE_JOBS[core_id];
+            if slot.state == JobState::Submitted {
+                to_run = slot.task_fn;
+                slot.state = JobState::Running;
+            }
+        }
+    }
+
+    if let Some(func) = to_run {
+        func();
+        let _guard = lock_job(core_id);
+        unsafe {
+            CORE_JOBS[core_id].state = JobState::Finished;
+            CORE_JOBS[core_id].task_fn = None;
+        }
+    }
+}
+
 pub fn init() {
     let scheduler = TaskScheduler {
         tasks: Vec::new(),
@@ -73,7 +166,7 @@ pub fn init() {
     unsafe {
         *addr_of_mut!(SCHEDULER) = Some(scheduler);
     }
-    log_info!("Task Scheduler: Preemptive multi-tasking engine ready.");
+    log_info!("SCHED", "Task Scheduler: Multi-Core Job Offloading queues ready.");
 }
 
 pub fn spawn(id: u64, name: &'static str, entry: extern "C" fn()) {
@@ -81,7 +174,7 @@ pub fn spawn(id: u64, name: &'static str, entry: extern "C" fn()) {
         if let Some(sched) = &mut *addr_of_mut!(SCHEDULER) {
             let task = Task::new(id, name, entry);
             sched.tasks.push(task);
-            log_info!("Task Spawned: [{}] '{}'", id, name);
+            log_info!("SCHED", "Task Spawned: [{}] '{}'", id, name);
         }
     }
 }
@@ -114,7 +207,7 @@ pub fn enable_preemption() {
     unsafe {
         if let Some(sched) = &mut *addr_of_mut!(SCHEDULER) {
             sched.preemptive_enabled = true;
-            log_info!("Preemptive Scheduling: ACTIVE (Timeslice: 10ms via PIT).");
+            log_info!("SCHED", "Preemptive Scheduling: ACTIVE (Timeslice: 10ms via PIT).");
         }
     }
 }

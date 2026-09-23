@@ -48,3 +48,14 @@ pub fn sleep_ms(ms: u64) {
         }
     }
 }
+
+// 💡 قراءة دورات المعالج مباشرة عبر تعليمة RDTSC للقياس الدقيق
+#[inline]
+pub fn read_tsc() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    unsafe {
+        asm!("rdtsc", out("eax") lo, out("edx") hi, options(nomem, nostack, preserves_flags));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}

@@ -1,6 +1,5 @@
 use core::arch::asm;
 
-// 🔧 تأمين واجهة الـ Syscalls لـ Userspace لمنع الـ ABI Mismatch
 #[inline(never)]
 pub fn sys_read(fd: u64, buf: &mut [u8]) -> usize {
     let ret: u64;
@@ -57,6 +56,13 @@ pub fn sys_blit_image_ptr(ptr: *const u32, x: usize, y: usize, w: usize, h: usiz
     ret
 }
 
+pub fn sys_clear_screen() {
+    unsafe {
+        asm!("syscall", in("rax") 11u64, out("rcx") _, out("r11") _, options(nostack, preserves_flags));
+    }
+}
+
+// 💡 تمرير سعة الـ Buffer للـ Syscall لمنع تجاوز الحدود
 #[inline(never)]
 pub fn sys_read_file(filename: &str, dest: &mut [u8]) -> isize {
     let ret: i64;
@@ -67,6 +73,7 @@ pub fn sys_read_file(filename: &str, dest: &mut [u8]) -> isize {
             in("rdi") filename.as_ptr() as u64,
             in("rsi") filename.len() as u64,
             in("rdx") dest.as_mut_ptr() as u64,
+            in("r10") dest.len() as u64,
             out("rcx") _,
             out("r11") _,
             options(nostack, preserves_flags)

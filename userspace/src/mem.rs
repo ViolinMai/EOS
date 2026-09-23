@@ -1,4 +1,5 @@
-// دوال C-ABI الإلزامية التي يولدها المترجم تلقائياً للعمليات الذاكرية
+#![allow(suspicious_runtime_symbol_definitions)]
+
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
     core::arch::asm!(
@@ -25,7 +26,7 @@ pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    if dest as usize <= src as usize || dest as usize >= (src as usize + n) {
+    if (dest as usize) <= (src as usize) || (dest as usize) >= (src as usize + n) {
         memcpy(dest, src, n)
     } else {
         core::arch::asm!(
