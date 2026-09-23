@@ -4,11 +4,12 @@ use crate::arch::x86_64::keyboard::{handle_scancode, read_scancode, KeyEvent};
 use crate::arch::x86_64::pic;
 use crate::arch::x86_64::pit;
 use crate::drivers::ata::write_file_content;
+use crate::drivers::gamepad::handle_keyboard_nav_scancode;
 use crate::drivers::mouse::on_mouse_interrupt;
 use crate::drivers::pci::{class_name, PCI_DEVICES};
 use crate::font::FONT_WIDTH;
 use crate::fs::elf::load_and_run_elf;
-use crate::fs::{vfs_list_all, vfs_read_bytes, VfsNode};
+use crate::fs::{vfs_read_bytes};
 use crate::mm::heap::{HEAP_ALLOCATOR, HEAP_SIZE};
 use crate::task::{dispatch_job, get_job_state, yield_now, JobState, SCHEDULER};
 use crate::writer::WRITER;
@@ -243,7 +244,7 @@ fn hana_save() {
             if let Some(w) = &mut *addr_of_mut!(WRITER) {
                 w.cursor_x = 24;
                 w.cursor_y = w.height - 32;
-                w.write_str("[✓] SAVED! (Bytes updated on Disk)                    ", 74, 222, 128);
+                w.write_str("[Saved to Disk]", 74, 222, 128);
             }
         }
     }
@@ -263,13 +264,7 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: Interrupt
         let scancode = read_scancode();
 
         if GUI_ACTIVE.load(Ordering::Relaxed) {
-            if scancode == 0x01 {
-                GUI_ACTIVE.store(false, Ordering::SeqCst);
-                if let Some(writer) = &mut *addr_of_mut!(WRITER) {
-                    writer.restore_screen();
-                }
-                print_prompt();
-            }
+            handle_keyboard_nav_scancode(scancode);
             pic::send_eoi(1);
             return;
         }
@@ -617,13 +612,11 @@ pub fn execute_command(cmd: &str) {
         }
         "ls" => {
             raw_serial_trace("[TRACE: LS running]\n");
-            let nodes = vfs_list_all();
-            log_info!("VFS", "Listing All System Files across Mounted Filesystems (Total: {}):", nodes.len());
+            let nodes = crate::fs::list_directory_contents("");
+            log_info!("VFS", "Listing Root Directories:");
             for node in nodes {
-                match node {
-                    VfsNode::Ext2(name, sz)    => log_info!("VFS", "  [EXT2-ROOT] {:<18} | {:>8} bytes", name, sz),
-                    VfsNode::Disk(name, sz)    => log_info!("VFS", "  [FAT-DISK]  {:<18} | {:>8} bytes", name, sz),
-                    VfsNode::Ramdisk(name, sz) => log_info!("VFS", "  [INITRD]    {:<18} | {:>8} bytes", name, sz),
+                if let crate::fs::FsItem::Directory(name) = node {
+                    log_info!("VFS", "  📁 [{}]", name);
                 }
             }
         }
@@ -690,37 +683,11 @@ pub fn execute_command(cmd: &str) {
                 writer.clear(15, 23, 42);
             }
         },
-        "reboot" => unsafe {
-            asm!("2: in al, 0x64; test al, 0x02; jnz 2b; mov al, 0xFE; out 0x64, al", options(nomem, nostack));
+        "reboot" => {
+            crate::arch::x86_64::power::reboot();
         },
         other => {
-            if let Some(target_file) = other.strip_prefix("view ") {
-                let clean_name = target_file.trim();
-                
-                unsafe {
-                    if let Some(writer) = &mut *addr_of_mut!(WRITER) {
-                        writer.save_screen();
-                    }
-                }
-
-                if let Ok(elf_bytes) = vfs_read_bytes("app.elf") {
-                    IS_RUNNING_PROGRAM.store(true, Ordering::SeqCst);
-                    if let Err(e) = load_and_run_elf(&elf_bytes, clean_name) {
-                        log_error!("VIEWER", "Failed to launch viewer: {}", e);
-                    }
-                    IS_RUNNING_PROGRAM.store(false, Ordering::SeqCst);
-                } else {
-                    log_error!("VIEWER", "Viewer app.elf not found in initrd.");
-                }
-
-                unsafe {
-                    if let Some(writer) = &mut *addr_of_mut!(WRITER) {
-                        writer.restore_screen();
-                    }
-                }
-            } else if other == "view" {
-                log_warn!("VIEWER", "Usage: view <filename> (e.g. 'view icon.png')");
-            } else if let Some(filename) = other.strip_prefix("hana ") {
+            if let Some(filename) = other.strip_prefix("hana ") {
                 hana_start(filename.trim());
             } else if let Some(path) = other.strip_prefix("cat ") {
                 match vfs_read_bytes(path.trim()) {

@@ -3,7 +3,8 @@ use core::fmt;
 pub const FONT_WIDTH: usize = 8;
 pub const FONT_HEIGHT: usize = 16;
 
-const SAVED_SCREEN_SIZE: usize = 1280 * 800;
+// 💡 توسيع مساحة حفظ الشاشة لدعم 1920x1080 بدقة كاملة
+const SAVED_SCREEN_SIZE: usize = 1920 * 1080;
 static mut SCREEN_SAVE_BUFFER: [u32; SAVED_SCREEN_SIZE] = [0; SAVED_SCREEN_SIZE];
 static mut SCREEN_SAVED: bool = false;
 
@@ -158,58 +159,6 @@ impl FramebufferWriter {
         let line_height = FONT_HEIGHT * self.scale;
         while self.cursor_y + line_height >= self.height - 12 {
             self.scroll_up();
-        }
-    }
-
-    pub fn blit_buffer_alpha(&mut self, buf: &[u32], dest_x: usize, dest_y: usize, w: usize, h: usize) {
-        self.erase_mouse_cursor();
-
-        if dest_x >= self.width || dest_y >= self.height || w == 0 || h == 0 {
-            return;
-        }
-
-        let render_w = core::cmp::min(w, self.width - dest_x);
-        let render_h = core::cmp::min(h, self.height - dest_y);
-
-        for y in 0..render_h {
-            let screen_y = dest_y + y;
-            let row_offset = y * w;
-
-            for x in 0..render_w {
-                let screen_x = dest_x + x;
-                let buf_idx = row_offset + x;
-
-                if buf_idx >= buf.len() {
-                    return;
-                }
-
-                let pixel = buf[buf_idx];
-                let alpha = ((pixel >> 24) & 0xFF) as u32;
-
-                if alpha == 0 {
-                    continue;
-                }
-
-                let src_r = ((pixel >> 16) & 0xFF) as u32;
-                let src_g = ((pixel >> 8) & 0xFF) as u32;
-                let src_b = (pixel & 0xFF) as u32;
-
-                if alpha >= 255 {
-                    self.put_pixel(screen_x, screen_y, src_r as u8, src_g as u8, src_b as u8);
-                } else {
-                    let dst_pixel = self.get_pixel(screen_x, screen_y);
-                    let dst_r = (dst_pixel >> 16) & 0xFF;
-                    let dst_g = (dst_pixel >> 8) & 0xFF;
-                    let dst_b = dst_pixel & 0xFF;
-
-                    let inv_a = 255 - alpha;
-                    let out_r = ((src_r * alpha + dst_r * inv_a) / 255) as u8;
-                    let out_g = ((src_g * alpha + dst_g * inv_a) / 255) as u8;
-                    let out_b = ((src_b * alpha + dst_b * inv_a) / 255) as u8;
-
-                    self.put_pixel(screen_x, screen_y, out_r, out_g, out_b);
-                }
-            }
         }
     }
 

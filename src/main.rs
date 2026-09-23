@@ -75,16 +75,13 @@ unsafe fn extract_limine_file_info(file_ref: &limine::file::File) -> (*const u8,
 extern "C" fn ap_entry(info: &MpInfo) -> ! {
     let cpu_id = info.lapic_id as usize;
 
-    // 💡 تحميل الـ GDT والـ TSS المستقل فوراً لكل AP
     arch::x86_64::gdt::init_core(cpu_id);
 
     unsafe { 
         arch::x86_64::idt::InterruptDescriptorTable::load_raw(core::ptr::addr_of!(arch::x86_64::interrupts::IDT));
     };
 
-    // 💡 إعداد الـ Syscalls الخاص بهذه النواة
     arch::x86_64::syscall::init_core_syscall(cpu_id);
-
     CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
     
     loop {
@@ -100,7 +97,53 @@ extern "C" fn ap_entry(info: &MpInfo) -> ! {
 pub extern "C" fn _start() -> ! {
     serial::SERIAL1.init();
     serial::SERIAL2.init(); 
+
+    // 💡 1. تهيئة إدارة الذاكرة فوراً قبل أي عملية تخصيص (Allocation)
+    let hhdm_offset = HHDM_REQUEST.response().expect("Limine HHDM missing").offset;
     
+    if let Some(memmap) = MEMMAP_REQUEST.response() {
+        unsafe {
+            *core::ptr::addr_of_mut!(mm::frame::FRAME_ALLOCATOR) = Some(
+                mm::frame::BitmapFrameAllocator::init(memmap.entries(), hhdm_offset)
+            );
+        }
+    }
+
+    unsafe { mm::paging::VirtualMemoryManager::init(hhdm_offset); }
+
+    // 💡 2. حجز مساحة حرة مستمرة بحجم 256MB للـ Heap فوراً عبر الـ Usable Entries
+    if let Some(memmap) = MEMMAP_REQUEST.response() {
+        let heap_size = mm::heap::HEAP_SIZE;
+        let mut heap_initialized = false;
+
+        for entry in memmap.entries() {
+            let entry_type: u64 = unsafe { core::ptr::read_unaligned(&entry.type_ as *const _ as *const u64) };
+            if entry_type == 0 && entry.length as usize >= heap_size {
+                let heap_virt = (entry.base + hhdm_offset) as *mut u8;
+                unsafe {
+                    mm::heap::HEAP_ALLOCATOR.init(heap_virt, heap_size);
+                }
+                heap_initialized = true;
+                break;
+            }
+        }
+
+        if !heap_initialized {
+            // بديل احتياطي إذا كانت القطع مجزأة
+            for entry in memmap.entries() {
+                let entry_type: u64 = unsafe { core::ptr::read_unaligned(&entry.type_ as *const _ as *const u64) };
+                if entry_type == 0 && entry.length as usize >= 64 * 1024 * 1024 {
+                    let heap_virt = (entry.base + hhdm_offset) as *mut u8;
+                    unsafe {
+                        mm::heap::HEAP_ALLOCATOR.init(heap_virt, entry.length as usize);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // 💡 3. الآن بعد أن أصبح الـ Heap جاهزاً تماماً، نبدأ ببقية الخدمات
     serial_println!("\n==========================================");
     serial_println!("[EOS] SERIAL CONSOLE INITIALIZED");
 
@@ -119,22 +162,13 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // 💡 تهيئة GDT و TSS النواة الرئيسية (Core 0)
     arch::x86_64::gdt::init_core(0);
-
     arch::x86_64::interrupts::init();
     unsafe {
         arch::x86_64::pic::remap();
         arch::x86_64::pit::init();
     }
     drivers::mouse::init();
-
-    let hhdm_offset = HHDM_REQUEST.response().expect("Limine HHDM missing").offset;
-    if let Some(memmap) = MEMMAP_REQUEST.response() {
-        unsafe { *core::ptr::addr_of_mut!(mm::frame::FRAME_ALLOCATOR) = Some(mm::frame::BitmapFrameAllocator::init(memmap.entries(), hhdm_offset)); }
-    }
-
-    unsafe { mm::paging::VirtualMemoryManager::init(hhdm_offset); }
     arch::x86_64::syscall::init();
     drivers::pci::init();
     drivers::ata::init();
@@ -170,7 +204,7 @@ pub extern "C" fn _start() -> ! {
 
     unsafe { asm!("sti", options(nomem, nostack)); }
 
-    log_info!("SMP", "Architecture Assigned: Core 0 [Kernel/Syscalls], Core 1 [Dedicated GUI], Cores 2-7 [Worker Pool]");
+    log_info!("SMP", "Architecture Ready: Core 0 [Kernel], Core 1 [Dedicated GUI], Cores 2-7 [Pool]");
     unsafe {
         if let Some(writer) = &mut *core::ptr::addr_of_mut!(WRITER) {
             writer.save_screen();

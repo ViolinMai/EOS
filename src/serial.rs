@@ -31,14 +31,14 @@ impl SerialPort {
 
     pub fn init(&self) {
         unsafe {
-            outb(self.base + 1, 0x00); 
-            outb(self.base + 3, 0x80); 
-            outb(self.base + 0, 0x03); 
+            outb(self.base + 1, 0x00); // تعطيل المقاطعات مؤقتاً
+            outb(self.base + 3, 0x80); // تفعيل DLAB
+            outb(self.base + 0, 0x01); // Divisor = 1 (Baud 115200) لنقل أسرع لليد
             outb(self.base + 1, 0x00);
-            outb(self.base + 3, 0x03); 
-            outb(self.base + 2, 0xC7); 
-            outb(self.base + 1, 0x01); // تفعيل مقاطعات استقبال البيانات Data Available
-            outb(self.base + 4, 0x0B); 
+            outb(self.base + 3, 0x03); // 8 bits, no parity, 1 stop bit
+            outb(self.base + 2, 0xC7); // Enable FIFO, clear RX/TX FIFO, 14-byte threshold
+            outb(self.base + 4, 0x0B); // IRQs enabled, RTS/DSR set
+            outb(self.base + 1, 0x01); // تفعيل مقاطعة Received Data Available
         }
     }
 

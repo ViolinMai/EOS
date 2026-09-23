@@ -42,29 +42,21 @@ def build_userspace_app():
     ]
     res = subprocess.run(cmd, shell=True)
     if res.returncode != 0:
-        print("[-] Failed to build userspace Rust application.")
         return None
 
     bin_path = os.path.join(userspace_dir, "target", "x86_64-unknown-none", "release", "user_app")
     if os.path.exists(bin_path):
         with open(bin_path, "rb") as f:
-            data = f.read()
-            print(f"[✓] Built userspace app successfully: {len(data)} bytes.")
-            return data
+            return f.read()
     return None
 
 def create_demo_tar(user_elf_data):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
-        f1_data = b"Welcome to EOS Kernel!\r\nThis is a real file loaded directly from the Ramdisk TarFS.\r\n"
+        f1_data = b"Welcome to EOS Kernel!\r\n"
         ti1 = tarfile.TarInfo(name="readme.txt")
         ti1.size = len(f1_data)
         tar.addfile(ti1, io.BytesIO(f1_data))
-
-        f2_data = b"EOS Version 0.1.0-alpha (x86_64 Rust Bare-Metal)\r\n"
-        ti2 = tarfile.TarInfo(name="version.sys")
-        ti2.size = len(f2_data)
-        tar.addfile(ti2, io.BytesIO(f2_data))
 
         if user_elf_data:
             ti3 = tarfile.TarInfo(name="app.elf")
@@ -91,44 +83,31 @@ def make_uefi_fat32_disk(img_path, files):
     PART_START_SECTOR = 2048
     PART_SECTORS = 2097152
     TOTAL_SECTORS = PART_START_SECTOR + PART_SECTORS
-
     FAT_SIZE_SECTORS = 2048
     ROOT_CLUSTER = 2
 
     disk = bytearray(TOTAL_SECTORS * SECTOR_SIZE)
-
     disk[510:512] = b"\x55\xAA"
-    disk[446:462] = struct.pack(
-        "<BBBBBBBBII",
-        0x80, 0x00, 0x02, 0x00, 0x0C, 0xFF, 0xFF, 0xFF,
-        PART_START_SECTOR, PART_SECTORS
-    )
+    disk[446:462] = struct.pack("<BBBBBBBBII", 0x80, 0x00, 0x02, 0x00, 0x0C, 0xFF, 0xFF, 0xFF, PART_START_SECTOR, PART_SECTORS)
 
     vbr_offset = PART_START_SECTOR * SECTOR_SIZE
     vbr = bytearray(SECTOR_SIZE)
     vbr[0:3] = b"\xEB\x58\x90"
     vbr[3:11] = b"MSWIN4.1"
-
     struct.pack_into("<H", vbr, 11, SECTOR_SIZE)
     vbr[13] = SECTORS_PER_CLUSTER
     struct.pack_into("<H", vbr, 14, RESERVED_SECTORS)
     vbr[16] = NUM_FATS
-    struct.pack_into("<H", vbr, 17, 0)
-    struct.pack_into("<H", vbr, 19, 0)
     vbr[21] = 0xF8
-    struct.pack_into("<H", vbr, 22, 0)
     struct.pack_into("<H", vbr, 24, 63)
     struct.pack_into("<H", vbr, 26, 255)
     struct.pack_into("<I", vbr, 28, PART_START_SECTOR)
     struct.pack_into("<I", vbr, 32, PART_SECTORS)
     struct.pack_into("<I", vbr, 36, FAT_SIZE_SECTORS)
-    struct.pack_into("<H", vbr, 40, 0)
-    struct.pack_into("<H", vbr, 42, 0)
     struct.pack_into("<I", vbr, 44, ROOT_CLUSTER)
     struct.pack_into("<H", vbr, 48, 1)
     struct.pack_into("<H", vbr, 50, 6)
     vbr[64] = 0x80
-    vbr[65] = 0x00
     vbr[66] = 0x29
     struct.pack_into("<I", vbr, 67, 0x12345678)
     vbr[71:82] = b"EOS_BOOT   "
@@ -137,14 +116,6 @@ def make_uefi_fat32_disk(img_path, files):
 
     disk[vbr_offset : vbr_offset + SECTOR_SIZE] = vbr
     disk[vbr_offset + (6 * SECTOR_SIZE) : vbr_offset + (7 * SECTOR_SIZE)] = vbr
-
-    fsinfo_offset = vbr_offset + SECTOR_SIZE
-    fsinfo = bytearray(SECTOR_SIZE)
-    fsinfo[0:4] = b"RRaA"
-    fsinfo[484:488] = b"rrAa"
-    struct.pack_into("<II", fsinfo, 488, 0xFFFFFFFF, 0xFFFFFFFF)
-    fsinfo[510:512] = b"\x55\xAA"
-    disk[fsinfo_offset : fsinfo_offset + SECTOR_SIZE] = fsinfo
 
     fat1_offset = vbr_offset + (RESERVED_SECTORS * SECTOR_SIZE)
     data_start = fat1_offset + (NUM_FATS * FAT_SIZE_SECTORS * SECTOR_SIZE)
@@ -161,8 +132,7 @@ def make_uefi_fat32_disk(img_path, files):
 
     def write_file(data):
         nonlocal current_cluster
-        if len(data) == 0:
-            return 0
+        if len(data) == 0: return 0
         needed = (len(data) + CLUSTER_SIZE - 1) // CLUSTER_SIZE
         start_c = current_cluster
         for i in range(needed):
@@ -250,6 +220,10 @@ def make_uefi_fat32_disk(img_path, files):
         f.write(disk)
 
 def make_ext2_disk(img_path):
+    # لا نعيد إنشاء قرص ext2 إذا كان موجوداً للحفاظ على الإعدادات والملفات المخزنة
+    if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
+        return
+
     BLOCK_SIZE = 1024
     BLOCKS_COUNT = 8192
     INODES_COUNT = 256
@@ -257,7 +231,6 @@ def make_ext2_disk(img_path):
     INODES_PER_GROUP = 256
     
     disk = bytearray(BLOCKS_COUNT * BLOCK_SIZE)
-    
     sb_offset = 1024
     struct.pack_into("<I", disk, sb_offset + 0, INODES_COUNT)
     struct.pack_into("<I", disk, sb_offset + 4, BLOCKS_COUNT)
@@ -337,6 +310,17 @@ def prepare_and_run():
     ext2_img_path = os.path.join(target_dir, "rootfs.ext2")
     make_ext2_disk(ext2_img_path)
 
+    # تجهيز مجلد المشاركة من ويندوز وإنشاء ملف eos.cfg إذا لم يكن موجوداً
+    share_dir = r"C:\EOS_SHARE"
+    try:
+        os.makedirs(share_dir, exist_ok=True)
+        cfg_file = os.path.join(share_dir, "eos.cfg")
+        if not os.path.exists(cfg_file):
+            with open(cfg_file, "w", encoding="utf-8") as f:
+                f.write("THEME=0\nWALLPAPER=\n")
+    except Exception:
+        pass
+
     qemu_share = r"C:\Program Files\qemu\share"
     code_fd = os.path.join(qemu_share, "edk2-x86_64-code.fd")
     vars_src = os.path.join(qemu_share, "edk2-i386-vars.fd")
@@ -350,6 +334,10 @@ def prepare_and_run():
 
     log_path = os.path.join(target_dir, "qemu.log")
 
+    print("[*] Starting Gamepad Bridge Server...")
+    bridge_proc = subprocess.Popen([sys.executable, "gamepad_bridge.py"])
+    time.sleep(0.5)
+
     qemu_cmd = [
         "qemu-system-x86_64",
         "-M", "q35",
@@ -360,10 +348,12 @@ def prepare_and_run():
         "-device", "piix3-ide,id=ide",
         "-drive", f"id=disk0,file={img_path},format=raw,if=none",
         "-device", "ide-hd,bus=ide.0,unit=0,drive=disk0",
+        "-drive", f"id=disk1,file=fat:rw:{share_dir},format=raw,if=none",
+        "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
         "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none",
         "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",
         "-serial", "stdio",
-        "-serial", "tcp:127.0.0.1:4444,server,nowait",
+        "-serial", "tcp:127.0.0.1:4444",
         "-d", "int,cpu_reset,guest_errors",
         "-D", log_path,
         "-no-reboot",
@@ -371,15 +361,8 @@ def prepare_and_run():
     ]
     
     print("[*] Launching QEMU...")
-    qemu_proc = subprocess.Popen(qemu_cmd)
-
-    # تشغيل الـ Bridge بعد تأخير زمني بسيط للتأكد من إقلاع النواة وفتح الـ Port
-    time.sleep(1.5)
-    print("[*] Starting Gamepad IPC Bridge...")
-    bridge_proc = subprocess.Popen([sys.executable, "gamepad_bridge.py"])
-
     try:
-        qemu_proc.wait()
+        subprocess.run(qemu_cmd)
     finally:
         bridge_proc.terminate()
 

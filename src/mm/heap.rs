@@ -1,61 +1,49 @@
 use core::alloc::{GlobalAlloc, Layout};
-use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use core::mem::MaybeUninit;
+use linked_list_allocator::LockedHeap;
 
-pub const HEAP_SIZE: usize = 16 * 1024 * 1024; // 16 MB
+pub const HEAP_SIZE: usize = 256 * 1024 * 1024; // 256 MB مساحة تشغيل ضخمة
 
-#[allow(dead_code)]
-#[repr(align(4096))]
-pub struct HeapStorage(pub [u8; HEAP_SIZE]);
+#[global_allocator]
+pub static HEAP_ALLOCATOR: DynamicKernelHeap = DynamicKernelHeap::new();
 
-static mut HEAP_MEMORY: MaybeUninit<HeapStorage> = MaybeUninit::uninit();
-
-pub struct LockedBumpAllocator {
-    next: AtomicUsize,
+pub struct DynamicKernelHeap {
+    inner: LockedHeap,
+    allocated_bytes: AtomicUsize,
 }
 
-impl LockedBumpAllocator {
+impl DynamicKernelHeap {
     pub const fn new() -> Self {
         Self {
-            next: AtomicUsize::new(0),
+            inner: LockedHeap::empty(),
+            allocated_bytes: AtomicUsize::new(0),
+        }
+    }
+
+    pub unsafe fn init(&self, start: *mut u8, size: usize) {
+        unsafe {
+            self.inner.lock().init(start, size);
         }
     }
 
     pub fn used(&self) -> usize {
-        self.next.load(Ordering::Relaxed)
+        self.allocated_bytes.load(Ordering::Relaxed)
     }
 }
 
-unsafe impl GlobalAlloc for LockedBumpAllocator {
+unsafe impl GlobalAlloc for DynamicKernelHeap {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let heap_start = addr_of_mut!(HEAP_MEMORY) as usize;
-        let heap_end = heap_start + HEAP_SIZE;
-
-        loop {
-            let current_offset = self.next.load(Ordering::Relaxed);
-            let current_addr = heap_start + current_offset;
-
-            let align = layout.align();
-            let alloc_start = (current_addr + align - 1) & !(align - 1);
-            let new_offset = (alloc_start - heap_start) + layout.size();
-
-            if heap_start + new_offset > heap_end {
-                return core::ptr::null_mut();
-            }
-
-            if self
-                .next
-                .compare_exchange_weak(current_offset, new_offset, Ordering::SeqCst, Ordering::Relaxed)
-                .is_ok()
-            {
-                return alloc_start as *mut u8;
-            }
+        let ptr = unsafe { self.inner.alloc(layout) };
+        if !ptr.is_null() {
+            self.allocated_bytes.fetch_add(layout.size(), Ordering::Relaxed);
         }
+        ptr
     }
 
-    unsafe fn dealloc(&self, _ptr: *mut u8, _layout: Layout) {}
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe {
+            self.inner.dealloc(ptr, layout);
+        }
+        self.allocated_bytes.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
 }
-
-#[global_allocator]
-pub static HEAP_ALLOCATOR: LockedBumpAllocator = LockedBumpAllocator::new();

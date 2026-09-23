@@ -18,6 +18,7 @@ use syscall::{
     sys_lseek, sys_mmap, sys_open, sys_read, sys_clock_gettime, TimeSpec,
     SEEK_END, SEEK_SET,
 };
+use zune_jpeg::JpegDecoder;
 
 #[global_allocator]
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
@@ -79,37 +80,53 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
     if pa <= pb && pa <= pc { a } else if pb <= pc { b } else { c }
 }
 
-fn try_render_png(path: &str) -> Result<(), &'static str> {
-    let t0 = get_time_ms();
+fn try_render_jpeg(data: &[u8]) -> Result<(), &'static str> {
+    let t_start = get_time_ms();
+    let mut decoder = JpegDecoder::new(data);
+    let pixels_u8 = decoder.decode().map_err(|_| "Failed to decode JPEG")?;
+    let info = decoder.info().ok_or("Failed to fetch JPEG metadata")?;
+    let t_decode = get_time_ms();
 
-    let fd = sys_open(path);
-    if fd < 0 {
-        return Err("File not found");
+    let width = info.width as usize;
+    let height = info.height as usize;
+
+    print_str("[Viewer] JPEG Dimensions: ");
+    print_num(width);
+    print_str("x");
+    print_num(height);
+    print_str(" (Decode: ");
+    print_num((t_decode - t_start) as usize);
+    print_str(" ms)\n");
+
+    let step = if width > 600 || height > 400 { 2 } else { 1 };
+    let out_w = width / step;
+    let out_h = height / step;
+    let total_pixels = out_w * out_h;
+
+    let mut pixels = alloc::vec![0u32; total_pixels];
+    let mut out_idx = 0usize;
+
+    for y in (0..height).step_by(step) {
+        if out_idx >= total_pixels { break; }
+        let row_start = y * width * 3;
+        for x in (0..width).step_by(step) {
+            if out_idx >= total_pixels { break; }
+            let off = row_start + (x * 3);
+            if off + 2 < pixels_u8.len() {
+                let r = pixels_u8[off] as u32;
+                let g = pixels_u8[off + 1] as u32;
+                let b = pixels_u8[off + 2] as u32;
+                pixels[out_idx] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+                out_idx += 1;
+            }
+        }
     }
 
-    let file_size = sys_lseek(fd as u64, 0, SEEK_END);
-    sys_lseek(fd as u64, 0, SEEK_SET);
+    sys_blit_image_ptr(pixels.as_ptr(), 0, 0, out_w, out_h);
+    Ok(())
+}
 
-    if file_size <= 0 {
-        sys_close(fd as u64);
-        return Err("Empty or invalid file");
-    }
-
-    let mut data = alloc::vec![0u8; file_size as usize];
-    sys_read(fd as u64, &mut data);
-    sys_close(fd as u64);
-
-    let t_io = get_time_ms();
-    print_str("[Benchmark] File Read via VFS: ");
-    print_num((t_io - t0) as usize);
-    print_str(" ms (");
-    print_num(file_size as usize);
-    print_str(" bytes)\n");
-
-    if data.len() < 33 || &data[0..8] != &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
-        return Err("Invalid PNG signature");
-    }
-
+fn try_render_png(data: &[u8]) -> Result<(), &'static str> {
     let width = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as usize;
     let height = u32::from_be_bytes([data[20], data[21], data[22], data[23]]) as usize;
     let color_type = data[25];
@@ -119,14 +136,6 @@ fn try_render_png(path: &str) -> Result<(), &'static str> {
         6 => 4,
         _ => return Err("Unsupported color type"),
     };
-
-    print_str("[Viewer] Target Image: ");
-    print_str(path);
-    print_str(" (");
-    print_num(width);
-    print_str("x");
-    print_num(height);
-    print_str(")\n");
 
     let mut idat_data = Vec::new();
     let mut offset = 33;
@@ -143,16 +152,8 @@ fn try_render_png(path: &str) -> Result<(), &'static str> {
         offset = doff + len + 4;
     }
 
-    let t_extract = get_time_ms();
     let decompressed = miniz_oxide::inflate::decompress_to_vec_zlib(&idat_data)
         .map_err(|_| "Decompression failed")?;
-    let t_inflate = get_time_ms();
-
-    print_str("[Benchmark] Deflate Decompression: ");
-    print_num((t_inflate - t_extract) as usize);
-    print_str(" ms (Decompressed: ");
-    print_num(decompressed.len());
-    print_str(" bytes)\n");
 
     let stride = width * bpp;
     let line_stride = stride + 1;
@@ -161,7 +162,6 @@ fn try_render_png(path: &str) -> Result<(), &'static str> {
         return Err("Truncated stream");
     }
 
-    // تجهيز البكسلات للنافذة العائمة
     let step = if width > 600 || height > 400 { 2 } else { 1 };
     let out_w = width / step;
     let out_h = height / step;
@@ -180,9 +180,7 @@ fn try_render_png(path: &str) -> Result<(), &'static str> {
         let raw_line = &decompressed[data_start..data_start + stride];
 
         match filter {
-            0 => {
-                curr_row.copy_from_slice(raw_line);
-            }
+            0 => curr_row.copy_from_slice(raw_line),
             1 => {
                 for x in 0..stride {
                     let left = if x >= bpp { curr_row[x - bpp] } else { 0 };
@@ -228,20 +226,46 @@ fn try_render_png(path: &str) -> Result<(), &'static str> {
         prev_row.copy_from_slice(&curr_row);
     }
 
-    let t_filter = get_time_ms();
-    print_str("[Benchmark] Scanline Unfiltering: ");
-    print_num((t_filter - t_inflate) as usize);
-    print_str(" ms\n");
-
-    // إرسال الصورة للنافذة العائمة دون حجب الشاشة
     sys_blit_image_ptr(pixels.as_ptr(), 0, 0, out_w, out_h);
-
-    let t_blit = get_time_ms();
-    print_str("[Benchmark] Dispatched to Floating Window: ");
-    print_num((t_blit - t_filter) as usize);
-    print_str(" ms\n");
-
     Ok(())
+}
+
+fn try_render_image(path: &str) -> Result<(), &'static str> {
+    let t0 = get_time_ms();
+    let fd = sys_open(path);
+    if fd < 0 {
+        return Err("File not found");
+    }
+
+    let file_size = sys_lseek(fd as u64, 0, SEEK_END);
+    sys_lseek(fd as u64, 0, SEEK_SET);
+
+    if file_size <= 0 {
+        sys_close(fd as u64);
+        return Err("Empty or invalid file");
+    }
+
+    let mut data = alloc::vec![0u8; file_size as usize];
+    sys_read(fd as u64, &mut data);
+    sys_close(fd as u64);
+
+    let t_io = get_time_ms();
+    print_str("[Benchmark] File Read via VFS: ");
+    print_num((t_io - t0) as usize);
+    print_str(" ms (");
+    print_num(file_size as usize);
+    print_str(" bytes)\n");
+
+    // الكشف التلقائي عن نوع الصورة بواسطة الـ Magic Signature
+    if data.len() >= 8 && &data[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+        print_str("[Viewer] Detected Format: PNG\n");
+        try_render_png(&data)
+    } else if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+        print_str("[Viewer] Detected Format: JPEG / JPG\n");
+        try_render_jpeg(&data)
+    } else {
+        Err("Unsupported image signature (only PNG and JPEG are supported)")
+    }
 }
 
 fn get_passed_argument() -> &'static str {
@@ -268,7 +292,7 @@ extern "C" fn app_main() {
     init_heap();
 
     let target_file = get_passed_argument();
-    match try_render_png(target_file) {
+    match try_render_image(target_file) {
         Ok(()) => print_str("[Viewer] Image Rendered Successfully in Overlay.\n"),
         Err(err) => {
             print_str("[Viewer] Error: ");
@@ -277,7 +301,6 @@ extern "C" fn app_main() {
         }
     }
 
-    // الخروج فوراً ليعود Core 2 إلى وضع الخمول فور الانتهاء من المعالجة
     sys_exit(0);
 }
 

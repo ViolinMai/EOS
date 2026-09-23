@@ -5,6 +5,9 @@ edition = "2024"
 
 [dependencies]
 limine = "0.6.5"
+linked_list_allocator = "0.10"
+miniz_oxide = { version = "0.7.4", default-features = false, features = ["with-alloc"] }
+zune-jpeg = { version = "0.4.13", default-features = false }
 
 [profile.dev]
 panic = "abort"
