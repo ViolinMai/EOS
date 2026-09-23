@@ -65,14 +65,13 @@ extern "C" fn jump_to_ring3(entry: u64, rsp: u64, user_cs: u64, user_ds: u64) {
 
         "mov [{kernel_sp}], rsp",
 
-        "push rcx",
-        "push rsi",
-        "push 0x202",
-        "push rdx",
-        "push rdi",
-        
-        "swapgs",
+        "push rcx",       // SS (User Data)
+        "push rsi",       // RSP (User Stack)
+        "push 0x202",     // RFLAGS (IF enabled)
+        "push rdx",       // CS (User Code)
+        "push rdi",       // RIP (User Entry Point)
 
+        "swapgs",         // 💡 ضرورية جداً عند التحول إلى Ring 3
         "iretq",
         kernel_sp = sym crate::arch::x86_64::syscall::KERNEL_SAVED_RSP,
     );

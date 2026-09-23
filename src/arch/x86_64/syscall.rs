@@ -15,7 +15,7 @@ pub static mut USER_SAVED_RSP: u64 = 0;
 pub static mut KERNEL_SYSCALL_STACK_TOP: u64 = 0;
 pub static ELF_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-static mut SYSCALL_STACK: [u8; 16384] = [0; 16384];
+static mut SYSCALL_STACK: [u8; 32768] = [0; 32768];
 
 #[inline]
 unsafe fn rdmsr(msr: u32) -> u64 {
@@ -118,7 +118,7 @@ pub fn init() {
         wrmsr(0xC0000084, fmask);
 
         let stack_ptr = addr_of_mut!(SYSCALL_STACK) as *mut u8;
-        let stack_top = stack_ptr as u64 + 16384;
+        let stack_top = stack_ptr as u64 + 32768;
         *addr_of_mut!(KERNEL_SYSCALL_STACK_TOP) = stack_top;
     }
     log_info!("SYSCALL", "System Calls (MSR/Sysret) initialized with POSIX foundations.");
@@ -151,7 +151,7 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     asm!(
                         "mov rsp, {sp}",
                         "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx", "pop rbp",
-                        "sti", "ret",
+                        "ret",
                         sp = in(reg) saved_sp,
                         options(noreturn)
                     );
@@ -161,8 +161,9 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         }
         2 => {
             if frame.rdi == 1 || frame.rdi == 2 {
+                let count = core::cmp::min(frame.rdx as usize, 4096); // حماية من سكب بايتات ضخمة
                 unsafe {
-                    let slice = core::slice::from_raw_parts(frame.rsi as *const u8, frame.rdx as usize);
+                    let slice = core::slice::from_raw_parts(frame.rsi as *const u8, count);
                     if let Ok(s) = core::str::from_utf8(slice) {
                         crate::serial_print!("{}", s);
                         if let Some(w) = &mut *addr_of_mut!(WRITER) {
@@ -170,7 +171,7 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                         }
                     }
                 }
-                frame.rax = frame.rdx;
+                frame.rax = count as u64;
             } else {
                 frame.rax = -1i64 as u64;
             }
@@ -344,7 +345,6 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                         if !pt.entries[p1_idx].is_present() {
                             let frame_phys = frame_alloc.allocate_frame().unwrap();
                             let frame_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
-                            // 💡 السر هنا: استخدام write_bytes بدلاً من حلقة for يختصر دقيقتين إلى جزء من الميلي ثانية
                             core::ptr::write_bytes(frame_ptr, 0, 4096);
                             pt.entries[p1_idx].set(frame_phys, user_flags);
                             invalidate_tlb(current_vaddr);
@@ -380,8 +380,18 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     let y = frame.rdx as usize;
                     let w = frame.r10 as usize;
                     let h = frame.r8 as usize;
-                    let slice = core::slice::from_raw_parts(ptr, w * h);
-                    writer.blit_buffer_alpha(slice, x, y, w, h);
+                    if !ptr.is_null() && w > 0 && h > 0 {
+                        // قص الصورة تلقائياً لعدم تجاوز مساحة الشاشة
+                        let max_w = if x < writer.width { writer.width - x } else { 0 };
+                        let max_h = if y < writer.height { writer.height - y } else { 0 };
+                        let draw_w = core::cmp::min(w, max_w);
+                        let draw_h = core::cmp::min(h, max_h);
+
+                        if draw_w > 0 && draw_h > 0 {
+                            let slice = core::slice::from_raw_parts(ptr, w * h);
+                            writer.blit_buffer_alpha(slice, x, y, draw_w, draw_h);
+                        }
+                    }
                 }
             }
             frame.rax = 0;

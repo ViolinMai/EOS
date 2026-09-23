@@ -23,8 +23,7 @@ use syscall::{
 static ALLOCATOR: LockedHeap = LockedHeap::empty();
 
 fn init_heap() {
-    // تخصيص 64MB لتغطية الصورة بدقتها الكاملة ومخازن فك الضغط
-    let heap_size = 64 * 1024 * 1024;
+    let heap_size = 48 * 1024 * 1024;
     let heap_start = sys_mmap(heap_size);
 
     if heap_start.is_null() {
@@ -80,7 +79,7 @@ fn paeth(a: u8, b: u8, c: u8) -> u8 {
     if pa <= pb && pa <= pc { a } else if pb <= pc { b } else { c }
 }
 
-fn try_render_png_full_res(path: &str, pos_x: usize, pos_y: usize) -> Result<(), &'static str> {
+fn try_render_png(path: &str) -> Result<(), &'static str> {
     let t0 = get_time_ms();
 
     let fd = sys_open(path);
@@ -121,11 +120,13 @@ fn try_render_png_full_res(path: &str, pos_x: usize, pos_y: usize) -> Result<(),
         _ => return Err("Unsupported color type"),
     };
 
-    print_str("[Viewer] Image Resolution: ");
+    print_str("[Viewer] Target Image: ");
+    print_str(path);
+    print_str(" (");
     print_num(width);
     print_str("x");
     print_num(height);
-    print_str(" (Full Native Resolution, No Downsampling)\n");
+    print_str(")\n");
 
     let mut idat_data = Vec::new();
     let mut offset = 33;
@@ -160,8 +161,14 @@ fn try_render_png_full_res(path: &str, pos_x: usize, pos_y: usize) -> Result<(),
         return Err("Truncated stream");
     }
 
-    let total_pixels = width * height;
+    // لضمان ملائمة الشاشة (1280x800) بدون تجاوز الذاكرة
+    let step = if width > 1200 || height > 750 { 2 } else { 1 };
+    let out_w = width / step;
+    let out_h = height / step;
+    let total_pixels = out_w * out_h;
+
     let mut pixels = alloc::vec![0u32; total_pixels];
+    let mut out_idx = 0usize;
 
     let mut prev_row = vec![0u8; stride];
     let mut curr_row = vec![0u8; stride];
@@ -205,23 +212,16 @@ fn try_render_png_full_res(path: &str, pos_x: usize, pos_y: usize) -> Result<(),
             _ => return Err("Unknown filter"),
         }
 
-        let row_out_start = y * width;
-        if bpp == 4 {
-            for x in 0..width {
-                let off = x * 4;
+        if y % step == 0 && out_idx < total_pixels {
+            for x in (0..width).step_by(step) {
+                if out_idx >= total_pixels { break; }
+                let off = x * bpp;
                 let r = curr_row[off] as u32;
                 let g = curr_row[off + 1] as u32;
                 let b = curr_row[off + 2] as u32;
-                let a = curr_row[off + 3] as u32;
-                pixels[row_out_start + x] = (a << 24) | (r << 16) | (g << 8) | b;
-            }
-        } else {
-            for x in 0..width {
-                let off = x * 3;
-                let r = curr_row[off] as u32;
-                let g = curr_row[off + 1] as u32;
-                let b = curr_row[off + 2] as u32;
-                pixels[row_out_start + x] = (0xFF << 24) | (r << 16) | (g << 8) | b;
+                let a = if bpp == 4 { curr_row[off + 3] as u32 } else { 255u32 };
+                pixels[out_idx] = (a << 24) | (r << 16) | (g << 8) | b;
+                out_idx += 1;
             }
         }
 
@@ -229,12 +229,12 @@ fn try_render_png_full_res(path: &str, pos_x: usize, pos_y: usize) -> Result<(),
     }
 
     let t_filter = get_time_ms();
-    print_str("[Benchmark] Scanline Unfiltering (Full Res): ");
+    print_str("[Benchmark] Scanline Unfiltering: ");
     print_num((t_filter - t_inflate) as usize);
     print_str(" ms\n");
 
     sys_clear_screen();
-    sys_blit_image_ptr(pixels.as_ptr(), pos_x, pos_y, width, height);
+    sys_blit_image_ptr(pixels.as_ptr(), 40, 30, out_w, out_h);
 
     let t_blit = get_time_ms();
     print_str("[Benchmark] Blit to Screen: ");
@@ -254,7 +254,10 @@ fn get_passed_argument() -> &'static str {
         if len > 0 {
             let slice = core::slice::from_raw_parts(ipc_ptr, len);
             if let Ok(s) = core::str::from_utf8(slice) {
-                return s.trim();
+                let trimmed = s.trim();
+                if !trimmed.is_empty() {
+                    return trimmed;
+                }
             }
         }
     }
@@ -265,7 +268,7 @@ extern "C" fn app_main() {
     init_heap();
 
     let target_file = get_passed_argument();
-    match try_render_png_full_res(target_file, 10, 10) {
+    match try_render_png(target_file) {
         Ok(()) => print_str("[Viewer] Render Complete.\n"),
         Err(err) => {
             print_str("[Viewer] Error: ");

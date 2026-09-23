@@ -1,9 +1,8 @@
 use core::arch::asm;
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::{log_error, log_info};
+use crate::log_info;
 
-// 💡 دعم القناتين الأساسية والثانوية (Primary & Secondary IDE Channels)
 const ATA_PRIMARY_IO_BASE: u16 = 0x1F0;
 const ATA_SECONDARY_IO_BASE: u16 = 0x170;
 
@@ -30,10 +29,10 @@ const STATUS_DF: u8 = 0x20;
 #[inline]
 fn get_drive_io_base_and_head(drive: u8) -> (u16, u8) {
     match drive {
-        0 => (ATA_PRIMARY_IO_BASE, 0xE0),   // Primary Master
-        1 => (ATA_PRIMARY_IO_BASE, 0xF0),   // Primary Slave
-        2 => (ATA_SECONDARY_IO_BASE, 0xE0), // Secondary Master (ext2)
-        3 => (ATA_SECONDARY_IO_BASE, 0xF0), // Secondary Slave
+        0 => (ATA_PRIMARY_IO_BASE, 0xE0),
+        1 => (ATA_PRIMARY_IO_BASE, 0xF0),
+        2 => (ATA_SECONDARY_IO_BASE, 0xE0),
+        3 => (ATA_SECONDARY_IO_BASE, 0xF0),
         _ => (ATA_PRIMARY_IO_BASE, 0xE0),
     }
 }
@@ -90,7 +89,7 @@ unsafe fn ata_io_wait(io_base: u16) {
 }
 
 fn poll_drive_ready(io_base: u16, expect_drq: bool) -> Result<(), &'static str> {
-    for _ in 0..100_000 {
+    for _ in 0..10_000 {
         let status = unsafe { inb(io_base + ATA_REG_STATUS) };
 
         if status == 0xFF {
@@ -99,8 +98,6 @@ fn poll_drive_ready(io_base: u16, expect_drq: bool) -> Result<(), &'static str> 
 
         if (status & STATUS_BSY) == 0 {
             if (status & (STATUS_ERR | STATUS_DF)) != 0 {
-                let err_reg = unsafe { inb(io_base + ATA_REG_ERROR) };
-                log_error!("ATA", "Hardware Error Register: {:#04x}, Status: {:#04x}", err_reg, status);
                 return Err("ATA Drive hardware error detected");
             }
 
@@ -112,6 +109,7 @@ fn poll_drive_ready(io_base: u16, expect_drq: bool) -> Result<(), &'static str> 
                 return Ok(());
             }
         }
+        core::hint::spin_loop();
     }
     Err("ATA Timeout: Drive did not become ready")
 }
@@ -363,7 +361,9 @@ pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
 
     for s in 0..layout.root_dir_sectors {
         let dir_lba = layout.root_dir_lba + s;
-        read_sector_drive(1, dir_lba, &mut sector)?;
+        if read_sector_drive(1, dir_lba, &mut sector).is_err() {
+            break;
+        }
         for entry_idx in 0..16 {
             let offset = entry_idx * 32;
             let first_byte = sector[offset];

@@ -178,7 +178,6 @@ pub extern "C" fn _start() -> ! {
         mm::paging::VirtualMemoryManager::init(hhdm_offset);
     }
 
-    // 💡 تفعيل الـ Syscalls بعد تجهيز الـ VMM والـ PMM بالكامل
     arch::x86_64::syscall::init();
 
     drivers::pci::init();

@@ -1,7 +1,6 @@
 use crate::serial_print;
 use crate::writer::WRITER;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
 
 #[allow(dead_code)]
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -15,28 +14,10 @@ pub enum LogLevel {
 
 pub struct KernelLogger;
 
-static PRINT_LOCK: AtomicBool = AtomicBool::new(false);
-
 #[inline(always)]
 fn get_current_core_id() -> u32 {
-    let core_id: u32;
-    unsafe {
-        // 💡 استخدام دالة cpuid آمنة تتجاوز قيد حجز مسجل rbx في LLVM
-        core::arch::asm!(
-            "push rbx",
-            "mov eax, 1",
-            "cpuid",
-            "shr ebx, 24",
-            "mov {0:e}, ebx",
-            "pop rbx",
-            out(reg) core_id,
-            out("eax") _,
-            out("ecx") _,
-            out("edx") _,
-            options(nomem, preserves_flags)
-        );
-    }
-    core_id
+    let cpuid = core::arch::x86_64::__cpuid(1);
+    (cpuid.ebx >> 24) & 0xFF
 }
 
 impl KernelLogger {
@@ -57,15 +38,6 @@ impl KernelLogger {
         serial_print!("{}{}\x1b[0m \x1b[1;30m[{:03}.{:02}s]\x1b[0m \x1b[1;34m[CPU#{}]\x1b[0m \x1b[1;30m[{:<6}]\x1b[0m {}\n",
             color_prefix, tag, secs, frac, core_id, subsystem, args
         );
-
-        let mut attempts = 0;
-        while PRINT_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            attempts += 1;
-            if attempts > 10_000 {
-                return;
-            }
-            core::hint::spin_loop();
-        }
 
         let (r, g, b) = match level {
             LogLevel::Debug => (148, 163, 184),
@@ -88,8 +60,6 @@ impl KernelLogger {
                 writer.write_char('\n', 255, 255, 255);
             }
         }
-
-        PRINT_LOCK.store(false, Ordering::Release);
     }
 }
 

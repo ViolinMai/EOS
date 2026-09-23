@@ -44,6 +44,13 @@ static mut HANA_CY: usize = 0;
 
 static PARALLEL_COMPLETED: AtomicU64 = AtomicU64::new(0);
 
+#[inline(always)]
+fn raw_serial_trace(tag: &str) {
+    for b in tag.bytes() {
+        crate::serial::SERIAL1.send_byte(b);
+    }
+}
+
 fn heavy_computation_worker() {
     let mut sum: u64 = 0;
     for i in 1..=5_000_000 {
@@ -90,6 +97,7 @@ pub fn init() {
 pub fn take_pending_command() -> Option<String> {
     unsafe {
         if let Some(cmd) = (*addr_of_mut!(PENDING_COMMAND)).take() {
+            raw_serial_trace("[TRACE: take_pending_command]\n");
             Some(cmd)
         } else {
             None
@@ -223,7 +231,7 @@ fn hana_save() {
             if let Some(w) = &mut *addr_of_mut!(WRITER) {
                 w.cursor_x = 24;
                 w.cursor_y = w.height - 32;
-                w.write_str("[✓] SAVED! (Bytes updated on Disk)                   ", 74, 222, 128);
+                w.write_str("[✓] SAVED! (Bytes updated on Disk)                    ", 74, 222, 128);
             }
         }
     }
@@ -343,13 +351,14 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: Interrupt
                             }
                         }
                         '\n' => {
+                            raw_serial_trace("[TRACE: K1 Enter pressed]\n");
+
                             if let Some(writer) = &mut *addr_of_mut!(WRITER) {
                                 writer.write_char('\n', 255, 255, 255);
                             }
                             crate::serial_println!();
 
-                            let cmd_str = buffer.clone();
-                            buffer.clear();
+                            let cmd_str = core::mem::replace(buffer, String::with_capacity(128));
                             *c_idx = 0;
 
                             if !cmd_str.trim().is_empty() {
@@ -360,6 +369,7 @@ pub extern "x86-interrupt" fn keyboard_interrupt_handler(_stack_frame: Interrupt
                             }
 
                             *addr_of_mut!(PENDING_COMMAND) = Some(cmd_str);
+                            raw_serial_trace("[TRACE: K2 Command queued]\n");
 
                             pic::send_eoi(1);
                             return;
@@ -491,6 +501,7 @@ pub fn print_prompt() {
 }
 
 pub fn execute_command(cmd: &str) {
+    raw_serial_trace("[TRACE: E1 execute_command entered]\n");
     let trimmed = cmd.trim();
     if trimmed.is_empty() {
         return;
@@ -583,6 +594,7 @@ pub fn execute_command(cmd: &str) {
             log_info!("SMP", "========================================");
         }
         "ls" => {
+            raw_serial_trace("[TRACE: LS running]\n");
             let nodes = vfs_list_all();
             log_info!("VFS", "Listing All System Files across Mounted Filesystems (Total: {}):", nodes.len());
             for node in nodes {
@@ -760,7 +772,6 @@ pub extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFr
     loop { core::hint::spin_loop(); }
 }
 
-// 💡 طباعة مباشرة لعنوان الـ Page Fault ورقم الخطأ على Serial فوراً دون قفل
 pub extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFrame, error_code: u64) {
     let cr2: u64;
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)); }
