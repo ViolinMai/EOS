@@ -5,6 +5,7 @@ use crate::arch::x86_64::syscall::{ELF_EXIT_REQUESTED, reset_core2_process};
 use crate::log_info;
 use crate::mm::paging::{invalidate_tlb, read_cr3, PageTable, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
 use crate::mm::paging::VMM;
+use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;
@@ -12,8 +13,8 @@ use core::sync::atomic::Ordering;
 pub const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 pub const PT_LOAD: u32 = 1;
 
-pub const USER_STACK_TOP: u64 = 0x0000_0000_2040_0000;
-pub const USER_IPC_PAGE: u64  = 0x0000_0000_2050_0000;
+// مكدس بمساحة 8MB للبرامج الكبيرة مثل FFmpeg
+pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
 
 #[repr(C, packed)]
 #[derive(Debug, Clone, Copy)]
@@ -72,16 +73,16 @@ extern "C" fn jump_to_ring3(entry: u64, rsp: u64, user_cs: u64, user_ds: u64) {
         "mov gs, ax",
 
         "push rcx",         // SS (User Data)
-        "push rsi",         // RSP (Aligned 16 bytes)
-        "push 0x202",       // RFLAGS
+        "push rsi",         // RSP
+        "push 0x202",       // RFLAGS (IF=1)
         "push rdx",         // CS (User Code)
-        "push rdi",         // RIP
+        "push rdi",         // RIP (Entry Point)
         "iretq",
         kernel_sp = sym crate::arch::x86_64::syscall::KERNEL_SAVED_RSP,
     );
 }
 
-pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
+pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str> {
     if data.len() < core::mem::size_of::<Elf64Header>() { return Err("File smaller than ELF header"); }
     let header = unsafe { *(data.as_ptr() as *const Elf64Header) };
     if header.magic != ELF_MAGIC { return Err("Invalid ELF magic identifier"); }
@@ -96,23 +97,11 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
     let vmm = unsafe { (&*addr_of_mut!(VMM)).as_ref().ok_or("VMM not initialized")? };
     let frame_alloc = unsafe { (*addr_of_mut!(crate::mm::frame::FRAME_ALLOCATOR)).as_mut().ok_or("PMM not initialized")? };
 
-    let pdpt_phys = frame_alloc.allocate_frame().ok_or("OOM: Failed to allocate PDPT")?;
-    let pd_phys = frame_alloc.allocate_frame().ok_or("OOM: Failed to allocate PD")?;
-
-    let pdpt = unsafe { &mut *((pdpt_phys + vmm.hhdm_offset) as *mut PageTable) };
-    let pd = unsafe { &mut *((pd_phys + vmm.hhdm_offset) as *mut PageTable) };
-
-    unsafe {
-        core::ptr::write_bytes(pdpt as *mut PageTable as *mut u8, 0, 4096);
-        core::ptr::write_bytes(pd as *mut PageTable as *mut u8, 0, 4096);
-    }
-
     let user_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_USER;
     let pml4_phys = read_cr3() & 0x000F_FFFF_FFFF_F000;
     let pml4 = unsafe { &mut *((pml4_phys + vmm.hhdm_offset) as *mut PageTable) };
-    pml4.entries[0].set(pdpt_phys, user_flags);
-    pdpt.entries[0].set(pd_phys, user_flags);
 
+    // تحميل مقاطع الـ LOAD في فضاء العنونة
     for i in 0..phnum {
         let ph_offset = phoff + (i * phentsize);
         if ph_offset + core::mem::size_of::<Elf64ProgramHeader>() > data.len() { return Err("Program header out of bounds"); }
@@ -130,24 +119,37 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
             
             let mut curr_vaddr = start_page;
             while curr_vaddr < end_page {
+                let p4_idx = ((curr_vaddr >> 39) & 0x1FF) as usize;
+                let p3_idx = ((curr_vaddr >> 30) & 0x1FF) as usize;
                 let p2_idx = ((curr_vaddr >> 21) & 0x1FF) as usize;
                 let p1_idx = ((curr_vaddr >> 12) & 0x1FF) as usize;
 
-                if !pd.entries[p2_idx].is_present() {
-                    let pt_phys = frame_alloc.allocate_frame().ok_or("OOM: PT")?;
-                    let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
-                    unsafe { core::ptr::write_bytes(pt as *mut PageTable as *mut u8, 0, 4096); }
-                    pd.entries[p2_idx].set(pt_phys, user_flags);
+                if !pml4.entries[p4_idx].is_present() {
+                    let f = frame_alloc.allocate_frame().ok_or("OOM: PT4")?;
+                    unsafe { core::ptr::write_bytes((f + vmm.hhdm_offset) as *mut u8, 0, 4096); }
+                    pml4.entries[p4_idx].set(f, user_flags);
                 }
+                let pt4 = unsafe { &mut *((pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
 
-                let pt_phys = pd.entries[p2_idx].physical_address();
-                let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
+                if !pt4.entries[p3_idx].is_present() {
+                    let f = frame_alloc.allocate_frame().ok_or("OOM: PT3")?;
+                    unsafe { core::ptr::write_bytes((f + vmm.hhdm_offset) as *mut u8, 0, 4096); }
+                    pt4.entries[p3_idx].set(f, user_flags);
+                }
+                let pt3 = unsafe { &mut *((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
 
-                if !pt.entries[p1_idx].is_present() {
-                    let frame_phys = frame_alloc.allocate_frame().ok_or("OOM: User Frame")?;
+                if !pt3.entries[p2_idx].is_present() {
+                    let f = frame_alloc.allocate_frame().ok_or("OOM: PT2")?;
+                    unsafe { core::ptr::write_bytes((f + vmm.hhdm_offset) as *mut u8, 0, 4096); }
+                    pt3.entries[p2_idx].set(f, user_flags);
+                }
+                let pt2 = unsafe { &mut *((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
+
+                if !pt2.entries[p1_idx].is_present() {
+                    let frame_phys = frame_alloc.allocate_frame().ok_or("OOM: Page")?;
                     let frame_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
                     unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
-                    pt.entries[p1_idx].set(frame_phys, user_flags);
+                    pt2.entries[p1_idx].set(frame_phys, user_flags);
                     unsafe { invalidate_tlb(curr_vaddr); }
                 }
                 curr_vaddr += 4096;
@@ -159,12 +161,15 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
                 let mut dest_vaddr = vaddr;
 
                 while remaining > 0 {
+                    let p4_idx = ((dest_vaddr >> 39) & 0x1FF) as usize;
+                    let p3_idx = ((dest_vaddr >> 30) & 0x1FF) as usize;
                     let p2_idx = ((dest_vaddr >> 21) & 0x1FF) as usize;
                     let p1_idx = ((dest_vaddr >> 12) & 0x1FF) as usize;
 
-                    let pt_phys = pd.entries[p2_idx].physical_address();
-                    let pt = &*((pt_phys + vmm.hhdm_offset) as *const PageTable);
-                    let frame_phys = pt.entries[p1_idx].physical_address();
+                    let pt4 = &*((pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+                    let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+                    let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+                    let frame_phys = pt2.entries[p1_idx].physical_address();
 
                     let page_offset = (dest_vaddr & 0xFFF) as usize;
                     let copy_size = core::cmp::min(remaining, 4096 - page_offset);
@@ -180,82 +185,103 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
         }
     }
 
-    let stack_pages = 64; 
+    // تجهيز مكدس للمستخدم بحجم 512 صفحة (2 MB Stack)
+    let stack_pages = 512;
     let stack_start = USER_STACK_TOP - (stack_pages * 4096);
     for i in 0..stack_pages {
         let curr_vaddr = stack_start + (i * 4096);
+        let p4_idx = ((curr_vaddr >> 39) & 0x1FF) as usize;
+        let p3_idx = ((curr_vaddr >> 30) & 0x1FF) as usize;
         let p2_idx = ((curr_vaddr >> 21) & 0x1FF) as usize;
         let p1_idx = ((curr_vaddr >> 12) & 0x1FF) as usize;
 
-        if !pd.entries[p2_idx].is_present() {
-            let pt_phys = frame_alloc.allocate_frame().ok_or("OOM: PT Stack")?;
-            let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
-            unsafe { core::ptr::write_bytes(pt as *mut PageTable as *mut u8, 0, 4096); }
-            pd.entries[p2_idx].set(pt_phys, user_flags);
+        if !pml4.entries[p4_idx].is_present() {
+            let f = frame_alloc.allocate_frame().ok_or("OOM: Stack PT4")?;
+            unsafe { core::ptr::write_bytes((f + vmm.hhdm_offset) as *mut u8, 0, 4096); }
+            pml4.entries[p4_idx].set(f, user_flags);
         }
+        let pt4 = unsafe { &mut *((pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
 
-        let pt_phys = pd.entries[p2_idx].physical_address();
-        let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
+        if !pt4.entries[p3_idx].is_present() {
+            let f = frame_alloc.allocate_frame().ok_or("OOM: Stack PT3")?;
+            unsafe { core::ptr::write_bytes((f + vmm.hhdm_offset) as *mut u8, 0, 4096); }
+            pt4.entries[p3_idx].set(f, user_flags);
+        }
+        let pt3 = unsafe { &mut *((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
 
-        if !pt.entries[p1_idx].is_present() {
+        if !pt3.entries[p2_idx].is_present() {
+            let f = frame_alloc.allocate_frame().ok_or("OOM: Stack PT2")?;
+            unsafe { core::ptr::write_bytes((f + vmm.hhdm_offset) as *mut u8, 0, 4096); }
+            pt3.entries[p2_idx].set(f, user_flags);
+        }
+        let pt2 = unsafe { &mut *((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
+
+        if !pt2.entries[p1_idx].is_present() {
             let frame_phys = frame_alloc.allocate_frame().ok_or("OOM: Stack Frame")?;
             let frame_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
             unsafe { core::ptr::write_bytes(frame_ptr, 0, 4096); }
-            pt.entries[p1_idx].set(frame_phys, user_flags);
+            pt2.entries[p1_idx].set(frame_phys, user_flags);
             unsafe { invalidate_tlb(curr_vaddr); }
         }
     }
 
-    {
-        let curr_vaddr = USER_IPC_PAGE;
-        let p2_idx = ((curr_vaddr >> 21) & 0x1FF) as usize;
-        let p1_idx = ((curr_vaddr >> 12) & 0x1FF) as usize;
-
-        if !pd.entries[p2_idx].is_present() {
-            let pt_phys = frame_alloc.allocate_frame().ok_or("OOM: PT IPC")?;
-            let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
-            unsafe { core::ptr::write_bytes(pt as *mut PageTable as *mut u8, 0, 4096); }
-            pd.entries[p2_idx].set(pt_phys, user_flags);
+    // بناء وسائط سطر الأوامر (Command Line Arguments)
+    let mut args: Vec<&str> = Vec::new();
+    if args_str.is_empty() {
+        args.push("ffmpeg");
+        args.push("-version");
+    } else {
+        for part in args_str.split_whitespace() {
+            args.push(part);
         }
-
-        let pt_phys = pd.entries[p2_idx].physical_address();
-        let pt = unsafe { &mut *((pt_phys + vmm.hhdm_offset) as *mut PageTable) };
-
-        let frame_phys = frame_alloc.allocate_frame().ok_or("OOM: IPC Frame")?;
-        let ipc_ptr = (frame_phys + vmm.hhdm_offset) as *mut u8;
-        unsafe { core::ptr::write_bytes(ipc_ptr, 0, 4096); }
-        let bytes = arg.as_bytes();
-        let len = core::cmp::min(bytes.len(), 255);
-        unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), ipc_ptr, len); }
-        pt.entries[p1_idx].set(frame_phys, user_flags);
-        unsafe { invalidate_tlb(curr_vaddr); }
     }
 
-    // 💡 إعداد قمة المكدس محاذية لـ 16 بايت وتمرير جدول الـ Auxv الأساسي لمكتبة std
-    let user_rsp = (USER_STACK_TOP - 0x1000) & !0x0F;
+    let user_rsp_page = USER_STACK_TOP - 0x2000;
+    let user_rsp;
+
     unsafe {
-        let p2_idx = ((user_rsp >> 21) & 0x1FF) as usize;
-        let p1_idx = ((user_rsp >> 12) & 0x1FF) as usize;
-        let pt_phys = pd.entries[p2_idx].physical_address();
-        let pt = &*((pt_phys + vmm.hhdm_offset) as *const PageTable);
-        let frame_phys = pt.entries[p1_idx].physical_address();
-        let page_offset = (user_rsp & 0xFFF) as usize;
-        
-        let stack_ptr = (frame_phys + vmm.hhdm_offset + page_offset as u64) as *mut u64;
-        
-        // هيئة Linux ELF ABI:
-        // [argc = 0]
-        // [argv_end = NULL]
-        // [envp_end = NULL]
-        // [auxv: AT_PAGESZ=6, 4096]
-        // [auxv: AT_NULL=0, 0]
-        *stack_ptr.offset(0) = 0;    // argc = 0
-        *stack_ptr.offset(1) = 0;    // argv[0] = NULL
-        *stack_ptr.offset(2) = 0;    // envp[0] = NULL
-        *stack_ptr.offset(3) = 6;    // AT_PAGESZ
-        *stack_ptr.offset(4) = 4096; // 4096 Bytes
-        *stack_ptr.offset(5) = 0;    // AT_NULL
-        *stack_ptr.offset(6) = 0;
+        let p4_idx = ((user_rsp_page >> 39) & 0x1FF) as usize;
+        let p3_idx = ((user_rsp_page >> 30) & 0x1FF) as usize;
+        let p2_idx = ((user_rsp_page >> 21) & 0x1FF) as usize;
+        let p1_idx = ((user_rsp_page >> 12) & 0x1FF) as usize;
+
+        let pt4 = &*((pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let frame_phys = pt2.entries[p1_idx].physical_address();
+
+        let stack_base = (frame_phys + vmm.hhdm_offset) as *mut u8;
+        let mut string_cursor = 4096 - 512;
+        let mut arg_pointers: Vec<u64> = Vec::new();
+
+        for arg in &args {
+            let bytes = arg.as_bytes();
+            string_cursor -= bytes.len() + 1;
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), stack_base.add(string_cursor), bytes.len());
+            *stack_base.add(string_cursor + bytes.len()) = 0;
+            let virt_ptr = user_rsp_page + string_cursor as u64;
+            arg_pointers.push(virt_ptr);
+        }
+
+        let stack_ptr = stack_base.add(0x800) as *mut u64;
+        let mut idx = 0isize;
+
+        *stack_ptr.offset(idx) = arg_pointers.len() as u64; idx += 1;
+        for ptr in arg_pointers {
+            *stack_ptr.offset(idx) = ptr; idx += 1;
+        }
+        *stack_ptr.offset(idx) = 0; idx += 1;
+        *stack_ptr.offset(idx) = 0; idx += 1;
+
+        // Auxv: AT_PAGESZ=6, 4096 | AT_RANDOM=25
+        *stack_ptr.offset(idx) = 6; idx += 1;
+        *stack_ptr.offset(idx) = 4096; idx += 1;
+        *stack_ptr.offset(idx) = 25; idx += 1; // AT_RANDOM
+        *stack_ptr.offset(idx) = user_rsp_page + 0x100; idx += 1;
+        *stack_ptr.offset(idx) = 0; idx += 1;
+        *stack_ptr.offset(idx) = 0;
+
+        user_rsp = (user_rsp_page + 0x800) & !0x0F;
     }
 
     clear_keyboard_buffer();

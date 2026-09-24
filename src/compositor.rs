@@ -3,8 +3,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 use crate::arch::x86_64::interrupts::GUI_ACTIVE;
-use crate::arch::x86_64::syscall::{OVERLAY_ACTIVE, OVERLAY_WIDTH, OVERLAY_HEIGHT, OVERLAY_PIXELS};
-use crate::drivers::ata::{save_system_config, load_system_config};
+use crate::arch::x86_64::syscall::{OVERLAY_ACTIVE, OVERLAY_WIDTH, OVERLAY_HEIGHT, OVERLAY_PIXELS, OVERLAY_LOCK, OVERLAY_MAX_W, OVERLAY_MAX_H};
+use crate::drivers::ata::{save_system_config, load_system_config, MediaType};
 use crate::drivers::gamepad::{
     GAMEPAD_CONNECTED, BTN_MASK, KEYBOARD_NAV_MASK, STICK_X, STICK_Y,
     RAW_BYTES_COUNT, PACKETS_PARSED_COUNT, LAST_RAW_BYTE, pop_editor_char
@@ -20,7 +20,7 @@ use crate::fs::image::{
 use crate::fs::{list_directory_contents, vfs_list_all_images, vfs_read_bytes, vfs_save_text_file, FsItem};
 use crate::arch::x86_64::pit;
 use crate::arch::x86_64::power;
-use crate::log_info;
+use crate::{log_info, log_error};
 
 #[derive(Clone)]
 pub struct ConsoleCard {
@@ -173,7 +173,7 @@ pub fn compositor_core_entry() {
             }
         }
 
-        if OVERLAY_ACTIVE.load(Ordering::Relaxed) {
+        if OVERLAY_ACTIVE.load(Ordering::Acquire) {
             if b_btn && !b_pressed_last {
                 cleanup_overlay_cache();
                 last_nav_tick = current_tick + 20;
@@ -256,11 +256,15 @@ pub fn compositor_core_entry() {
                     if a_btn && !a_pressed_last {
                         if selected_tests_idx == 0 {
                             let t_before = pit::read_tsc();
-                            if let Ok(()) = request_elf_execution("app.elf", "test") {
-                                log_info!("TESTS", "Dispatched Crates Test Suite to Core 2");
-                                crates_test_status = "Status: Tests Running in Background";
-                            } else {
-                                crates_test_status = "Status: Execution Error (Busy/Missing)";
+                            match request_elf_execution("app.elf", "test") {
+                                Ok(assigned_core) => {
+                                    log_info!("TESTS", "Dispatched Crates Test Suite to Core {}", assigned_core);
+                                    crates_test_status = "Status: Tests Running in Background";
+                                }
+                                Err(e) => {
+                                    log_error!("TESTS", "Process dispatch error: {}", e);
+                                    crates_test_status = "Status: System Busy";
+                                }
                             }
                             crates_test_time_ms = pit::read_tsc().saturating_sub(t_before);
                         } else {
@@ -434,17 +438,32 @@ pub fn compositor_core_entry() {
                                         explorer_scroll_offset = 0;
                                         log_info!("VFS", "Entered Folder: [{}]", dirname);
                                     }
-                                    FsItem::File(filename, _) => {
-                                        let name_lower = filename.to_ascii_lowercase();
-                                        log_info!("VFS", "Opening Item: '{}'", filename);
-                                        if name_lower.ends_with(".png") || name_lower.ends_with(".jpg") || name_lower.ends_with(".jpeg") {
+                                    FsItem::File(filename, size, media_type) => {
+                                        log_info!("VFS", "Opening Item: '{}' (Type: {:?}, Size: {} MB)", filename, media_type, size / (1024 * 1024));
+                                        
+                                        if filename.eq_ignore_ascii_case("ffmpeg.elf") {
+                                            log_info!("FFMPEG", "Dispatching FFmpeg Version Check to available Core...");
+                                            match request_elf_execution("ffmpeg.elf", "ffmpeg -version") {
+                                                Ok(core) => log_info!("SCHED", "Assigned to Core {}", core),
+                                                Err(e) => log_error!("SCHED", "Core allocation failed: {}", e),
+                                            }
+                                        } else if media_type == MediaType::Video {
+                                            log_info!("FFMPEG", "Invoking FFmpeg Video Pipeline for '{}'", filename);
+                                            let cmd_args = alloc::format!("ffmpeg -i {} -f rawvideo -pix_fmt bgra -s 800x600 -", filename);
+                                            match request_elf_execution("ffmpeg.elf", &cmd_args) {
+                                                Ok(core) => log_info!("SCHED", "Assigned to Core {}", core),
+                                                Err(e) => log_error!("SCHED", "Core allocation failed: {}", e),
+                                            }
+                                        } else if media_type == MediaType::Image {
                                             if let Ok(bytes) = vfs_read_bytes(&filename) {
                                                 let _ = decode_and_display_cached(&filename, &bytes, current_tick);
                                             }
-                                        } else if name_lower.ends_with(".elf") {
+                                        } else if media_type == MediaType::Executable {
                                             let _ = request_elf_execution(&filename, "");
                                         } else {
-                                            if let Ok(bytes) = vfs_read_bytes(&filename) {
+                                            if size > 16 * 1024 * 1024 {
+                                                log_info!("VFS", "File '{}' is too large for Text Editor ({} MB)", filename, size / (1024 * 1024));
+                                            } else if let Ok(bytes) = vfs_read_bytes(&filename) {
                                                 active_text_filename = filename;
                                                 editor_save_status = "";
                                                 if let Ok(text) = core::str::from_utf8(&bytes) {
@@ -510,7 +529,7 @@ pub fn compositor_core_entry() {
                             log_info!("EDITOR", "Saved changes to '{}' ({} bytes)", active_text_filename, full.len());
                         } else {
                             editor_save_status = "[Save Failed: Read-only]";
-                            crate::log_error!("EDITOR", "Save failed for '{}'", active_text_filename);
+                            log_error!("EDITOR", "Save failed for '{}'", active_text_filename);
                         }
                         last_nav_tick = current_tick + 20;
                     }
@@ -532,6 +551,7 @@ pub fn compositor_core_entry() {
         let is_running_elf = ELF_ACTIVE_RUNNING.load(Ordering::Relaxed);
         let active_bg_color = themes[current_theme_idx].color;
 
+        // 💡 استدعاء دوال الرسم لإعادة رسم الشاشة في كل دورة ومنع الشاشة السوداء
         draw_desktop_wallpaper(&mut backbuffer, width, height, active_bg_color);
 
         match current_view {
@@ -793,10 +813,12 @@ pub fn compositor_core_entry() {
             }
         }
 
-        if OVERLAY_ACTIVE.load(Ordering::Relaxed) {
-            let ow = OVERLAY_WIDTH.load(Ordering::Relaxed);
-            let oh = OVERLAY_HEIGHT.load(Ordering::Relaxed);
-            draw_floating_modal(&mut backbuffer, width, height, ow, oh);
+        if OVERLAY_ACTIVE.load(Ordering::Acquire) {
+            let ow = OVERLAY_WIDTH.load(Ordering::Relaxed).min(OVERLAY_MAX_W);
+            let oh = OVERLAY_HEIGHT.load(Ordering::Relaxed).min(OVERLAY_MAX_H);
+            if ow > 0 && oh > 0 {
+                draw_floating_modal(&mut backbuffer, width, height, ow, oh);
+            }
         }
 
         unsafe {
@@ -836,14 +858,12 @@ fn draw_explorer_item_row(buf: &mut [u32], fb_w: usize, fb_h: usize, x: usize, y
             draw_text_scaled(buf, fb_w, fb_h, x + 120, y + 16, dirname.as_str(), 0xFFFFFFFF, 2);
             draw_text_scaled(buf, fb_w, fb_h, x + w - 180, y + 16, "<Folder>", 0xFF94A3B8, 2);
         }
-        FsItem::File(filename, size) => {
-            let lower = filename.to_ascii_lowercase();
-            let (icon, icon_col) = if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-                ("[IMG]", 0xFFFDE047)
-            } else if lower.ends_with(".elf") {
-                ("[BIN]", 0xFF4ADE80)
-            } else {
-                ("[TXT]", 0xFF60A5FA)
+        FsItem::File(filename, size, media_type) => {
+            let (icon, icon_col) = match media_type {
+                MediaType::Video => ("[VID]", 0xFFEC4899),
+                MediaType::Image => ("[IMG]", 0xFFFDE047),
+                MediaType::Executable => ("[BIN]", 0xFF4ADE80),
+                _ => ("[TXT]", 0xFF60A5FA),
             };
 
             draw_text_scaled(buf, fb_w, fb_h, x + 25, y + 16, icon, icon_col, 2);
@@ -1047,7 +1067,7 @@ fn draw_top_bar(buf: &mut [u32], fb_w: usize, fb_h: usize, connected: bool, runn
     draw_text_scaled(buf, fb_w, fb_h, fb_w - 1000, 52, status, color, 1);
 
     if running_elf {
-        draw_text_scaled(buf, fb_w, fb_h, fb_w - 1230, 52, "[Core 2: Processing]", 0xFFF59E0B, 1);
+        draw_text_scaled(buf, fb_w, fb_h, fb_w - 1230, 52, "[Multi-Core: Active]", 0xFFF59E0B, 1);
     }
 }
 
@@ -1108,35 +1128,26 @@ fn draw_floating_modal(buf: &mut [u32], fb_w: usize, fb_h: usize, img_w: usize, 
         }
     }
 
-    draw_text_scaled(buf, fb_w, fb_h, win_x + 20, win_y + 12, "IMAGE VIEWER (PNG / JPEG)", 0xFFFFFFFF, 2);
+    draw_text_scaled(buf, fb_w, fb_h, win_x + 20, win_y + 12, "MEDIA VIEWER / VIDEO OVERLAY", 0xFFFFFFFF, 2);
     draw_text_scaled(buf, fb_w, fb_h, win_x + win_w - 140, win_y + 14, "[B / Esc]", 0xFFF87171, 2);
 
     let content_x = win_x + 20;
     let content_y = win_y + 60;
 
-    unsafe {
-        let src = addr_of!(OVERLAY_PIXELS) as *const u32;
-        for dy in 0..img_h {
-            let py = content_y + dy;
-            if py >= fb_h { break; }
-            let dst_row = py * fb_w;
-            for dx in 0..img_w {
-                let px = content_x + dx;
-                if px >= fb_w { break; }
-                let col = *src.add(dy * img_w + dx);
-                let a = (col >> 24) & 0xFF;
-                if a == 255 {
-                    buf[dst_row + px] = col;
-                } else if a > 0 {
-                    let bg = buf[dst_row + px];
-                    let inv_a = 255 - a;
-                    let r = (((col >> 16) & 0xFF) * a + ((bg >> 16) & 0xFF) * inv_a) / 255;
-                    let g = (((col >> 8) & 0xFF) * a + ((bg >> 8) & 0xFF) * inv_a) / 255;
-                    let b = ((col & 0xFF) * a + (bg & 0xFF) * inv_a) / 255;
-                    buf[dst_row + px] = (0xFF << 24) | (r << 16) | (g << 8) | b;
-                }
+    if OVERLAY_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+        unsafe {
+            let src = addr_of!(OVERLAY_PIXELS) as *const u32;
+            for dy in 0..img_h {
+                let py = content_y + dy;
+                if py >= fb_h { break; }
+                let dst_row = py * fb_w;
+                let src_row = dy * img_w;
+                
+                let copy_w = core::cmp::min(img_w, fb_w.saturating_sub(content_x));
+                core::ptr::copy_nonoverlapping(src.add(src_row), buf.as_mut_ptr().add(dst_row + content_x), copy_w);
             }
         }
+        OVERLAY_LOCK.store(false, Ordering::Release);
     }
 }
 

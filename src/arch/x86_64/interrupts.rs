@@ -90,10 +90,23 @@ pub fn init() {
         
         (*idt_ptr).entries[32].set_handler(timer_interrupt_preempt_entry as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
         (*idt_ptr).entries[33].set_handler(keyboard_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
+        
+        // 💡 إضافة معالجات لمقاطعات COM1 و COM2 لمنع حدوث #GP (0x122)
         (*idt_ptr).entries[35].set_handler(com2_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
+        (*idt_ptr).entries[36].set_handler(com1_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
+
         (*idt_ptr).entries[44].set_handler(mouse_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
 
         InterruptDescriptorTable::load_raw(idt_ptr);
+    }
+}
+
+pub extern "x86-interrupt" fn com1_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    unsafe {
+        while (crate::serial::SERIAL1.read_status() & 1) != 0 {
+            let _ = crate::serial::SERIAL1.read_byte();
+        }
+        pic::send_eoi(4);
     }
 }
 
@@ -626,7 +639,7 @@ pub fn execute_command(cmd: &str) {
             let kernel_heap_total = HEAP_SIZE;
             let online_cpus = CORES_ONLINE.load(Ordering::SeqCst);
             log_info!("SHELL", "  - Processors Online       : {} Cores Active", online_cpus);
-            log_info!("SHELL", "  - Physical RAM            : 2048 MB Total Assigned");
+            log_info!("SHELL", "  - Physical RAM            : 8192 MB Total Assigned");
             log_info!("SHELL", "  - Kernel Heap Usage       : {} KB / {} KB", kernel_heap_used / 1024, kernel_heap_total / 1024);
             log_info!("SHELL", "  - Unified VFS Mounted     : Native Linux ext2 + Windows FAT32 + TarFS");
             log_info!("SHELL", "=================================================================");

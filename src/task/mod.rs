@@ -10,10 +10,16 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 pub const TASK_STACK_SIZE: usize = 16 * 1024;
 
+#[derive(Clone, Debug)]
+pub enum FileSource {
+    Memory(Vec<u8>),
+    AtaDisk { drive: u8, first_cluster: u32, size: usize },
+}
+
 pub struct FileDescriptor {
     #[allow(dead_code)]
     pub path: String,
-    pub data: Vec<u8>,
+    pub source: FileSource,
     pub offset: usize,
 }
 
@@ -96,8 +102,17 @@ static mut CORE_JOBS: [PerCoreJob; 8] = [
 
 pub static mut ELF_TARGET_FILE: [u8; 128] = [0; 128];
 pub static mut ELF_TARGET_ARG: [u8; 128] = [0; 128];
-pub static ELF_SPAWN_REQUEST: AtomicBool = AtomicBool::new(false);
 pub static ELF_ACTIVE_RUNNING: AtomicBool = AtomicBool::new(false);
+
+// 💡 مصفوفة إشعارات الأنوية المستقلة لتمكين الجدولة الديناميكية (Dynamic Load Balancing)
+pub static CORE_ELF_SPAWN_REQ: [AtomicBool; 8] = [
+    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
+];
+pub static CORE_IS_BUSY: [AtomicBool; 8] = [
+    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
+    AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false),
+];
 
 pub struct SpinLockGuard(usize);
 impl Drop for SpinLockGuard {
@@ -130,10 +145,18 @@ pub fn get_job_state(core_id: usize) -> JobState {
     unsafe { CORE_JOBS[core_id].state }
 }
 
-pub fn request_elf_execution(filename: &str, argument: &str) -> Result<(), &'static str> {
-    if ELF_ACTIVE_RUNNING.load(Ordering::SeqCst) {
-        return Err("Core 2 is already executing another process");
+// 💡 Process Manager ذكي: يبحث عن أول Core فارغ من 2 إلى 7 لتوزيع الحمل تلقائياً
+pub fn request_elf_execution(filename: &str, argument: &str) -> Result<usize, &'static str> {
+    let mut selected_core = None;
+    for c in 2..8 {
+        if !CORE_IS_BUSY[c].load(Ordering::Acquire) {
+            selected_core = Some(c);
+            break;
+        }
     }
+
+    let core_id = selected_core.ok_or("All Cores (2-7) are currently busy!")?;
+
     unsafe {
         core::ptr::write_bytes(addr_of_mut!(ELF_TARGET_FILE) as *mut u8, 0, 128);
         core::ptr::write_bytes(addr_of_mut!(ELF_TARGET_ARG) as *mut u8, 0, 128);
@@ -147,11 +170,14 @@ pub fn request_elf_execution(filename: &str, argument: &str) -> Result<(), &'sta
         core::ptr::copy_nonoverlapping(ab.as_ptr(), addr_of_mut!(ELF_TARGET_ARG) as *mut u8, alen);
     }
 
-    ELF_SPAWN_REQUEST.store(true, Ordering::SeqCst);
-    Ok(())
+    CORE_IS_BUSY[core_id].store(true, Ordering::SeqCst);
+    CORE_ELF_SPAWN_REQ[core_id].store(true, Ordering::SeqCst);
+    ELF_ACTIVE_RUNNING.store(true, Ordering::SeqCst);
+
+    Ok(core_id)
 }
 
-fn elf_runner_worker() {
+fn elf_runner_worker(core_id: usize) {
     let mut file_buf = [0u8; 128];
     let mut arg_buf = [0u8; 128];
 
@@ -167,7 +193,7 @@ fn elf_runner_worker() {
     let arg = core::str::from_utf8(&arg_buf[..arg_len]).unwrap_or("");
 
     crate::log_info!("PROC", "==================================================");
-    crate::log_info!("PROC", "Core 2 -> Spawning Userspace Ring 3 Process");
+    crate::log_info!("PROC", "Core {} -> Spawning Userspace Ring 3 Process", core_id);
     crate::log_info!("PROC", "Target Binary: '{}' | Argument: '{}'", filename, arg);
 
     let t_start = crate::arch::x86_64::pit::read_tsc();
@@ -181,10 +207,10 @@ fn elf_runner_worker() {
                 Ok(()) => {
                     let t_end = crate::arch::x86_64::pit::read_tsc();
                     let cycles = t_end.saturating_sub(t_start);
-                    crate::log_info!("PROC", "[SUCCESS] Process exited cleanly (Total Cycles: {})", cycles);
+                    crate::log_info!("PROC", "[SUCCESS] Core {} Process exited cleanly (Total Cycles: {})", core_id, cycles);
                 }
                 Err(err) => {
-                    crate::log_error!("PROC", "[FAILED] Execution error: {}", err);
+                    crate::log_error!("PROC", "[FAILED] Core {} Execution error: {}", core_id, err);
                 }
             }
 
@@ -195,18 +221,25 @@ fn elf_runner_worker() {
         }
     }
 
-    ELF_ACTIVE_RUNNING.store(false, Ordering::SeqCst);
-    crate::log_info!("PROC", "Core 2 -> Process Lifecycle Terminated. Core back to IDLE.");
+    CORE_IS_BUSY[core_id].store(false, Ordering::Release);
+    
+    let mut any_busy = false;
+    for c in 2..8 {
+        if CORE_IS_BUSY[c].load(Ordering::Relaxed) { any_busy = true; break; }
+    }
+    ELF_ACTIVE_RUNNING.store(any_busy, Ordering::SeqCst);
+
+    crate::log_info!("PROC", "Core {} -> Process Lifecycle Terminated. Core back to IDLE.", core_id);
     crate::log_info!("PROC", "==================================================");
 }
 
 pub fn core_poll_and_execute(core_id: usize) {
     if core_id == 0 || core_id >= 8 { return; }
 
-    if core_id == 2 {
-        if ELF_SPAWN_REQUEST.swap(false, Ordering::SeqCst) {
-            ELF_ACTIVE_RUNNING.store(true, Ordering::SeqCst);
-            elf_runner_worker();
+    // التحقق إذا كان هذا الـ Core مخصصاً لتشغيل Process
+    if core_id >= 2 {
+        if CORE_ELF_SPAWN_REQ[core_id].swap(false, Ordering::SeqCst) {
+            elf_runner_worker(core_id);
             return;
         }
     }

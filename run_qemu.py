@@ -34,14 +34,12 @@ def lfn_checksum(short_name_bytes):
 
 def build_userspace_app():
     userspace_dir = os.path.abspath("userspace")
-    
     cmd = [
         "cargo", "build",
         "--release",
         "--manifest-path", os.path.join(userspace_dir, "Cargo.toml"),
         "--target", "x86_64-unknown-linux-musl"
     ]
-    
     env = os.environ.copy()
     env.pop("RUSTFLAGS", None)
 
@@ -224,6 +222,123 @@ def make_uefi_fat32_disk(img_path, files):
     with open(img_path, "wb") as f:
         f.write(disk)
 
+def make_large_fat32_storage(img_path, share_dir):
+    SECTOR_SIZE = 512
+    SECTORS_PER_CLUSTER = 64
+    CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE
+    RESERVED_SECTORS = 32
+    NUM_FATS = 2
+
+    TOTAL_SECTORS = 20971520 # 10 GB
+    FAT_SIZE_SECTORS = 2560
+    ROOT_CLUSTER = 2
+
+    if os.path.exists(img_path) and os.path.getsize(img_path) == TOTAL_SECTORS * SECTOR_SIZE:
+        return
+
+    print("[*] Creating 10GB FAT32 Storage Image for high-bitrate media & binaries...")
+    
+    with open(img_path, "wb") as f:
+        f.truncate(TOTAL_SECTORS * SECTOR_SIZE)
+
+    vbr = bytearray(SECTOR_SIZE)
+    vbr[0:3] = b"\xEB\x58\x90"
+    vbr[3:11] = b"MSWIN4.1"
+    struct.pack_into("<H", vbr, 11, SECTOR_SIZE)
+    vbr[13] = SECTORS_PER_CLUSTER
+    struct.pack_into("<H", vbr, 14, RESERVED_SECTORS)
+    vbr[16] = NUM_FATS
+    vbr[21] = 0xF8
+    struct.pack_into("<H", vbr, 24, 63)
+    struct.pack_into("<H", vbr, 26, 255)
+    struct.pack_into("<I", vbr, 28, 0)
+    struct.pack_into("<I", vbr, 32, TOTAL_SECTORS)
+    struct.pack_into("<I", vbr, 36, FAT_SIZE_SECTORS)
+    struct.pack_into("<I", vbr, 44, ROOT_CLUSTER)
+    struct.pack_into("<H", vbr, 48, 1)
+    struct.pack_into("<H", vbr, 50, 6)
+    vbr[64] = 0x80
+    vbr[66] = 0x29
+    struct.pack_into("<I", vbr, 67, 0x87654321)
+    vbr[71:82] = b"EOS_MEDIA  "
+    vbr[82:90] = b"FAT32   "
+    vbr[510:512] = b"\x55\xAA"
+
+    fat1_offset = RESERVED_SECTORS * SECTOR_SIZE
+    data_start = fat1_offset + (NUM_FATS * FAT_SIZE_SECTORS * SECTOR_SIZE)
+
+    with open(img_path, "r+b") as f:
+        f.seek(0)
+        f.write(vbr)
+        f.seek(6 * SECTOR_SIZE)
+        f.write(vbr)
+
+        fat_init = bytearray(12)
+        struct.pack_into("<I", fat_init, 0, 0x0FFFFFF8)
+        struct.pack_into("<I", fat_init, 4, 0x0FFFFFFF)
+        struct.pack_into("<I", fat_init, 8, 0x0FFFFFFF)
+        f.seek(fat1_offset)
+        f.write(fat_init)
+        f.seek(fat1_offset + (FAT_SIZE_SECTORS * SECTOR_SIZE))
+        f.write(fat_init)
+
+        current_cluster = 3
+        root_entries = []
+        file_counter = 1
+
+        if os.path.exists(share_dir):
+            for fname in os.listdir(share_dir):
+                fpath = os.path.join(share_dir, fname)
+                if os.path.isfile(fpath):
+                    fsize = os.path.getsize(fpath)
+                    needed_c = (fsize + CLUSTER_SIZE - 1) // CLUSTER_SIZE
+                    start_c = current_cluster if fsize > 0 else 0
+
+                    print(f"   -> Importing '{fname}' ({fsize // (1024*1024)} MB)...")
+
+                    with open(fpath, "rb") as src:
+                        for ci in range(needed_c):
+                            curr = start_c + ci
+                            nxt = (curr + 1) if (ci < needed_c - 1) else 0x0FFFFFFF
+                            f.seek(fat1_offset + (curr * 4))
+                            f.write(struct.pack("<I", nxt))
+                            f.seek(fat1_offset + (FAT_SIZE_SECTORS * SECTOR_SIZE) + (curr * 4))
+                            f.write(struct.pack("<I", nxt))
+
+                            chunk = src.read(CLUSTER_SIZE)
+                            f.seek(data_start + ((curr - 2) * CLUSTER_SIZE))
+                            f.write(chunk)
+
+                    current_cluster += needed_c
+
+                    _, ext = os.path.splitext(fname)
+                    ext = ext.lstrip(".").upper()[:3].ljust(3)
+                    short_base = f"FILE{file_counter:04d}"
+                    short_name = (short_base + ext).encode("ascii")
+                    file_counter += 1
+
+                    ent = bytearray(32)
+                    ent[0:11] = short_name
+                    ent[11] = 0x20
+                    struct.pack_into("<H", ent, 20, (start_c >> 16) & 0xFFFF)
+                    struct.pack_into("<H", ent, 26, start_c & 0xFFFF)
+                    struct.pack_into("<I", ent, 28, fsize)
+
+                    chk = lfn_checksum(short_name)
+                    name_slices = [fname[i:i+13] for i in range(0, len(fname), 13)]
+                    total_lfn = len(name_slices)
+                    for idx, s in enumerate(reversed(name_slices)):
+                        order = total_lfn - idx
+                        is_last = (idx == 0)
+                        lfn_ent = make_lfn_entry(order, s, chk, is_last=is_last)
+                        root_entries.append(lfn_ent)
+
+                    root_entries.append(ent)
+
+        f.seek(data_start)
+        for e in root_entries:
+            f.write(e)
+
 def make_ext2_disk(img_path):
     if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
         return
@@ -319,14 +434,8 @@ def prepare_and_run():
     make_ext2_disk(ext2_img_path)
 
     share_dir = r"C:\EOS_SHARE"
-    try:
-        os.makedirs(share_dir, exist_ok=True)
-        cfg_file = os.path.join(share_dir, "eos.cfg")
-        if not os.path.exists(cfg_file):
-            with open(cfg_file, "w", encoding="utf-8") as f:
-                f.write("THEME=0\nWALLPAPER=\n")
-    except Exception:
-        pass
+    storage_img_path = os.path.join(target_dir, "storage_10gb.img")
+    make_large_fat32_storage(storage_img_path, share_dir)
 
     qemu_share = r"C:\Program Files\qemu\share"
     code_fd = os.path.join(qemu_share, "edk2-x86_64-code.fd")
@@ -348,14 +457,14 @@ def prepare_and_run():
     qemu_cmd = [
         "qemu-system-x86_64",
         "-M", "q35",
-        "-m", "2048M",
+        "-m", "8192M",
         "-smp", "8",
         "-drive", f"if=pflash,format=raw,readonly=on,file={code_fd}",
         "-drive", f"if=pflash,format=raw,file={vars_dst}",
         "-device", "piix3-ide,id=ide",
         "-drive", f"id=disk0,file={img_path},format=raw,if=none",
         "-device", "ide-hd,bus=ide.0,unit=0,drive=disk0",
-        "-drive", f"id=disk1,file=fat:rw:{share_dir},format=raw,if=none",
+        "-drive", f"id=disk1,file={storage_img_path},format=raw,if=none",
         "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
         "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none",
         "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",

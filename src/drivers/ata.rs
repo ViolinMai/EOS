@@ -27,8 +27,16 @@ const STATUS_DRQ: u8 = 0x08;
 const STATUS_ERR: u8 = 0x01;
 const STATUS_DF: u8 = 0x20;
 
-// القطاع الثابت في قرص rootfs.ext2 (Drive 2) - غير قابل للحذف في run_qemu.py
 pub const PERSISTENT_CONFIG_SECTOR: u32 = 500;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaType {
+    Video,
+    Image,
+    Executable,
+    Text,
+    Unknown,
+}
 
 #[inline]
 fn get_drive_io_base_and_head(drive: u8) -> (u16, u8) {
@@ -48,6 +56,7 @@ pub struct DiskFileInfo {
     pub first_cluster: u32,
     pub dir_entry_lba: u32,
     pub dir_entry_offset: usize,
+    pub media_type: MediaType,
 }
 
 #[inline]
@@ -71,7 +80,7 @@ unsafe fn inw(port: u16) -> u16 {
 
 #[inline]
 unsafe fn outw(port: u16, val: u16) {
-    unsafe { asm!("out dx, ax", in("dx") port, in("ax") val, options(nomem, nostack, preserves_flags)); }
+    unsafe { asm!("out dx, ax", in("dx") port, in("al") val as u8, options(nomem, nostack, preserves_flags)); }
 }
 
 #[inline]
@@ -85,7 +94,7 @@ unsafe fn ata_io_wait(io_base: u16) {
 }
 
 fn poll_drive_ready(io_base: u16, expect_drq: bool) -> Result<(), &'static str> {
-    for _ in 0..10_000 {
+    for _ in 0..25_000 {
         let status = unsafe { inb(io_base + ATA_REG_STATUS) };
         if status == 0xFF { return Err("ATA Floating Bus"); }
         if (status & STATUS_BSY) == 0 {
@@ -101,8 +110,9 @@ fn poll_drive_ready(io_base: u16, expect_drq: bool) -> Result<(), &'static str> 
     Err("ATA Timeout")
 }
 
-pub fn read_sector_drive(drive: u8, lba: u32, buffer: &mut [u8; 512]) -> Result<(), &'static str> {
+pub fn read_sectors_drive(drive: u8, lba: u32, count: u8, buffer: &mut [u8]) -> Result<(), &'static str> {
     if lba >= 0x1000_0000 { return Err("LBA out of range"); }
+    if buffer.len() < (count as usize) * 512 { return Err("Buffer too small"); }
     let (io_base, drive_head) = get_drive_io_base_and_head(drive);
 
     unsafe {
@@ -110,21 +120,29 @@ pub fn read_sector_drive(drive: u8, lba: u32, buffer: &mut [u8; 512]) -> Result<
         ata_io_wait(io_base);
         poll_drive_ready(io_base, false)?;
 
-        outb(io_base + ATA_REG_SECTOR_CNT, 1);
+        outb(io_base + ATA_REG_SECTOR_CNT, count);
         outb(io_base + ATA_REG_LBA_LO, (lba & 0xFF) as u8);
         outb(io_base + ATA_REG_LBA_MID, ((lba >> 8) & 0xFF) as u8);
         outb(io_base + ATA_REG_LBA_HI, ((lba >> 16) & 0xFF) as u8);
         outb(io_base + ATA_REG_COMMAND, ATA_CMD_READ_SECTORS);
-        ata_io_wait(io_base);
-        poll_drive_ready(io_base, true)?;
 
-        for i in 0..256 {
-            let word = inw(io_base + ATA_REG_DATA);
-            buffer[i * 2] = (word & 0xFF) as u8;
-            buffer[i * 2 + 1] = ((word >> 8) & 0xFF) as u8;
+        for sec in 0..count as usize {
+            ata_io_wait(io_base);
+            poll_drive_ready(io_base, true)?;
+
+            let sec_offset = sec * 512;
+            for i in 0..256 {
+                let word = inw(io_base + ATA_REG_DATA);
+                buffer[sec_offset + i * 2] = (word & 0xFF) as u8;
+                buffer[sec_offset + i * 2 + 1] = ((word >> 8) & 0xFF) as u8;
+            }
         }
     }
     Ok(())
+}
+
+pub fn read_sector_drive(drive: u8, lba: u32, buffer: &mut [u8; 512]) -> Result<(), &'static str> {
+    read_sectors_drive(drive, lba, 1, buffer)
 }
 
 pub fn write_sector_drive(drive: u8, lba: u32, buffer: &[u8; 512]) -> Result<(), &'static str> {
@@ -156,7 +174,6 @@ pub fn write_sector_drive(drive: u8, lba: u32, buffer: &[u8; 512]) -> Result<(),
     Ok(())
 }
 
-// 💡 الحفظ في Drive 2 (rootfs.ext2) داخل قطاع دائم لا يُمسح بين مرات التشغيل
 pub fn save_system_config(theme_idx: u8, wallpaper_name: &str) -> Result<(), &'static str> {
     let mut sector = [0u8; 512];
     sector[0] = 0xAA;
@@ -172,7 +189,6 @@ pub fn save_system_config(theme_idx: u8, wallpaper_name: &str) -> Result<(), &'s
     if res.is_ok() {
         log_info!("CONFIG", "Configuration written to Persistent Sector. Theme={}, Wall='{}'", theme_idx, wallpaper_name);
         
-        // كتابة نسخة نصية واضحة في ملف eos.cfg على قرص التخزين
         let mut cfg_content = String::new();
         cfg_content.push_str("THEME=");
         cfg_content.push((b'0' + theme_idx) as char);
@@ -287,26 +303,38 @@ pub fn get_fat_layout(drive: u8) -> Result<FatLayout, &'static str> {
     })
 }
 
+static mut FAT_CACHE_SECTOR: u32 = 0xFFFF_FFFF;
+static mut FAT_CACHE_DRIVE: u8 = 0xFF;
+static mut FAT_CACHE_DATA: [u8; 512] = [0; 512];
+
 pub fn get_next_cluster(drive: u8, layout: &FatLayout, cluster: u32) -> Result<u32, &'static str> {
-    let mut buf = [0u8; 512];
     match layout.fat_type {
         FatType::Fat32 => {
             let fat_offset = cluster * 4;
             let fat_sector_lba = layout.fat_start_lba + (fat_offset / 512);
             let entry_offset = (fat_offset % 512) as usize;
-            read_sector_drive(drive, fat_sector_lba, &mut buf)?;
-            let next_c = u32::from_le_bytes([
-                buf[entry_offset],
-                buf[entry_offset + 1],
-                buf[entry_offset + 2],
-                buf[entry_offset + 3],
-            ]) & 0x0FFF_FFFF;
-            Ok(next_c)
+
+            unsafe {
+                let cache_ptr = core::ptr::addr_of_mut!(FAT_CACHE_DATA);
+                if FAT_CACHE_DRIVE != drive || FAT_CACHE_SECTOR != fat_sector_lba {
+                    read_sector_drive(drive, fat_sector_lba, &mut *cache_ptr)?;
+                    FAT_CACHE_SECTOR = fat_sector_lba;
+                    FAT_CACHE_DRIVE = drive;
+                }
+                let next_c = u32::from_le_bytes([
+                    (*cache_ptr)[entry_offset],
+                    (*cache_ptr)[entry_offset + 1],
+                    (*cache_ptr)[entry_offset + 2],
+                    (*cache_ptr)[entry_offset + 3],
+                ]) & 0x0FFF_FFFF;
+                Ok(next_c)
+            }
         }
         FatType::Fat16 => {
             let fat_offset = cluster * 2;
             let fat_sector_lba = layout.fat_start_lba + (fat_offset / 512);
             let entry_offset = (fat_offset % 512) as usize;
+            let mut buf = [0u8; 512];
             read_sector_drive(drive, fat_sector_lba, &mut buf)?;
             Ok(u16::from_le_bytes([buf[entry_offset], buf[entry_offset + 1]]) as u32)
         }
@@ -314,6 +342,7 @@ pub fn get_next_cluster(drive: u8, layout: &FatLayout, cluster: u32) -> Result<u
             let fat_offset = cluster + (cluster / 2);
             let fat_sector_lba = layout.fat_start_lba + (fat_offset / 512);
             let entry_offset = (fat_offset % 512) as usize;
+            let mut buf = [0u8; 512];
             read_sector_drive(drive, fat_sector_lba, &mut buf)?;
             let val = if entry_offset == 511 {
                 let low = buf[511] as u16;
@@ -334,7 +363,8 @@ pub fn read_entire_file(drive: u8, file_info: &DiskFileInfo) -> Result<Vec<u8>, 
     let mut data = Vec::with_capacity(file_info.size as usize);
     let mut current_cluster = file_info.first_cluster;
     let mut remaining = file_info.size as usize;
-    let mut buf = [0u8; 512];
+    let cluster_bytes = (layout.spc as usize) * 512;
+    let mut cluster_buf = alloc::vec![0u8; cluster_bytes];
 
     let end_marker = match layout.fat_type {
         FatType::Fat12 => 0x0FF8,
@@ -346,24 +376,53 @@ pub fn read_entire_file(drive: u8, file_info: &DiskFileInfo) -> Result<Vec<u8>, 
         let cluster_offset = (current_cluster.saturating_sub(2)).saturating_mul(layout.spc);
         let cluster_lba = layout.data_start_lba + cluster_offset;
 
-        for s in 0..layout.spc {
-            if remaining == 0 { break; }
-            read_sector_drive(drive, cluster_lba + s, &mut buf)?;
-            let to_copy = core::cmp::min(remaining, 512);
-            data.extend_from_slice(&buf[..to_copy]);
-            remaining -= to_copy;
-        }
+        read_sectors_drive(drive, cluster_lba, layout.spc as u8, &mut cluster_buf)?;
+        let to_copy = core::cmp::min(remaining, cluster_bytes);
+        data.extend_from_slice(&cluster_buf[..to_copy]);
+        remaining -= to_copy;
+
         current_cluster = get_next_cluster(drive, &layout, current_cluster)?;
     }
 
     Ok(data)
 }
 
+pub fn detect_media_type(drive: u8, first_cluster: u32) -> MediaType {
+    if first_cluster < 2 { return MediaType::Unknown; }
+    if let Ok(layout) = get_fat_layout(drive) {
+        let cluster_offset = (first_cluster.saturating_sub(2)).saturating_mul(layout.spc);
+        let cluster_lba = layout.data_start_lba + cluster_offset;
+        let mut buf = [0u8; 512];
+        if read_sector_drive(drive, cluster_lba, &mut buf).is_ok() {
+            if buf.len() >= 4 && &buf[0..4] == &[0x1A, 0x45, 0xDF, 0xA3] {
+                return MediaType::Video;
+            }
+            if buf.len() >= 8 && &buf[4..8] == b"ftyp" {
+                return MediaType::Video;
+            }
+            if (buf[0..4] == [0, 0, 0, 1] && (buf[4] & 0x1F) <= 23) 
+                || (buf[0..3] == [0, 0, 1] && (buf[3] & 0x1F) <= 23) {
+                return MediaType::Video;
+            }
+            if &buf[0..4] == b"DKIF" {
+                return MediaType::Video;
+            }
+            if &buf[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] || (&buf[0..3] == &[0xFF, 0xD8, 0xFF]) {
+                return MediaType::Image;
+            }
+            if &buf[0..4] == &[0x7F, b'E', b'L', b'F'] {
+                return MediaType::Executable;
+            }
+        }
+    }
+    MediaType::Unknown
+}
+
 pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
     let layout = get_fat_layout(1)?;
     let mut sector = [0u8; 512];
     let mut files = Vec::new();
-    let mut lfn_chars: Vec<u16> = Vec::new();
+    let mut lfn_parts: Vec<(u8, Vec<u16>)> = Vec::new();
 
     for s in 0..layout.root_dir_sectors {
         let dir_lba = layout.root_dir_lba + s;
@@ -375,13 +434,14 @@ pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
             let first_byte = sector[offset];
             if first_byte == 0x00 { break; }
             if first_byte == 0xE5 {
-                lfn_chars.clear();
+                lfn_parts.clear();
                 continue;
             }
 
             let attr = sector[offset + 11];
 
             if attr == 0x0F {
+                let order = sector[offset] & 0x3F;
                 let mut chunk = [0u16; 13];
                 for i in 0..5 {
                     chunk[i] = u16::from_le_bytes([sector[offset + 1 + i*2], sector[offset + 2 + i*2]]);
@@ -398,20 +458,23 @@ pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
                     if ch == 0x0000 || ch == 0xFFFF { break; }
                     valid_chunk.push(ch);
                 }
-                valid_chunk.extend(lfn_chars);
-                lfn_chars = valid_chunk;
+                lfn_parts.push((order, valid_chunk));
                 continue;
             }
 
-            if (attr & 0x08) != 0 || (attr & 0x10) != 0 {
-                lfn_chars.clear();
+            if (attr & 0x08) != 0 {
+                lfn_parts.clear();
                 continue;
             }
 
-            let filename = if !lfn_chars.is_empty() {
-                let parsed = String::from_utf16_lossy(&lfn_chars);
-                lfn_chars.clear();
-                parsed
+            let filename = if !lfn_parts.is_empty() {
+                lfn_parts.sort_by_key(|&(order, _)| order);
+                let mut full_utf16 = Vec::new();
+                for (_, part) in &lfn_parts {
+                    full_utf16.extend_from_slice(part);
+                }
+                lfn_parts.clear();
+                String::from_utf16_lossy(&full_utf16)
             } else {
                 let name_raw = &sector[offset..offset + 8];
                 let ext_raw = &sector[offset + 8..offset + 11];
@@ -439,12 +502,27 @@ pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
                 sector[offset + 31],
             ]);
 
+            let mut detected_type = detect_media_type(1, first_cluster);
+            let lower = filename.to_ascii_lowercase();
+            if detected_type == MediaType::Unknown {
+                if lower.ends_with(".mkv") || lower.ends_with(".mp4") || lower.ends_with(".h264") || lower.ends_with(".264") {
+                    detected_type = MediaType::Video;
+                } else if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+                    detected_type = MediaType::Image;
+                } else if lower.ends_with(".elf") {
+                    detected_type = MediaType::Executable;
+                } else {
+                    detected_type = MediaType::Text;
+                }
+            }
+
             files.push(DiskFileInfo {
                 name: filename,
                 size: file_size,
                 first_cluster,
                 dir_entry_lba: dir_lba,
                 dir_entry_offset: offset,
+                media_type: detected_type,
             });
         }
     }

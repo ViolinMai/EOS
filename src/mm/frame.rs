@@ -2,12 +2,14 @@ use crate::log_info;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 pub const PAGE_SIZE: usize = 4096;
+// 💡 حصر العناوين الفيزيائية تحت 4GB لضمان مطابقتها لنطاق الـ Identity Paging المباشر في النواة
+pub const MAX_SAFE_PHYS_ADDR: u64 = 0x1_0000_0000;
 
 pub struct BitmapFrameAllocator {
     bitmap: *mut u8,
     total_frames: usize,
     used_frames: AtomicUsize,
-    last_alloc_byte: usize, // 💡 السر الجوهري: تخزين آخر مكان تم الحجز منه لمنع البحث من الصفر وتسريع النظام آلاف المرات
+    last_alloc_byte: usize,
     #[allow(dead_code)]
     pub hhdm_offset: u64,
 }
@@ -17,7 +19,6 @@ unsafe impl Sync for BitmapFrameAllocator {}
 
 pub static mut FRAME_ALLOCATOR: Option<BitmapFrameAllocator> = None;
 
-#[allow(dead_code)]
 #[inline]
 fn is_entry_usable(entry: &limine::memmap::Entry) -> bool {
     let raw_val: u64 = unsafe { core::ptr::read_unaligned(&entry.type_ as *const _ as *const u64) };
@@ -39,12 +40,14 @@ impl BitmapFrameAllocator {
             }
         }
 
-        let total_frames = (highest_address as usize + PAGE_SIZE - 1) / PAGE_SIZE;
+        // تحديد سقف النطاق الآمن لضمان عدم حصول Page Fault في الـ High Phys Mem
+        let max_phys = highest_address.min(MAX_SAFE_PHYS_ADDR);
+        let total_frames = (max_phys as usize + PAGE_SIZE - 1) / PAGE_SIZE;
         let bitmap_size = (total_frames + 7) / 8;
 
         let mut bitmap_phys_addr: Option<u64> = None;
         for &entry in entries {
-            if is_entry_usable(entry) && entry.length as usize >= bitmap_size {
+            if is_entry_usable(entry) && entry.length as usize >= bitmap_size && (entry.base + bitmap_size as u64) < MAX_SAFE_PHYS_ADDR {
                 bitmap_phys_addr = Some(entry.base);
                 break;
             }
@@ -66,9 +69,10 @@ impl BitmapFrameAllocator {
         };
 
         for &entry in entries {
-            if is_entry_usable(entry) {
+            if is_entry_usable(entry) && entry.base < MAX_SAFE_PHYS_ADDR {
                 let start_frame = (entry.base as usize) / PAGE_SIZE;
-                let frame_count = (entry.length as usize) / PAGE_SIZE;
+                let available_len = (entry.length as usize).min(MAX_SAFE_PHYS_ADDR as usize - entry.base as usize);
+                let frame_count = available_len / PAGE_SIZE;
                 for i in 0..frame_count {
                     allocator.free_frame_index(start_frame + i);
                 }
@@ -81,7 +85,7 @@ impl BitmapFrameAllocator {
             allocator.mark_frame_used(bitmap_start_frame + i);
         }
 
-        log_info!("PMM", "Physical Memory: {} MB total ({} usable frames)",
+        log_info!("PMM", "Physical Memory: {} MB configured ({} usable frames)",
             usable_memory / (1024 * 1024),
             total_frames - allocator.used_frames.load(Ordering::Relaxed)
         );
@@ -120,7 +124,6 @@ impl BitmapFrameAllocator {
         }
     }
 
-    // 💡 الآن حجز الذاكرة فائق السرعة O(1) ولن يجمّد معالج جهازك أبدًا
     pub fn allocate_frame(&mut self) -> Option<u64> {
         let start_byte = self.last_alloc_byte;
         let total_bytes = self.total_frames / 8;
