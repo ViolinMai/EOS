@@ -65,13 +65,17 @@ extern "C" fn jump_to_ring3(entry: u64, rsp: u64, user_cs: u64, user_ds: u64) {
 
         "mov [{kernel_sp}], rsp",
 
-        "push rcx",       
-        "push rsi",       
-        "push 0x202",     
-        "push rdx",       
-        "push rdi",       
+        "mov ax, cx",
+        "mov ds, ax",
+        "mov es, ax",
+        "mov fs, ax",
+        "mov gs, ax",
 
-        "swapgs",         
+        "push rcx",         // SS (User Data)
+        "push rsi",         // RSP (Aligned 16 bytes)
+        "push 0x202",       // RFLAGS
+        "push rdx",         // CS (User Code)
+        "push rdi",         // RIP
         "iretq",
         kernel_sp = sym crate::arch::x86_64::syscall::KERNEL_SAVED_RSP,
     );
@@ -83,7 +87,7 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
     if header.magic != ELF_MAGIC { return Err("Invalid ELF magic identifier"); }
     if header.class != 2 || header.machine != 0x3E { return Err("Binary is not x86_64 64-bit"); }
 
-    reset_core2_process(); // 💡 تهيئة فضاء الـ Process المعزول لتجنب الـ Race Condition
+    reset_core2_process();
 
     let phoff = header.phoff as usize;
     let phnum = header.phnum as usize;
@@ -227,14 +231,41 @@ pub fn load_and_run_elf(data: &[u8], arg: &str) -> Result<(), &'static str> {
         unsafe { invalidate_tlb(curr_vaddr); }
     }
 
+    // 💡 إعداد قمة المكدس محاذية لـ 16 بايت وتمرير جدول الـ Auxv الأساسي لمكتبة std
+    let user_rsp = (USER_STACK_TOP - 0x1000) & !0x0F;
+    unsafe {
+        let p2_idx = ((user_rsp >> 21) & 0x1FF) as usize;
+        let p1_idx = ((user_rsp >> 12) & 0x1FF) as usize;
+        let pt_phys = pd.entries[p2_idx].physical_address();
+        let pt = &*((pt_phys + vmm.hhdm_offset) as *const PageTable);
+        let frame_phys = pt.entries[p1_idx].physical_address();
+        let page_offset = (user_rsp & 0xFFF) as usize;
+        
+        let stack_ptr = (frame_phys + vmm.hhdm_offset + page_offset as u64) as *mut u64;
+        
+        // هيئة Linux ELF ABI:
+        // [argc = 0]
+        // [argv_end = NULL]
+        // [envp_end = NULL]
+        // [auxv: AT_PAGESZ=6, 4096]
+        // [auxv: AT_NULL=0, 0]
+        *stack_ptr.offset(0) = 0;    // argc = 0
+        *stack_ptr.offset(1) = 0;    // argv[0] = NULL
+        *stack_ptr.offset(2) = 0;    // envp[0] = NULL
+        *stack_ptr.offset(3) = 6;    // AT_PAGESZ
+        *stack_ptr.offset(4) = 4096; // 4096 Bytes
+        *stack_ptr.offset(5) = 0;    // AT_NULL
+        *stack_ptr.offset(6) = 0;
+    }
+
     clear_keyboard_buffer();
 
     let actual_entry = header.entry;
     ELF_EXIT_REQUESTED.store(false, Ordering::SeqCst);
-    log_info!("ELF", "Context Jump -> Ring 3 Entry: {:#010x}", actual_entry);
+    log_info!("ELF", "Context Jump -> Ring 3 Entry: {:#010x} | Stack: {:#010x}", actual_entry, user_rsp);
 
     unsafe {
-        jump_to_ring3(actual_entry, USER_STACK_TOP - 0x2000, USER_CODE_SELECTOR as u64, USER_DATA_SELECTOR as u64);
+        jump_to_ring3(actual_entry, user_rsp, USER_CODE_SELECTOR as u64, USER_DATA_SELECTOR as u64);
     }
 
     log_info!("ELF", "Process execution completed cleanly.");

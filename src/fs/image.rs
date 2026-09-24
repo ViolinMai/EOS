@@ -9,9 +9,6 @@ use zune_jpeg::JpegDecoder;
 pub static mut CUSTOM_WALLPAPER: Option<Vec<u32>> = None;
 pub static mut CUSTOM_WALLPAPER_DIM: (usize, usize) = (0, 0);
 
-// ==========================================
-// 💡 LRU Image Cache Manager (Max 256 MB)
-// ==========================================
 pub const MAX_CACHE_BYTES: usize = 256 * 1024 * 1024;
 
 pub struct CachedImage {
@@ -37,7 +34,6 @@ impl ImageCacheManager {
 
     pub fn evict_if_needed(&mut self, needed_bytes: usize) {
         while self.current_bytes + needed_bytes > MAX_CACHE_BYTES && !self.entries.is_empty() {
-            // البحث عن العنصر الأقدم استخداماً واستبعاده
             let mut oldest_idx = 0;
             let mut oldest_tick = u64::MAX;
 
@@ -167,6 +163,7 @@ pub fn set_as_wallpaper(data: &[u8]) -> Result<(), &'static str> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn set_wallpaper_from_raw(pixels: Vec<u32>, w: usize, h: usize) {
     unsafe {
         *addr_of_mut!(CUSTOM_WALLPAPER) = Some(pixels);

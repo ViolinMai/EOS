@@ -13,7 +13,7 @@ Instructions:
 
 # صيغ ملفات الأكواد، السكريبتات، وملفات التهيئة الخاصة بالنواة
 SOURCE_CODE_EXTENSIONS = (
-    '.rs', '.py', '.ld', '.conf', '.toml', '.s', '.asm', '.nsh', '.TAG'
+    '.rs', '.py', '.ld', '.conf', '.toml', '.s', '.asm', '.nsh', '.TAG', ".lock"
 )
 
 EXACT_SOURCE_FILES = {'CMakeLists.txt'}

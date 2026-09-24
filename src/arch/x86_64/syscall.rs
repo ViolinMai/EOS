@@ -1,5 +1,5 @@
 use core::arch::{asm, naked_asm};
-use crate::{log_info, log_error};
+use crate::{log_info, log_error, log_warn, log_debug};
 use crate::arch::x86_64::pit;
 use crate::fs::vfs_read_bytes;
 use crate::task::FileDescriptor;
@@ -73,6 +73,7 @@ pub struct SyscallFrame {
 #[unsafe(naked)]
 extern "C" fn syscall_entry() {
     naked_asm!(
+        "swapgs",
         "mov [{user_sp}], rsp",
         "mov rsp, [{kernel_sp}]",
         
@@ -116,6 +117,7 @@ extern "C" fn syscall_entry() {
         "pop rcx",
 
         "mov rsp, [{user_sp}]",
+        "swapgs",
         "sysretq",
         user_sp = sym USER_SAVED_RSP,
         kernel_sp = sym KERNEL_SYSCALL_STACK_TOP,
@@ -160,31 +162,97 @@ unsafe fn read_user_string(ptr: *const u8, max_len: usize) -> Option<String> {
     core::str::from_utf8(slice).map(String::from).ok()
 }
 
+fn syscall_name(num: u64) -> &'static str {
+    match num {
+        0 => "read", 1 => "write", 2 => "open", 3 => "close", 4 => "stat",
+        5 => "fstat", 7 => "poll", 8 => "lseek", 9 => "mmap", 10 => "mprotect",
+        11 => "munmap", 12 => "brk", 13 => "rt_sigaction", 14 => "rt_sigprocmask",
+        16 => "ioctl", 19 => "readv", 20 => "writev", 21 => "access", 22 => "pipe",
+        24 => "sched_yield", 28 => "madvise", 39 => "getpid", 41 => "socket",
+        60 => "exit", 72 => "fcntl", 79 => "getcwd", 89 => "readlink",
+        131 => "sigaltstack", 158 => "arch_prctl", 186 => "gettid", 200 => "tkill",
+        202 => "futex", 217 => "getdents64", 218 => "set_tid_address",
+        228 => "clock_gettime", 231 => "exit_group", 234 => "tgkill",
+        257 => "openat", 262 => "fstatat", 302 => "prlimit64", 318 => "getrandom",
+        500 => "sys_sleep", 501 => "sys_clear_screen", 502 => "sys_blit_image_ptr",
+        _ => "unknown_sys",
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
     let frame = unsafe { &mut *frame_ptr };
     let syscall_num = frame.rax;
+    let name = syscall_name(syscall_num);
+
+    // 💡 محلل استدعاءات متقدم لاستخراج النصوص والتفاصيل المهمة
+    let mut extra_info = String::new();
+    
+    if syscall_num == 2 || syscall_num == 257 || syscall_num == 4 || syscall_num == 21 {
+        let ptr = if syscall_num == 257 { frame.rsi } else { frame.rdi } as *const u8;
+        if let Some(s) = unsafe { read_user_string(ptr, 128) } {
+            extra_info = alloc::format!("path=\"{}\"", s);
+        }
+    } else if syscall_num == 9 { // mmap
+        extra_info = alloc::format!("len={}, prot={:#x}, flags={:#x}, fd={}", frame.rsi, frame.rdx, frame.r10, frame.r8 as i64);
+    } else if syscall_num == 1 || syscall_num == 0 { // read / write
+        extra_info = alloc::format!("fd={}, len={}", frame.rdi, frame.rdx);
+    } else if syscall_num == 3 { // close
+        extra_info = alloc::format!("fd={}", frame.rdi);
+    }
+
+    log_debug!(
+        "MIRROR",
+        "Syscall {:>3} [{:<14}] ({:#08x}, {:#08x}) {}",
+        syscall_num, name, frame.rdi, frame.rsi, extra_info
+    );
 
     match syscall_num {
-        1 => {
-            ELF_EXIT_REQUESTED.store(true, Ordering::SeqCst);
-            crate::serial_println!("\n[SYSCALL] Process exited cleanly with code {}.", frame.rdi);
+        // ===================================================================
+        // 🪞 MIRROR LAYER (Linux ABI Compatibility Subset for Rust STD) 🪞
+        // ===================================================================
+        0 => { // read
+            let fd = frame.rdi as usize;
+            let buf = frame.rsi as *mut u8;
+            let count = frame.rdx as usize;
+
+            if fd == 0 {
+                let mut read_count = 0;
+                unsafe {
+                    while read_count < count {
+                        if let Some(c) = crate::arch::x86_64::keyboard::pop_char_from_buffer() {
+                            core::ptr::write(buf.add(read_count), c);
+                            read_count += 1;
+                            if c == b'\n' { break; }
+                        } else {
+                            crate::task::yield_now();
+                        }
+                    }
+                }
+                frame.rax = read_count as u64;
+                return;
+            }
+
             unsafe {
-                let saved_sp = KERNEL_SAVED_RSP;
-                if saved_sp != 0 {
-                    asm!(
-                        "mov rsp, {sp}",
-                        "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx", "pop rbp",
-                        "ret",
-                        sp = in(reg) saved_sp,
-                        options(noreturn)
-                    );
+                let proc = &mut *addr_of_mut!(CORE2_PROCESS);
+                if fd < proc.fd_table.len() {
+                    if let Some(file_desc) = &mut proc.fd_table[fd] {
+                        let available = file_desc.data.len().saturating_sub(file_desc.offset);
+                        let to_read = core::cmp::min(available, count);
+                        if to_read > 0 {
+                            core::ptr::copy_nonoverlapping(file_desc.data.as_ptr().add(file_desc.offset), buf, to_read);
+                            file_desc.offset += to_read;
+                        }
+                        frame.rax = to_read as u64;
+                        return;
+                    }
                 }
             }
-            frame.rax = 0;
+            frame.rax = -9i64 as u64; // EBADF
         }
-        2 => {
-            if frame.rdi == 1 || frame.rdi == 2 {
+        1 => { // write
+            let fd = frame.rdi;
+            if fd == 1 || fd == 2 {
                 let count = core::cmp::min(frame.rdx as usize, 4096);
                 unsafe {
                     let slice = core::slice::from_raw_parts(frame.rsi as *const u8, count);
@@ -194,40 +262,12 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 }
                 frame.rax = count as u64;
             } else {
-                frame.rax = -1i64 as u64;
+                frame.rax = -9i64 as u64; // EBADF
             }
         }
-        3 => {
-            let fd = frame.rdi as usize;
-            let buf = frame.rsi as *mut u8;
-            let count = frame.rdx as usize;
-
-            unsafe {
-                let proc = &mut *addr_of_mut!(CORE2_PROCESS);
-                if fd < proc.fd_table.len() {
-                    if let Some(file_desc) = &mut proc.fd_table[fd] {
-                        let available = file_desc.data.len().saturating_sub(file_desc.offset);
-                        let to_read = core::cmp::min(available, count);
-                        
-                        if to_read > 0 {
-                            core::ptr::copy_nonoverlapping(
-                                file_desc.data.as_ptr().add(file_desc.offset),
-                                buf,
-                                to_read
-                            );
-                            file_desc.offset += to_read;
-                            frame.rax = to_read as u64;
-                            return;
-                        }
-                        frame.rax = 0;
-                        return;
-                    }
-                }
-            }
-            frame.rax = -1i64 as u64;
-        }
-        4 => {
-            let path_opt = unsafe { read_user_string(frame.rdi as *const u8, 256) };
+        2 | 257 => { // open / openat
+            let path_ptr = if syscall_num == 257 { frame.rsi } else { frame.rdi } as *const u8;
+            let path_opt = unsafe { read_user_string(path_ptr, 256) };
             if let Some(path) = path_opt {
                 match vfs_read_bytes(&path) {
                     Ok(data) => {
@@ -235,28 +275,24 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                             let proc = &mut *addr_of_mut!(CORE2_PROCESS);
                             for i in 3..proc.fd_table.len() {
                                 if proc.fd_table[i].is_none() {
-                                    proc.fd_table[i] = Some(FileDescriptor {
-                                        path,
-                                        data,
-                                        offset: 0,
-                                    });
+                                    proc.fd_table[i] = Some(FileDescriptor { path, data, offset: 0 });
                                     frame.rax = i as u64;
                                     return;
                                 }
                             }
                         }
-                        frame.rax = -2i64 as u64;
+                        frame.rax = -24i64 as u64; // EMFILE
                         return;
                     }
                     Err(_) => {
-                        frame.rax = -1i64 as u64;
+                        frame.rax = -2i64 as u64; // ENOENT
                         return;
                     }
                 }
             }
-            frame.rax = -1i64 as u64;
+            frame.rax = -2i64 as u64; // ENOENT
         }
-        5 => {
+        3 => { // close
             let fd = frame.rdi as usize;
             unsafe {
                 let proc = &mut *addr_of_mut!(CORE2_PROCESS);
@@ -266,13 +302,35 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     return;
                 }
             }
-            frame.rax = -1i64 as u64;
+            frame.rax = -9i64 as u64; // EBADF
         }
-        8 => {
+        4 | 5 => { // stat / fstat
+            let stat_ptr = frame.rsi as *mut u8;
+            unsafe {
+                core::ptr::write_bytes(stat_ptr, 0, 144);
+                let mode_ptr = stat_ptr.add(24) as *mut u32;
+                *mode_ptr = 0x81A4; // S_IFREG | 0644
+                
+                if syscall_num == 5 {
+                    let fd = frame.rdi as usize;
+                    let proc = &mut *addr_of_mut!(CORE2_PROCESS);
+                    if fd < proc.fd_table.len() {
+                        if let Some(file_desc) = &proc.fd_table[fd] {
+                            let size_ptr = stat_ptr.add(48) as *mut i64;
+                            *size_ptr = file_desc.data.len() as i64;
+                        }
+                    }
+                }
+            }
+            frame.rax = 0;
+        }
+        7 => { // poll
+            frame.rax = 1;
+        }
+        8 => { // lseek
             let fd = frame.rdi as usize;
             let offset = frame.rsi as i64;
             let whence = frame.rdx as usize;
-
             unsafe {
                 let proc = &mut *addr_of_mut!(CORE2_PROCESS);
                 if fd < proc.fd_table.len() {
@@ -283,7 +341,6 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                             2 => (file_desc.data.len() as i64).saturating_add(offset),
                             _ => -1,
                         };
-
                         if new_offset >= 0 && new_offset <= file_desc.data.len() as i64 {
                             file_desc.offset = new_offset as usize;
                             frame.rax = new_offset as u64;
@@ -292,12 +349,11 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     }
                 }
             }
-            frame.rax = -1i64 as u64;
+            frame.rax = -22i64 as u64; // EINVAL
         }
-        9 => {
-            let size = frame.rdi;
+        9 => { // mmap
+            let size = frame.rsi as usize;
             if size == 0 { frame.rax = 0; return; }
-            
             let pages_needed = (size + 4095) / 4096;
             
             unsafe {
@@ -350,18 +406,134 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
 
                 proc.mmap_bump = current_vaddr;
                 frame.rax = start_vaddr;
-                return;
             }
         }
-        100 => {
+        10 | 11 | 12 | 13 | 14 | 28 => { 
+            // mprotect, munmap, brk, rt_sigaction, rt_sigprocmask, madvise
+            frame.rax = 0;
+        }
+        16 => { // ioctl
+            frame.rax = -25i64 as u64; // ENOTTY
+        }
+        20 => { // writev
+            #[repr(C)]
+            struct Iovec { base: *const u8, len: usize }
+            let fd = frame.rdi;
+            let iov_ptr = frame.rsi as *const Iovec;
+            let iovcnt = frame.rdx as usize;
+            let mut written = 0;
+            unsafe {
+                for i in 0..iovcnt {
+                    let iov = &*iov_ptr.add(i);
+                    if fd == 1 || fd == 2 {
+                        let slice = core::slice::from_raw_parts(iov.base, iov.len);
+                        if let Ok(s) = core::str::from_utf8(slice) {
+                            crate::serial_print!("{}", s);
+                        }
+                    }
+                    written += iov.len;
+                }
+            }
+            frame.rax = written as u64;
+        }
+        24 => { // sched_yield
+            crate::task::yield_now();
+            frame.rax = 0;
+        }
+        39 | 186 => { // getpid / gettid
+            frame.rax = 100;
+        }
+        60 | 231 => { // exit / exit_group
+            ELF_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+            unsafe {
+                let saved_sp = KERNEL_SAVED_RSP;
+                if saved_sp != 0 {
+                    asm!(
+                        "mov rsp, {sp}",
+                        "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx", "pop rbp",
+                        "sti", "ret",
+                        sp = in(reg) saved_sp,
+                        options(noreturn)
+                    );
+                }
+            }
+            frame.rax = 0;
+        }
+        72 => { // fcntl (Stub: نجاح فوري للتحكم بالملفات)
+            frame.rax = 0;
+        }
+        131 => { // sigaltstack (Stub: نجاح فوري لتخصيص مكدس الطوارئ)
+            frame.rax = 0;
+        }
+        158 => { // arch_prctl
+            if frame.rdi == 0x1002 { // ARCH_SET_FS
+                unsafe { wrmsr(0xC0000100, frame.rsi); }
+                frame.rax = 0;
+            } else {
+                frame.rax = -22i64 as u64; // EINVAL
+            }
+        }
+        200 | 234 => { // tkill / tgkill
+            log_warn!("MIRROR", "tkill/tgkill invoked. Terminating application safely.");
+            unsafe {
+                let saved_sp = KERNEL_SAVED_RSP;
+                if saved_sp != 0 {
+                    asm!(
+                        "mov rsp, {sp}",
+                        "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx", "pop rbp",
+                        "sti", "ret",
+                        sp = in(reg) saved_sp,
+                        options(noreturn)
+                    );
+                }
+            }
+            frame.rax = 0;
+        }
+        202 => { // futex
+            frame.rax = 0;
+        }
+        218 => { // set_tid_address
+            frame.rax = 100;
+        }
+        228 => { // clock_gettime
+            let tp = frame.rsi as *mut u64;
+            if !tp.is_null() {
+                let ticks = pit::get_ticks();
+                let secs = ticks / 100;
+                let nsecs = (ticks % 100) * 10_000_000;
+                unsafe {
+                    *tp = secs;
+                    *tp.add(1) = nsecs;
+                }
+                frame.rax = 0;
+            } else {
+                frame.rax = -1i64 as u64;
+            }
+        }
+        318 => { // getrandom
+            let buf = frame.rdi as *mut u8;
+            let count = frame.rsi as usize;
+            unsafe {
+                for i in 0..count {
+                    let t = pit::get_ticks().wrapping_mul(6364136223846793005).wrapping_add(i as u64);
+                    *buf.add(i) = (t ^ (t >> 7)) as u8;
+                }
+            }
+            frame.rax = count as u64;
+        }
+
+        // ===================================================================
+        // ⚙️ EOS CUSTOM SYSCALLS (Shifted to 500+) ⚙️
+        // ===================================================================
+        500 => { // sys_sleep
             pit::sleep_ms(frame.rdi);
             frame.rax = 0;
         }
-        101 => {
+        501 => { // sys_clear_screen
             OVERLAY_ACTIVE.store(false, Ordering::SeqCst);
             frame.rax = 0;
         }
-        102 => {
+        502 => { // sys_blit_image_ptr
             let ptr = frame.rdi as *const u32;
             let src_w = frame.r10 as usize;
             let src_h = frame.r8 as usize;
@@ -388,24 +560,9 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             }
             frame.rax = 0;
         }
-        228 => {
-            let tp = frame.rsi as *mut u64;
-            if !tp.is_null() {
-                let ticks = pit::get_ticks();
-                let secs = ticks / 100;
-                let nsecs = (ticks % 100) * 10_000_000;
-                unsafe {
-                    *tp = secs;
-                    *tp.add(1) = nsecs;
-                }
-                frame.rax = 0;
-            } else {
-                frame.rax = -1i64 as u64;
-            }
-        }
         _ => {
-            log_error!("SYSCALL", "Unknown syscall number: {}", syscall_num);
-            frame.rax = -1i64 as u64;
+            log_error!("MIRROR", "UNHANDLED Syscall #{}: args=({:#x}, {:#x}, {:#x})", syscall_num, frame.rdi, frame.rsi, frame.rdx);
+            frame.rax = -38i64 as u64; // ENOSYS
         }
     }
 }

@@ -48,6 +48,7 @@ enum ViewMode {
     SettingsMenu,
     WallpaperDialog,
     DiagnosticsTest,
+    TestsMenu,
     PowerDialog,
 }
 
@@ -87,13 +88,14 @@ pub fn compositor_core_entry() {
     let cards = vec![
         ConsoleCard { title: "File Explorer", subtitle: "Browse RootFS, Storage & Initrd", card_type: CardType::Explorer, target_image: "", color: 0xFF0284C7 },
         ConsoleCard { title: "Media Viewer", subtitle: "Open Default Image", card_type: CardType::Media, target_image: "icon.png", color: 0xFF2563EB },
-        ConsoleCard { title: "System Tests", subtitle: "Diagnostics & Controller", card_type: CardType::Tests, target_image: "", color: 0xFFD97706 },
+        ConsoleCard { title: "System Tests", subtitle: "Crates & Hardware Diagnostics", card_type: CardType::Tests, target_image: "", color: 0xFFD97706 },
         ConsoleCard { title: "Console Settings", subtitle: "Wallpaper & Custom Themes", card_type: CardType::Settings, target_image: "", color: 0xFF475569 },
     ];
 
     let mut current_view = ViewMode::Dashboard;
     let mut selected_card = 0;
     let mut selected_settings_idx = 0;
+    let mut selected_tests_idx = 0;
     let mut power_focus = false;
     let mut power_selected_action = 0;
 
@@ -111,6 +113,9 @@ pub fn compositor_core_entry() {
     let mut editor_cursor_x = 0usize;
     let mut editor_cursor_y = 0usize;
     let mut editor_save_status = "";
+
+    let mut crates_test_status = "Status: Not Started";
+    let mut crates_test_time_ms = 0u64;
 
     let mut last_nav_tick = pit::get_ticks();
     let mut a_pressed_last = false;
@@ -224,7 +229,8 @@ pub fn compositor_core_entry() {
                                     }
                                 }
                                 CardType::Tests => {
-                                    current_view = ViewMode::DiagnosticsTest;
+                                    selected_tests_idx = 0;
+                                    current_view = ViewMode::TestsMenu;
                                 }
                                 CardType::Settings => {
                                     selected_settings_idx = 0;
@@ -232,6 +238,39 @@ pub fn compositor_core_entry() {
                                 }
                             }
                         }
+                        last_nav_tick = current_tick + 20;
+                    }
+                }
+
+                ViewMode::TestsMenu => {
+                    if current_tick.saturating_sub(last_nav_tick) > 15 {
+                        if down && selected_tests_idx < 1 {
+                            selected_tests_idx += 1;
+                            last_nav_tick = current_tick;
+                        } else if up && selected_tests_idx > 0 {
+                            selected_tests_idx -= 1;
+                            last_nav_tick = current_tick;
+                        }
+                    }
+
+                    if a_btn && !a_pressed_last {
+                        if selected_tests_idx == 0 {
+                            let t_before = pit::read_tsc();
+                            if let Ok(()) = request_elf_execution("app.elf", "test") {
+                                log_info!("TESTS", "Dispatched Crates Test Suite to Core 2");
+                                crates_test_status = "Status: Tests Running in Background";
+                            } else {
+                                crates_test_status = "Status: Execution Error (Busy/Missing)";
+                            }
+                            crates_test_time_ms = pit::read_tsc().saturating_sub(t_before);
+                        } else {
+                            current_view = ViewMode::DiagnosticsTest;
+                        }
+                        last_nav_tick = current_tick + 20;
+                    }
+
+                    if b_btn && !b_pressed_last {
+                        current_view = ViewMode::Dashboard;
                         last_nav_tick = current_tick + 20;
                     }
                 }
@@ -267,7 +306,7 @@ pub fn compositor_core_entry() {
 
                 ViewMode::DiagnosticsTest => {
                     if b_btn && !b_pressed_last {
-                        current_view = ViewMode::Dashboard;
+                        current_view = ViewMode::TestsMenu;
                         last_nav_tick = current_tick + 20;
                     }
                 }
@@ -386,7 +425,6 @@ pub fn compositor_core_entry() {
                         } else {
                             let actual_idx = if current_folder.is_empty() { explorer_selected_idx } else { explorer_selected_idx - 1 };
                             if actual_idx < explorer_items.len() {
-                                // 💡 استنساخ العنصر لحل خطأ الاستعارة E0506
                                 let selected_item = explorer_items[actual_idx].clone();
                                 match selected_item {
                                     FsItem::Directory(dirname) => {
@@ -529,6 +567,42 @@ pub fn compositor_core_entry() {
                 draw_bottom_bar(&mut backbuffer, width, height, hint, "[B / Esc] Exit");
             }
 
+            ViewMode::TestsMenu => {
+                draw_top_bar(&mut backbuffer, width, height, GAMEPAD_CONNECTED.load(Ordering::Relaxed), is_running_elf, "SYSTEM & CRATES TEST SUITE", false);
+
+                let list_x = 240;
+                let list_y = 180;
+                let row_h = 75;
+                let list_w = width - 480;
+
+                let is_opt0_focused = selected_tests_idx == 0;
+                let is_opt1_focused = selected_tests_idx == 1;
+
+                draw_settings_row(&mut backbuffer, width, height, list_x, list_y, list_w, row_h - 12, "Run Rust Crates Test Suite (serde, sha2, rand, regex)", 0xFF10B981, is_opt0_focused, is_running_elf);
+                draw_settings_row(&mut backbuffer, width, height, list_x, list_y + row_h, list_w, row_h - 12, "Hardware & Controller Diagnostics (COM2/Serial/Sensors)", 0xFF38BDF8, is_opt1_focused, false);
+
+                let stat_box_y = list_y + (row_h * 2) + 20;
+                let stat_box_h = 140;
+                for y in stat_box_y..stat_box_y + stat_box_h {
+                    let r = y * width;
+                    for x in list_x..list_x + list_w {
+                        let is_b = x == list_x || x == list_x + list_w - 1 || y == stat_box_y || y == stat_box_y + stat_box_h - 1;
+                        buf_pixel(&mut backbuffer, r, x, if is_b { 0xFF64748B } else { 0xFF0F172A });
+                    }
+                }
+
+                draw_text_scaled(&mut backbuffer, width, height, list_x + 25, stat_box_y + 20, "LATEST TEST EXECUTION LOG:", 0xFFFDE047, 2);
+                draw_text_scaled(&mut backbuffer, width, height, list_x + 25, stat_box_y + 55, crates_test_status, if is_running_elf { 0xFFF59E0B } else { 0xFF4ADE80 }, 2);
+                
+                if crates_test_time_ms > 0 {
+                    draw_text_scaled(&mut backbuffer, width, height, list_x + 25, stat_box_y + 90, "Check Terminal / UART Output (COM1) for complete test traces.", 0xFF94A3B8, 2);
+                } else {
+                    draw_text_scaled(&mut backbuffer, width, height, list_x + 25, stat_box_y + 90, "Press [A / Enter] to execute test suite on dedicated Core #2.", 0xFF94A3B8, 2);
+                }
+
+                draw_bottom_bar(&mut backbuffer, width, height, "[A / Enter] Run Test", "[B / Esc] Back");
+            }
+
             ViewMode::PowerDialog => {
                 draw_top_bar(&mut backbuffer, width, height, GAMEPAD_CONNECTED.load(Ordering::Relaxed), is_running_elf, "POWER OPTIONS", true);
                 draw_power_modal(&mut backbuffer, width, height, power_selected_action);
@@ -536,7 +610,7 @@ pub fn compositor_core_entry() {
             }
 
             ViewMode::DiagnosticsTest => {
-                draw_top_bar(&mut backbuffer, width, height, GAMEPAD_CONNECTED.load(Ordering::Relaxed), is_running_elf, "SYSTEM & CONTROLLER DIAGNOSTICS", false);
+                draw_top_bar(&mut backbuffer, width, height, GAMEPAD_CONNECTED.load(Ordering::Relaxed), is_running_elf, "HARDWARE & CONTROLLER DIAGNOSTICS", false);
 
                 let box_x = 180;
                 let box_y = 160;
@@ -603,7 +677,7 @@ pub fn compositor_core_entry() {
                 }
 
                 draw_text_scaled(&mut backbuffer, width, height, box_x + 30, box_y + 360, "Tip: Use Left Analog or D-Pad. Values reach 0..255 fully.", 0xFF94A3B8, 2);
-                draw_bottom_bar(&mut backbuffer, width, height, "", "[B / Esc] Return to Dashboard");
+                draw_bottom_bar(&mut backbuffer, width, height, "", "[B / Esc] Return to Tests Menu");
             }
 
             ViewMode::SettingsMenu => {
@@ -856,7 +930,7 @@ fn format_diag_1(buf: &mut [u8; 64], lsr: usize, last: usize) -> usize {
     let mut i = 0;
     for b in b"UART Status (LSR): 0x".iter() { buf[i] = *b; i += 1; }
     i += put_hex(buf, i, lsr);
-    for b in b"  |  Last Byte: 0x".iter() { buf[i] = *b; i += 1; }
+    for b in b"   |   Last Byte: 0x".iter() { buf[i] = *b; i += 1; }
     i += put_hex(buf, i, last);
     i
 }
@@ -865,20 +939,20 @@ fn format_diag_2(buf: &mut [u8; 64], raw: usize, pkts: usize) -> usize {
     let mut i = 0;
     for b in b"Raw Bytes Received: ".iter() { buf[i] = *b; i += 1; }
     i += put_num_dynamic(buf, i, raw);
-    for b in b"  |  Valid Packets: ".iter() { buf[i] = *b; i += 1; }
+    for b in b"   |   Valid Packets: ".iter() { buf[i] = *b; i += 1; }
     i += put_num_dynamic(buf, i, pkts);
     i
 }
 
 fn format_diag_buttons(buf: &mut [u8; 64], u: bool, d: bool, l: bool, r: bool) -> usize {
     let mut i = 0;
-    for b in b"D-Pad:  UP:".iter() { buf[i] = *b; i += 1; }
+    for b in b"D-Pad:   UP:".iter() { buf[i] = *b; i += 1; }
     buf[i] = if u { b'1' } else { b'0' }; i += 1;
-    for b in b"  DOWN:".iter() { buf[i] = *b; i += 1; }
+    for b in b"   DOWN:".iter() { buf[i] = *b; i += 1; }
     buf[i] = if d { b'1' } else { b'0' }; i += 1;
-    for b in b"  LEFT:".iter() { buf[i] = *b; i += 1; }
+    for b in b"   LEFT:".iter() { buf[i] = *b; i += 1; }
     buf[i] = if l { b'1' } else { b'0' }; i += 1;
-    for b in b"  RIGHT:".iter() { buf[i] = *b; i += 1; }
+    for b in b"   RIGHT:".iter() { buf[i] = *b; i += 1; }
     buf[i] = if r { b'1' } else { b'0' }; i += 1;
     i
 }
@@ -887,20 +961,20 @@ fn format_diag_actions(buf: &mut [u8; 64], a: bool, b: bool, x: bool, y: bool) -
     let mut i = 0;
     for b in b"Action: A:".iter() { buf[i] = *b; i += 1; }
     buf[i] = if a { b'1' } else { b'0' }; i += 1;
-    for b in b"  B:".iter() { buf[i] = *b; i += 1; }
+    for b in b"   B:".iter() { buf[i] = *b; i += 1; }
     buf[i] = if b { b'1' } else { b'0' }; i += 1;
-    for b in b"  X:".iter() { buf[i] = *b; i += 1; }
+    for b in b"   X:".iter() { buf[i] = *b; i += 1; }
     buf[i] = if x { b'1' } else { b'0' }; i += 1;
-    for b in b"  Y:".iter() { buf[i] = *b; i += 1; }
+    for b in b"   Y:".iter() { buf[i] = *b; i += 1; }
     buf[i] = if y { b'1' } else { b'0' }; i += 1;
     i
 }
 
 fn format_diag_sticks(buf: &mut [u8; 64], sx: usize, sy: usize) -> usize {
     let mut i = 0;
-    for b in b"Left Analog Stick:  X: ".iter() { buf[i] = *b; i += 1; }
+    for b in b"Left Analog Stick:   X: ".iter() { buf[i] = *b; i += 1; }
     i += put_num_dynamic(buf, i, sx);
-    for b in b"  |  Y: ".iter() { buf[i] = *b; i += 1; }
+    for b in b"   |   Y: ".iter() { buf[i] = *b; i += 1; }
     i += put_num_dynamic(buf, i, sy);
     i
 }
@@ -1118,7 +1192,7 @@ fn draw_settings_row(buf: &mut [u32], fb_w: usize, fb_h: usize, x: usize, y: usi
     draw_text_scaled(buf, fb_w, fb_h, x + 100, y + 16, name, 0xFFFFFFFF, 2);
 
     if active {
-        draw_text_scaled(buf, fb_w, fb_h, x + w - 180, y + 16, "[ACTIVE]", 0xFF34D399, 2);
+        draw_text_scaled(buf, fb_w, fb_h, x + w - 180, y + 16, "[RUNNING]", 0xFFF59E0B, 2);
     }
 }
 

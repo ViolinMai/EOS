@@ -66,6 +66,7 @@ pub struct TaskScheduler {
 pub static mut SCHEDULER: Option<TaskScheduler> = None;
 
 #[derive(Copy, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum JobState {
     Idle, Submitted, Running, Finished, Failed,
 }
@@ -93,7 +94,6 @@ static mut CORE_JOBS: [PerCoreJob; 8] = [
     PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 },
 ];
 
-// قناة تواصل لطلب تشغيل برامج الـ ELF على نواة مخصصة
 pub static mut ELF_TARGET_FILE: [u8; 128] = [0; 128];
 pub static mut ELF_TARGET_ARG: [u8; 128] = [0; 128];
 pub static ELF_SPAWN_REQUEST: AtomicBool = AtomicBool::new(false);
@@ -203,7 +203,6 @@ fn elf_runner_worker() {
 pub fn core_poll_and_execute(core_id: usize) {
     if core_id == 0 || core_id >= 8 { return; }
 
-    // Core 2 هو المسؤول الحصري عن تشغيل برامج الـ Userspace دون حجز النواة الرسومية
     if core_id == 2 {
         if ELF_SPAWN_REQUEST.swap(false, Ordering::SeqCst) {
             ELF_ACTIVE_RUNNING.store(true, Ordering::SeqCst);
@@ -243,6 +242,7 @@ pub fn init() {
     log_info!("SCHED", "Task Scheduler ready with FD Tables initialized.");
 }
 
+#[allow(dead_code)]
 pub fn spawn(id: u64, name: &'static str, entry: extern "C" fn()) {
     unsafe {
         if let Some(sched) = &mut *addr_of_mut!(SCHEDULER) {

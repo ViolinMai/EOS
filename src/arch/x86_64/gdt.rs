@@ -2,9 +2,10 @@ use core::arch::asm;
 use core::ptr::addr_of_mut;
 
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
+#[allow(dead_code)]
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
-pub const USER_DATA_SELECTOR: u16 = 0x18 | 3;
-pub const USER_CODE_SELECTOR: u16 = 0x20 | 3;
+pub const USER_CODE_SELECTOR: u16 = 0x18 | 3;
+pub const USER_DATA_SELECTOR: u16 = 0x20 | 3;
 pub const TSS_SELECTOR: u16 = 0x28;
 
 pub const MAX_CORES: usize = 8;
@@ -89,15 +90,16 @@ pub fn init_core(core_id: usize) {
         tss.ist1 = stack_top;
         tss.rsp0 = syscall_stack_top;
 
-        // مزامنة مكدس الـ Syscall للنواة المحددة
         crate::arch::x86_64::syscall::KERNEL_SYSCALL_STACKS[core_id] = syscall_stack_top;
 
         let gdt = &mut (*addr_of_mut!(GDTS))[core_id];
         gdt.entries[0] = 0;
-        gdt.entries[1] = 0x00AF9A000000FFFF; // Kernel Code
-        gdt.entries[2] = 0x00CF92000000FFFF; // Kernel Data
-        gdt.entries[3] = 0x00CFF2000000FFFF; // User Data
-        gdt.entries[4] = 0x00AFFA000000FFFF; // User Code
+        gdt.entries[1] = 0x00AF9A000000FFFF; // Kernel Code (0x08)
+        gdt.entries[2] = 0x00CF92000000FFFF; // Kernel Data (0x10)
+        
+        // 💡 للـ SYSRET: يجب أن يكون User Code أولاً ثم User Data مباشرة
+        gdt.entries[3] = 0x00AFFA000000FFFF; // User Code (0x18 | 3)
+        gdt.entries[4] = 0x00CFF2000000FFFF; // User Data (0x20 | 3)
 
         let tss_base = tss as *const _ as u64;
         let tss_limit = (core::mem::size_of::<TaskStateSegment>() - 1) as u64;

@@ -34,17 +34,22 @@ def lfn_checksum(short_name_bytes):
 
 def build_userspace_app():
     userspace_dir = os.path.abspath("userspace")
+    
     cmd = [
         "cargo", "build",
         "--release",
         "--manifest-path", os.path.join(userspace_dir, "Cargo.toml"),
-        "--target", "x86_64-unknown-none"
+        "--target", "x86_64-unknown-linux-musl"
     ]
-    res = subprocess.run(cmd, shell=True)
+    
+    env = os.environ.copy()
+    env.pop("RUSTFLAGS", None)
+
+    res = subprocess.run(cmd, shell=True, env=env)
     if res.returncode != 0:
         return None
 
-    bin_path = os.path.join(userspace_dir, "target", "x86_64-unknown-none", "release", "user_app")
+    bin_path = os.path.join(userspace_dir, "target", "x86_64-unknown-linux-musl", "release", "user_app")
     if os.path.exists(bin_path):
         with open(bin_path, "rb") as f:
             return f.read()
@@ -53,7 +58,7 @@ def build_userspace_app():
 def create_demo_tar(user_elf_data):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
-        f1_data = b"Welcome to EOS Kernel!\r\n"
+        f1_data = b"Welcome to EOS Kernel!\r\nThis file is read from TarFS using standard Rust std::fs::File.\r\n"
         ti1 = tarfile.TarInfo(name="readme.txt")
         ti1.size = len(f1_data)
         tar.addfile(ti1, io.BytesIO(f1_data))
@@ -220,7 +225,6 @@ def make_uefi_fat32_disk(img_path, files):
         f.write(disk)
 
 def make_ext2_disk(img_path):
-    # لا نعيد إنشاء قرص ext2 إذا كان موجوداً للحفاظ على الإعدادات والملفات المخزنة
     if os.path.exists(img_path) and os.path.getsize(img_path) > 0:
         return
 
@@ -283,7 +287,11 @@ def make_ext2_disk(img_path):
 
 def prepare_and_run():
     user_elf = build_userspace_app()
-    res = subprocess.run(["cargo", "build", "--release"], shell=True)
+    if user_elf is None:
+        print("[!] Userspace app compilation failed or missing.")
+        return
+
+    res = subprocess.run(["cargo", "build", "--release", "-Z", "build-std=core,alloc"], shell=True)
     if res.returncode != 0: return
 
     target_dir = "target"
@@ -310,7 +318,6 @@ def prepare_and_run():
     ext2_img_path = os.path.join(target_dir, "rootfs.ext2")
     make_ext2_disk(ext2_img_path)
 
-    # تجهيز مجلد المشاركة من ويندوز وإنشاء ملف eos.cfg إذا لم يكن موجوداً
     share_dir = r"C:\EOS_SHARE"
     try:
         os.makedirs(share_dir, exist_ok=True)

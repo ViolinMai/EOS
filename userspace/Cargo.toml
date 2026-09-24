@@ -4,8 +4,12 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-linked_list_allocator = "0.10"
-miniz_oxide = { version = "0.7.4", default-features = false, features = ["with-alloc"] }
+serde = { version = "1.0", default-features = false, features = ["alloc", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["alloc"] }
+sha2 = { version = "0.10", default-features = false }
+rand = { version = "0.8", default-features = false, features = ["small_rng"] }
+# 💡 أضفنا ميزة unicode-perl لكي يفهم النمط \w بدون أن ينهار (Panic)
+regex-automata = { version = "0.4", default-features = false, features = ["alloc", "syntax", "meta", "unicode-perl"] }
 zune-jpeg = { version = "0.4.13", default-features = false }
 
 [profile.release]

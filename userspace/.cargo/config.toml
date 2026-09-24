@@ -1,7 +1,1 @@
-[build]
-target = "x86_64-unknown-none"
-rustflags = ["-C", "link-arg=-Tlinker.ld", "-Zprobe-stack=false"]
-
-[unstable]
-build-std = ["core", "alloc", "compiler_builtins"]
-build-std-features = ["compiler-builtins-mem"]
+# ملف فارغ لتجنب أي تداخل

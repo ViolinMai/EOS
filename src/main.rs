@@ -72,6 +72,22 @@ unsafe fn extract_limine_file_info(file_ref: &limine::file::File) -> (*const u8,
     }
 }
 
+pub fn enable_sse() {
+    unsafe {
+        let mut cr0: u64;
+        let mut cr4: u64;
+        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
+        cr0 &= !(1 << 2); // مسح EM (Emulation)
+        cr0 |= 1 << 1;  // ضبط MP (Monitor Co-processor)
+        asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
+
+        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
+        cr4 |= 1 << 9;  // تفعيل OSFXSR (FXSAVE/FXRSTOR & SSE)
+        cr4 |= 1 << 10; // تفعيل OSXMMEXCPT (Unmasked SIMD FP Exceptions)
+        asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
+    }
+}
+
 extern "C" fn ap_entry(info: &MpInfo) -> ! {
     let cpu_id = info.lapic_id as usize;
 
@@ -81,6 +97,7 @@ extern "C" fn ap_entry(info: &MpInfo) -> ! {
         arch::x86_64::idt::InterruptDescriptorTable::load_raw(core::ptr::addr_of!(arch::x86_64::interrupts::IDT));
     };
 
+    enable_sse();
     arch::x86_64::syscall::init_core_syscall(cpu_id);
     CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
     
@@ -98,7 +115,8 @@ pub extern "C" fn _start() -> ! {
     serial::SERIAL1.init();
     serial::SERIAL2.init(); 
 
-    // 💡 1. تهيئة إدارة الذاكرة فوراً قبل أي عملية تخصيص (Allocation)
+    enable_sse();
+
     let hhdm_offset = HHDM_REQUEST.response().expect("Limine HHDM missing").offset;
     
     if let Some(memmap) = MEMMAP_REQUEST.response() {
@@ -111,7 +129,6 @@ pub extern "C" fn _start() -> ! {
 
     unsafe { mm::paging::VirtualMemoryManager::init(hhdm_offset); }
 
-    // 💡 2. حجز مساحة حرة مستمرة بحجم 256MB للـ Heap فوراً عبر الـ Usable Entries
     if let Some(memmap) = MEMMAP_REQUEST.response() {
         let heap_size = mm::heap::HEAP_SIZE;
         let mut heap_initialized = false;
@@ -129,7 +146,6 @@ pub extern "C" fn _start() -> ! {
         }
 
         if !heap_initialized {
-            // بديل احتياطي إذا كانت القطع مجزأة
             for entry in memmap.entries() {
                 let entry_type: u64 = unsafe { core::ptr::read_unaligned(&entry.type_ as *const _ as *const u64) };
                 if entry_type == 0 && entry.length as usize >= 64 * 1024 * 1024 {
@@ -143,7 +159,6 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // 💡 3. الآن بعد أن أصبح الـ Heap جاهزاً تماماً، نبدأ ببقية الخدمات
     serial_println!("\n==========================================");
     serial_println!("[EOS] SERIAL CONSOLE INITIALIZED");
 
