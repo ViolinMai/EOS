@@ -1,35 +1,16 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
+use crate::input::{push_event, InputEvent, NavAction, MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_CAPS};
 
 const KEYBOARD_PORT: u16 = 0x60;
-#[allow(dead_code)]
-const SERIAL_PORT: u16 = 0x3F8;
 
 static SHIFT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CTRL_ACTIVE: AtomicBool = AtomicBool::new(false);
+static ALT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static CAPS_ACTIVE: AtomicBool = AtomicBool::new(false);
 static EXTENDED_PREFIX: AtomicBool = AtomicBool::new(false);
 
-const KBD_BUF_SIZE: usize = 128;
-static mut KEY_RING_BUFFER: [u8; KBD_BUF_SIZE] = [0; KBD_BUF_SIZE];
-static mut KBD_HEAD: usize = 0;
-static mut KBD_TAIL: usize = 0;
-
-pub fn clear_keyboard_buffer() {
-    unsafe {
-        KBD_HEAD = 0;
-        KBD_TAIL = 0;
-    }
-}
-
-pub fn push_char_to_buffer(c: u8) {
-    unsafe {
-        let next_head = (KBD_HEAD + 1) % KBD_BUF_SIZE;
-        if next_head != KBD_TAIL {
-            KEY_RING_BUFFER[KBD_HEAD] = c;
-            KBD_HEAD = next_head;
-        }
-    }
-}
+pub fn clear_keyboard_buffer() { }
 
 #[inline]
 unsafe fn inb(port: u16) -> u8 {
@@ -40,172 +21,112 @@ unsafe fn inb(port: u16) -> u8 {
     val
 }
 
-#[allow(dead_code)]
-fn read_serial_char_if_available() -> Option<u8> {
+pub unsafe fn read_scancode() -> Option<u8> {
     unsafe {
-        let status = inb(SERIAL_PORT + 5);
-        if (status & 1) != 0 {
-            let c = inb(SERIAL_PORT);
-            if c == b'\r' {
-                Some(b'\n')
-            } else {
-                Some(c)
-            }
+        let status = inb(0x64);
+        // التأكد من أن البايت جاهز وينتمي للكيبورد (Bit 5 == 0) لمنع ابتلاع بايتات الماوس
+        if (status & 0x01) != 0 && (status & 0x20) == 0 {
+            Some(inb(KEYBOARD_PORT))
         } else {
             None
         }
     }
 }
 
-#[allow(dead_code)]
-pub fn pop_char_from_buffer() -> Option<u8> {
-    if let Some(c) = read_serial_char_if_available() {
-        return Some(c);
-    }
-
-    unsafe {
-        if KBD_HEAD == KBD_TAIL {
-            None
-        } else {
-            let c = KEY_RING_BUFFER[KBD_TAIL];
-            KBD_TAIL = (KBD_TAIL + 1) % KBD_BUF_SIZE;
-            Some(c)
-        }
-    }
+fn get_current_mods() -> u8 {
+    let mut m = 0;
+    if SHIFT_ACTIVE.load(Ordering::Relaxed) { m |= MOD_SHIFT; }
+    if CTRL_ACTIVE.load(Ordering::Relaxed) { m |= MOD_CTRL; }
+    if ALT_ACTIVE.load(Ordering::Relaxed) { m |= MOD_ALT; }
+    if CAPS_ACTIVE.load(Ordering::Relaxed) { m |= MOD_CAPS; }
+    m
 }
 
-#[derive(Debug, PartialEq, Eq)]
-pub enum KeyEvent {
-    Char(char),
-    UpArrow,
-    DownArrow,
-    LeftArrow,
-    RightArrow,
-    CtrlS,
-    CtrlQ,
-    CtrlC,
-    CtrlV,
-    CtrlX,
-    Escape,
-    None,
-}
-
-pub fn handle_scancode(scancode: u8) -> KeyEvent {
+pub fn handle_scancode(scancode: u8) {
     if scancode == 0xE0 {
         EXTENDED_PREFIX.store(true, Ordering::Relaxed);
-        return KeyEvent::None;
+        return;
     }
 
     let is_extended = EXTENDED_PREFIX.swap(false, Ordering::Relaxed);
+    let is_release = (scancode & 0x80) != 0;
+    let code = scancode & 0x7F;
 
-    if is_extended {
-        return match scancode {
-            0x48 => KeyEvent::UpArrow,
-            0x50 => KeyEvent::DownArrow,
-            0x4B => KeyEvent::LeftArrow,
-            0x4D => KeyEvent::RightArrow,
-            _ => KeyEvent::None,
-        };
+    if is_release {
+        match code {
+            0x2A | 0x36 => { SHIFT_ACTIVE.store(false, Ordering::Relaxed); }
+            0x1D => { CTRL_ACTIVE.store(false, Ordering::Relaxed); }
+            0x38 => { ALT_ACTIVE.store(false, Ordering::Relaxed); }
+            _ => {}
+        }
+        push_event(InputEvent::KeyUp { keycode: code });
+        return;
     }
 
-    match scancode {
-        0x1D => {
-            CTRL_ACTIVE.store(true, Ordering::Relaxed);
-            return KeyEvent::None;
+    if is_extended {
+        match code {
+            0x48 => { push_event(InputEvent::Nav(NavAction::Up)); push_event(InputEvent::KeyDown { keycode: 0x48, mods: get_current_mods() }); }
+            0x50 => { push_event(InputEvent::Nav(NavAction::Down)); push_event(InputEvent::KeyDown { keycode: 0x50, mods: get_current_mods() }); }
+            0x4B => { push_event(InputEvent::Nav(NavAction::Left)); push_event(InputEvent::KeyDown { keycode: 0x4B, mods: get_current_mods() }); }
+            0x4D => { push_event(InputEvent::Nav(NavAction::Right)); push_event(InputEvent::KeyDown { keycode: 0x4D, mods: get_current_mods() }); }
+            0x1D => { CTRL_ACTIVE.store(true, Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: 0x1D, mods: get_current_mods() }); }
+            0x38 => { ALT_ACTIVE.store(true, Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: 0x38, mods: get_current_mods() }); }
+            _ => { push_event(InputEvent::KeyDown { keycode: code | 0x80, mods: get_current_mods() }); }
         }
-        0x9D => {
-            CTRL_ACTIVE.store(false, Ordering::Relaxed);
-            return KeyEvent::None;
+        return;
+    }
+
+    match code {
+        0x2A | 0x36 => { SHIFT_ACTIVE.store(true, Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; }
+        0x1D => { CTRL_ACTIVE.store(true, Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; }
+        0x38 => { ALT_ACTIVE.store(true, Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; }
+        0x3A => { CAPS_ACTIVE.store(!CAPS_ACTIVE.load(Ordering::Relaxed), Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; }
+        0x01 => { push_event(InputEvent::Nav(NavAction::Back)); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; } 
+        0x1C => { 
+            push_event(InputEvent::Nav(NavAction::Select)); 
+            push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() });
+            push_event(InputEvent::Char('\n')); 
+            return; 
         }
-        0x2A | 0x36 => {
-            SHIFT_ACTIVE.store(true, Ordering::Relaxed);
-            return KeyEvent::None;
-        }
-        0xAA | 0xB6 => {
-            SHIFT_ACTIVE.store(false, Ordering::Relaxed);
-            return KeyEvent::None;
-        }
-        0x01 => return KeyEvent::Escape,
+        0x0F => { push_event(InputEvent::Nav(NavAction::Right)); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; }
         _ => {}
     }
 
-    if scancode >= 0x80 {
-        return KeyEvent::None;
-    }
+    push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() });
 
-    let ctrl = CTRL_ACTIVE.load(Ordering::Relaxed);
     let shift = SHIFT_ACTIVE.load(Ordering::Relaxed);
-
-    if ctrl {
-        return match scancode {
-            0x1F => KeyEvent::CtrlS,
-            0x10 => KeyEvent::CtrlQ,
-            0x2E => KeyEvent::CtrlC,
-            0x2F => KeyEvent::CtrlV,
-            0x2D => KeyEvent::CtrlX,
-            _ => KeyEvent::None,
-        };
-    }
-
-    let c = match scancode {
-        0x02 => if shift { '!' } else { '1' },
-        0x03 => if shift { '@' } else { '2' },
-        0x04 => if shift { '#' } else { '3' },
-        0x05 => if shift { '$' } else { '4' },
-        0x06 => if shift { '%' } else { '5' },
-        0x07 => if shift { '^' } else { '6' },
-        0x08 => if shift { '&' } else { '7' },
-        0x09 => if shift { '*' } else { '8' },
-        0x0A => if shift { '(' } else { '9' },
-        0x0B => if shift { ')' } else { '0' },
-        0x0C => if shift { '_' } else { '-' },
-        0x0D => if shift { '+' } else { '=' },
-        0x0E => '\x08',
-        0x0F => '\t',
-        0x10 => if shift { 'Q' } else { 'q' },
-        0x11 => if shift { 'W' } else { 'w' },
-        0x12 => if shift { 'E' } else { 'e' },
-        0x13 => if shift { 'R' } else { 'r' },
-        0x14 => if shift { 'T' } else { 't' },
-        0x15 => if shift { 'Y' } else { 'y' },
-        0x16 => if shift { 'U' } else { 'u' },
-        0x17 => if shift { 'I' } else { 'i' },
-        0x18 => if shift { 'O' } else { 'o' },
-        0x19 => if shift { 'P' } else { 'p' },
-        0x1A => if shift { '{' } else { '[' },
-        0x1B => if shift { '}' } else { ']' },
-        0x1C => '\n',
-        0x1E => if shift { 'A' } else { 'a' },
-        0x1F => if shift { 'S' } else { 's' },
-        0x20 => if shift { 'D' } else { 'd' },
-        0x21 => if shift { 'F' } else { 'f' },
-        0x22 => if shift { 'G' } else { 'g' },
-        0x23 => if shift { 'H' } else { 'h' },
-        0x24 => if shift { 'J' } else { 'j' },
-        0x25 => if shift { 'K' } else { 'k' },
-        0x26 => if shift { 'L' } else { 'l' },
-        0x27 => if shift { ':' } else { ';' },
-        0x28 => if shift { '"' } else { '\'' },
-        0x29 => if shift { '~' } else { '`' },
-        0x2B => if shift { '|' } else { '\\' },
-        0x2C => if shift { 'Z' } else { 'z' },
-        0x2D => if shift { 'X' } else { 'x' },
-        0x2E => if shift { 'C' } else { 'c' },
-        0x2F => if shift { 'V' } else { 'v' },
-        0x30 => if shift { 'B' } else { 'b' },
-        0x31 => if shift { 'N' } else { 'n' },
-        0x32 => if shift { 'M' } else { 'm' },
-        0x33 => if shift { '<' } else { ',' },
-        0x34 => if shift { '>' } else { '.' },
+    let caps = CAPS_ACTIVE.load(Ordering::Relaxed);
+    let is_upper = shift ^ caps;
+    
+    let c = match code {
+        0x02 => if shift { '!' } else { '1' }, 0x03 => if shift { '@' } else { '2' },
+        0x04 => if shift { '#' } else { '3' }, 0x05 => if shift { '$' } else { '4' },
+        0x06 => if shift { '%' } else { '5' }, 0x07 => if shift { '^' } else { '6' },
+        0x08 => if shift { '&' } else { '7' }, 0x09 => if shift { '*' } else { '8' },
+        0x0A => if shift { '(' } else { '9' }, 0x0B => if shift { ')' } else { '0' },
+        0x0C => if shift { '_' } else { '-' }, 0x0D => if shift { '+' } else { '=' },
+        0x0E => '\x08', // Backspace
+        0x10 => if is_upper { 'Q' } else { 'q' }, 0x11 => if is_upper { 'W' } else { 'w' },
+        0x12 => if is_upper { 'E' } else { 'e' }, 0x13 => if is_upper { 'R' } else { 'r' },
+        0x14 => if is_upper { 'T' } else { 't' }, 0x15 => if is_upper { 'Y' } else { 'y' },
+        0x16 => if is_upper { 'U' } else { 'u' }, 0x17 => if is_upper { 'I' } else { 'i' },
+        0x18 => if is_upper { 'O' } else { 'o' }, 0x19 => if is_upper { 'P' } else { 'p' },
+        0x1A => if shift { '{' } else { '[' }, 0x1B => if shift { '}' } else { ']' },
+        0x1E => if is_upper { 'A' } else { 'a' }, 0x1F => if is_upper { 'S' } else { 's' },
+        0x20 => if is_upper { 'D' } else { 'd' }, 0x21 => if is_upper { 'F' } else { 'f' },
+        0x22 => if is_upper { 'G' } else { 'g' }, 0x23 => if is_upper { 'H' } else { 'h' },
+        0x24 => if is_upper { 'J' } else { 'j' }, 0x25 => if is_upper { 'K' } else { 'k' },
+        0x26 => if is_upper { 'L' } else { 'l' }, 
+        0x27 => if shift { ':' } else { ';' }, 0x28 => if shift { '"' } else { '\'' },
+        0x29 => if shift { '~' } else { '`' }, 0x2B => if shift { '|' } else { '\\' },
+        0x2C => if is_upper { 'Z' } else { 'z' }, 0x2D => if is_upper { 'X' } else { 'x' },
+        0x2E => if is_upper { 'C' } else { 'c' }, 0x2F => if is_upper { 'V' } else { 'v' },
+        0x30 => if is_upper { 'B' } else { 'b' }, 0x31 => if is_upper { 'N' } else { 'n' },
+        0x32 => if is_upper { 'M' } else { 'm' }, 
+        0x33 => if shift { '<' } else { ',' }, 0x34 => if shift { '>' } else { '.' },
         0x35 => if shift { '?' } else { '/' },
         0x39 => ' ',
-        _ => return KeyEvent::None,
+        _ => return,
     };
-
-    push_char_to_buffer(c as u8);
-    KeyEvent::Char(c)
-}
-
-pub unsafe fn read_scancode() -> u8 {
-    unsafe { inb(KEYBOARD_PORT) }
+    push_event(InputEvent::Char(c));
 }

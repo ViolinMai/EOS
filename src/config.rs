@@ -1,0 +1,61 @@
+use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
+
+pub struct KernelConfig {
+    pub max_cpus: usize,
+    pub default_heap_size_mb: usize,
+    pub trace_buffer_size: usize,
+    pub log_queue_capacity: usize,
+    pub ui_scale: AtomicUsize,
+    pub dark_mode: AtomicBool,
+}
+
+pub static CONFIG: KernelConfig = KernelConfig {
+    max_cpus: 32,
+    default_heap_size_mb: 256,
+    trace_buffer_size: 4096,
+    log_queue_capacity: 1024,
+    ui_scale: AtomicUsize::new(2),
+    dark_mode: AtomicBool::new(false),
+};
+
+impl KernelConfig {
+    pub fn is_dark_mode(&self) -> bool { self.dark_mode.load(Ordering::Relaxed) }
+    pub fn toggle_dark_mode(&self) {
+        let new_val = !self.is_dark_mode();
+        self.dark_mode.store(new_val, Ordering::Relaxed);
+        self.save_to_disk();
+    }
+    pub fn get_ui_scale(&self) -> usize { self.ui_scale.load(Ordering::Relaxed) }
+    pub fn set_ui_scale(&self, scale: usize) {
+        self.ui_scale.store(scale.clamp(1, 4), Ordering::Relaxed);
+        self.save_to_disk();
+    }
+
+    pub fn load_from_disk(&self) {
+        if let Ok(bytes) = crate::fs::vfs_read_bytes("settings.ini") {
+            if let Ok(content) = core::str::from_utf8(&bytes) {
+                for line in content.lines() {
+                    let mut parts = line.split('=');
+                    if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
+                        let key = k.trim();
+                        let val = v.trim();
+                        if key == "dark_mode" {
+                            self.dark_mode.store(val == "true" || val == "1", Ordering::Relaxed);
+                        } else if key == "ui_scale" {
+                            if let Ok(scale) = val.parse::<usize>() {
+                                self.ui_scale.store(scale.clamp(1, 4), Ordering::Relaxed);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn save_to_disk(&self) {
+        let dark_str = if self.is_dark_mode() { "true" } else { "false" };
+        let scale = self.get_ui_scale();
+        let config_str = alloc::format!("dark_mode={}\nui_scale={}\n", dark_str, scale);
+        let _ = crate::fs::vfs_save_text_file("settings.ini", config_str.as_bytes());
+    }
+}

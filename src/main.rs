@@ -4,6 +4,11 @@
 
 extern crate alloc;
 
+pub mod config;
+pub mod input;
+pub mod profiler;
+pub mod net;
+pub mod gui;
 mod arch;
 mod compositor;
 mod drivers;
@@ -15,233 +20,151 @@ mod serial;
 mod task;
 mod writer;
 
-use core::arch::asm;
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest};
-use limine::mp::MpInfo;
-use limine::BaseRevision;
-use writer::{FrameWriter, WRITER};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use limine::request::{FramebufferRequest, HhdmRequest, MemmapRequest, ModulesRequest, MpRequest, StackSizeRequest};
 
 #[used]
-#[unsafe(link_section = ".requests_start_marker")]
-static _START_MARKER: () = ();
-
-#[used]
-#[unsafe(link_section = ".requests")]
-static BASE_REVISION: BaseRevision = BaseRevision::with_revision(2);
-
-#[used]
-#[unsafe(link_section = ".requests")]
-static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
-
-#[used]
-#[unsafe(link_section = ".requests")]
+#[unsafe(link_section = ".limine_requests")]
 static HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
-
 #[used]
-#[unsafe(link_section = ".requests")]
-static MEMMAP_REQUEST: MemmapRequest = MemmapRequest::new();
-
+#[unsafe(link_section = ".limine_requests")]
+static FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 #[used]
-#[unsafe(link_section = ".requests")]
+#[unsafe(link_section = ".limine_requests")]
+static MEMORY_MAP_REQUEST: MemmapRequest = MemmapRequest::new();
+#[used]
+#[unsafe(link_section = ".limine_requests")]
 static MODULES_REQUEST: ModulesRequest = ModulesRequest::new();
-
 #[used]
-#[unsafe(link_section = ".requests")]
+#[unsafe(link_section = ".limine_requests")]
 static MP_REQUEST: MpRequest = MpRequest::new(0);
-
 #[used]
-#[unsafe(link_section = ".requests_end_marker")]
-static _END_MARKER: () = ();
+#[unsafe(link_section = ".limine_requests")]
+static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(128 * 1024);
 
-pub static CORES_ONLINE: AtomicUsize = AtomicUsize::new(1);
-pub static CORE_HEARTBEAT: [AtomicU64; 8] = [
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-    AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0),
-];
-
-extern "C" fn main_shell_entry() {}
-
-unsafe fn extract_limine_file_info(file_ref: &limine::file::File) -> (*const u8, usize) {
-    let raw_ptr = file_ref as *const _ as *const u8;
-    unsafe {
-        let addr_val = *(raw_ptr.add(8) as *const usize);
-        let size_val = *(raw_ptr.add(16) as *const u64) as usize;
-        (addr_val as *const u8, size_val)
-    }
-}
-
-pub fn enable_sse() {
-    unsafe {
-        let mut cr0: u64;
-        let mut cr4: u64;
-        asm!("mov {}, cr0", out(reg) cr0, options(nomem, nostack, preserves_flags));
-        cr0 &= !(1 << 2); // مسح EM (Emulation)
-        cr0 |= 1 << 1;  // ضبط MP (Monitor Co-processor)
-        asm!("mov cr0, {}", in(reg) cr0, options(nomem, nostack, preserves_flags));
-
-        asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack, preserves_flags));
-        cr4 |= 1 << 9;  // تفعيل OSFXSR (FXSAVE/FXRSTOR & SSE)
-        cr4 |= 1 << 10; // تفعيل OSXMMEXCPT (Unmasked SIMD FP Exceptions)
-        asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack, preserves_flags));
-    }
-}
-
-extern "C" fn ap_entry(info: &MpInfo) -> ! {
-    let cpu_id = info.lapic_id as usize;
-
-    arch::x86_64::gdt::init_core(cpu_id);
-
-    unsafe { 
-        arch::x86_64::idt::InterruptDescriptorTable::load_raw(core::ptr::addr_of!(arch::x86_64::interrupts::IDT));
-    };
-
-    enable_sse();
-    arch::x86_64::syscall::init_core_syscall(cpu_id);
-    CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
-    
-    loop {
-        if cpu_id < 8 {
-            CORE_HEARTBEAT[cpu_id].fetch_add(1, Ordering::Relaxed);
-            task::core_poll_and_execute(cpu_id);
-        }
-        for _ in 0..200 { core::hint::spin_loop(); }
-    }
-}
+pub static CORES_ONLINE: AtomicU64 = AtomicU64::new(1);
+pub static CORE_HEARTBEAT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
+static AP_BOOT_LATCH: AtomicBool = AtomicBool::new(false);
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     serial::SERIAL1.init();
-    serial::SERIAL2.init(); 
+    serial::SERIAL2.init();
+    crate::log_info!("KERNEL", "SERIAL CONSOLE INITIALIZED");
 
-    enable_sse();
-
-    let hhdm_offset = HHDM_REQUEST.response().expect("Limine HHDM missing").offset;
+    let hhdm_resp = HHDM_REQUEST.response().expect("HHDM failed");
+    let hhdm_offset = hhdm_resp.offset;
+    let mmap_resp = MEMORY_MAP_REQUEST.response().expect("MemMap failed");
     
-    if let Some(memmap) = MEMMAP_REQUEST.response() {
-        unsafe {
-            *core::ptr::addr_of_mut!(mm::frame::FRAME_ALLOCATOR) = Some(
-                mm::frame::BitmapFrameAllocator::init(memmap.entries(), hhdm_offset)
-            );
-        }
+    unsafe {
+        mm::frame::BitmapFrameAllocator::init(mmap_resp.entries(), hhdm_offset);
+        mm::paging::VirtualMemoryManager::init(hhdm_offset);
     }
 
-    unsafe { mm::paging::VirtualMemoryManager::init(hhdm_offset); }
-
-    if let Some(memmap) = MEMMAP_REQUEST.response() {
-        let heap_size = mm::heap::HEAP_SIZE;
-        let mut heap_initialized = false;
-
-        for entry in memmap.entries() {
-            let entry_type: u64 = unsafe { core::ptr::read_unaligned(&entry.type_ as *const _ as *const u64) };
-            if entry_type == 0 && entry.length as usize >= heap_size {
-                let heap_virt = (entry.base + hhdm_offset) as *mut u8;
-                unsafe {
-                    mm::heap::HEAP_ALLOCATOR.init(heap_virt, heap_size);
-                }
-                heap_initialized = true;
-                break;
-            }
-        }
-
-        if !heap_initialized {
-            for entry in memmap.entries() {
-                let entry_type: u64 = unsafe { core::ptr::read_unaligned(&entry.type_ as *const _ as *const u64) };
-                if entry_type == 0 && entry.length as usize >= 64 * 1024 * 1024 {
-                    let heap_virt = (entry.base + hhdm_offset) as *mut u8;
-                    unsafe {
-                        mm::heap::HEAP_ALLOCATOR.init(heap_virt, entry.length as usize);
-                    }
-                    break;
-                }
-            }
-        }
-    }
-
-    serial_println!("\n==========================================");
-    serial_println!("[EOS] SERIAL CONSOLE INITIALIZED");
-
-    if let Some(fb_response) = FRAMEBUFFER_REQUEST.response() {
-        if let Some(&framebuffer) = fb_response.framebuffers().first() {
-            let buffer_ptr = framebuffer.address() as *mut u8;
-            let fb_w = framebuffer.width as usize;
-            let fb_h = framebuffer.height as usize;
-            let pitch = framebuffer.pitch as usize;
-
+    if let Some(fb_resp) = FRAMEBUFFER_REQUEST.response() {
+        if let Some(fb) = fb_resp.framebuffers().first() {
             unsafe {
-                let mut w = FrameWriter::new(buffer_ptr, fb_w, fb_h, pitch);
-                w.clear(10, 15, 26);
-                *core::ptr::addr_of_mut!(WRITER) = Some(w);
+                let w = writer::FramebufferWriter::new(
+                    fb.address() as *mut u8,
+                    fb.width as usize,
+                    fb.height as usize,
+                    fb.pitch as usize,
+                );
+                *core::ptr::addr_of_mut!(writer::WRITER) = Some(w);
             }
+            crate::log_info!("FRAMEBUFFER", "Initialized: {}x{} (Pitch: {})", fb.width, fb.height, fb.pitch);
         }
+    }
+
+    unsafe {
+        mm::heap::HEAP_ALLOCATOR.init(
+            (0x10000000 + hhdm_offset) as *mut u8, 
+            config::CONFIG.default_heap_size_mb * 1024 * 1024
+        );
     }
 
     arch::x86_64::gdt::init_core(0);
     arch::x86_64::interrupts::init();
-    unsafe {
-        arch::x86_64::pic::remap();
-        arch::x86_64::pit::init();
-    }
     drivers::mouse::init();
     arch::x86_64::syscall::init();
+
     drivers::pci::init();
+    drivers::e1000::init();
+    net::init();
+
     drivers::ata::init();
     fs::ext2::init(2);
 
+    if let Some(mod_resp) = MODULES_REQUEST.response() {
+        for module in mod_resp.modules() {
+            unsafe { fs::tar::init(module.data().as_ptr(), module.data().len()); }
+            break;
+        }
+    }
+
+    // Load user settings if saved
+    config::CONFIG.load_from_disk();
+
+    task::init();
+
     if let Some(mp_resp) = MP_REQUEST.response() {
-        let bsp_id = mp_resp.bsp_lapic_id;
         let cpus = mp_resp.cpus();
+        crate::log_info!("SMP", "Hardware CPUs detected: {}", cpus.len());
         for cpu in cpus {
-            if cpu.lapic_id != bsp_id {
+            if cpu.lapic_id != 0 {
                 unsafe {
-                    let raw_ptr = (*cpu) as *const MpInfo as *const u8;
-                    let goto_addr_ptr = raw_ptr.add(16) as *mut usize;
-                    core::ptr::write_volatile(goto_addr_ptr, ap_entry as *const () as usize);
+                    let cpu_ptr = *cpu as *const limine::mp::MpInfo as *mut u8;
+                    let goto_addr_ptr = cpu_ptr.add(16) as *mut u64;
+                    core::ptr::write_volatile(goto_addr_ptr, ap_startup_entry as *const () as u64);
                 }
             }
         }
+        AP_BOOT_LATCH.store(true, Ordering::SeqCst);
     }
 
-    if let Some(mod_resp) = MODULES_REQUEST.response() {
-        if let Some(&first_mod) = mod_resp.modules().first() {
-            let (mod_ptr, mod_size) = unsafe { extract_limine_file_info(first_mod) };
-            unsafe { fs::tar::init(mod_ptr, mod_size); }
-        }
-    }
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-    task::init();
-    unsafe {
-        if let Some(sched) = &mut *core::ptr::addr_of_mut!(task::SCHEDULER) {
-            sched.tasks.push(task::Task::new(0, "Kernel Master Task", main_shell_entry));
-        }
-    }
-
-    unsafe { asm!("sti", options(nomem, nostack)); }
-
-    log_info!("SMP", "Architecture Ready: Core 0 [Kernel], Core 1 [Dedicated GUI], Cores 2-7 [Pool]");
-    unsafe {
-        if let Some(writer) = &mut *core::ptr::addr_of_mut!(WRITER) {
-            writer.save_screen();
-        }
-    }
-    crate::arch::x86_64::interrupts::GUI_ACTIVE.store(true, Ordering::SeqCst);
-    if let Err(e) = task::dispatch_job(1, crate::compositor::compositor_core_entry) {
-        log_error!("DESKTOP", "Failed to pin GUI to Core 1: {}", e);
-    }
+    crate::log_info!("DESKTOP", "Starting Compositor Core directly on BSP...");
+    arch::x86_64::interrupts::GUI_ACTIVE.store(true, Ordering::SeqCst);
+    compositor::compositor_core_entry();
 
     loop {
-        CORE_HEARTBEAT[0].fetch_add(1, Ordering::Relaxed);
+        net::poll();
         if let Some(cmd) = arch::x86_64::interrupts::take_pending_command() {
             arch::x86_64::interrupts::execute_command(&cmd);
             arch::x86_64::interrupts::print_prompt();
         }
-        unsafe { asm!("hlt", options(nomem, nostack)); }
+        core::hint::spin_loop();
+    }
+}
+
+extern "C" fn ap_startup_entry(info: &limine::mp::MpInfo) -> ! {
+    while !AP_BOOT_LATCH.load(Ordering::Acquire) {
+        core::hint::spin_loop();
+    }
+    let core_id = info.lapic_id as usize;
+    if core_id < 8 {
+        arch::x86_64::gdt::init_core(core_id);
+        unsafe {
+            crate::arch::x86_64::idt::InterruptDescriptorTable::load_raw(
+                core::ptr::addr_of_mut!(crate::arch::x86_64::interrupts::IDT)
+            );
+            core::arch::asm!("sti", options(nomem, nostack));
+        }
+        arch::x86_64::syscall::init_core_syscall(core_id);
+    }
+    CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
+    loop {
+        if core_id < 8 { CORE_HEARTBEAT[core_id].fetch_add(1, Ordering::Relaxed); }
+        task::core_poll_and_execute(core_id);
+        core::hint::spin_loop();
     }
 }
 
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
-    serial_println!("\x1b[31m[PANIC]: {}\x1b[0m", info);
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+    crate::serial_println!("\n\x1b[31;1m[KERNEL PANIC]\x1b[0m {}", info);
     loop { core::hint::spin_loop(); }
 }

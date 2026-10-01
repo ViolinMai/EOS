@@ -1,11 +1,15 @@
 use core::arch::asm;
-use crate::arch::x86_64::interrupts::{GUI_ACTIVE, SHARED_MOUSE_BUTTONS, SHARED_MOUSE_X, SHARED_MOUSE_Y};
-use crate::writer::WRITER;
-use core::ptr::addr_of_mut;
-use core::sync::atomic::Ordering;
+use crate::input::{push_event, InputEvent};
 
-const MOUSE_PORT: u16 = 0x60;
-const MOUSE_STATUS: u16 = 0x64;
+const MOUSE_DATA_PORT: u16 = 0x60;
+const MOUSE_STATUS_PORT: u16 = 0x64;
+const MOUSE_COMMAND_PORT: u16 = 0x64;
+
+static mut CYCLE: u8 = 0;
+static mut BYTES: [u8; 4] = [0; 4];
+static mut HAS_WHEEL: bool = false;
+static mut LAST_LEFT: bool = false;
+static mut LAST_RIGHT: bool = false;
 
 #[inline]
 unsafe fn inb(port: u16) -> u8 {
@@ -23,169 +27,156 @@ unsafe fn outb(port: u16, val: u8) {
     }
 }
 
-unsafe fn mouse_wait(wait_type: u8) {
-    let mut timeout = 100_000;
+unsafe fn mouse_wait_write() {
+    let mut timeout = 100_000usize;
     while timeout > 0 {
+        if (unsafe { inb(MOUSE_STATUS_PORT) } & 0x02) == 0 { return; }
         timeout -= 1;
-        let status = unsafe { inb(MOUSE_STATUS) };
-        if wait_type == 0 && (status & 1) == 1 {
-            return;
-        }
-        if wait_type == 1 && (status & 2) == 0 {
-            return;
-        }
+        core::hint::spin_loop();
     }
 }
 
-unsafe fn mouse_write(data: u8) {
+unsafe fn mouse_wait_read() -> bool {
+    let mut timeout = 100_000usize;
+    while timeout > 0 {
+        if (unsafe { inb(MOUSE_STATUS_PORT) } & 0x01) != 0 { return true; }
+        timeout -= 1;
+        core::hint::spin_loop();
+    }
+    false
+}
+
+unsafe fn mouse_write_cmd(cmd: u8) {
     unsafe {
-        mouse_wait(1);
-        outb(MOUSE_STATUS, 0xD4);
-        mouse_wait(1);
-        outb(MOUSE_PORT, data);
+        mouse_wait_write();
+        outb(MOUSE_COMMAND_PORT, cmd);
     }
 }
 
-unsafe fn mouse_read() -> u8 {
+unsafe fn mouse_write_device(byte: u8) {
     unsafe {
-        mouse_wait(0);
-        inb(MOUSE_PORT)
+        mouse_wait_write();
+        outb(MOUSE_COMMAND_PORT, 0xD4);
+        mouse_wait_write();
+        outb(MOUSE_DATA_PORT, byte);
     }
 }
 
-pub struct MouseState {
-    pub x: isize,
-    pub y: isize,
-    pub left_button: bool,
-    pub right_button: bool,
-    pub has_wheel: bool,
-    cycle: u8,
-    bytes: [u8; 4],
+unsafe fn mouse_read_data() -> u8 {
+    unsafe {
+        if mouse_wait_read() { inb(MOUSE_DATA_PORT) } else { 0 }
+    }
 }
-
-pub static mut MOUSE: MouseState = MouseState {
-    x: 200,
-    y: 200,
-    left_button: false,
-    right_button: false,
-    has_wheel: false,
-    cycle: 0,
-    bytes: [0; 4],
-};
 
 pub fn init() {
     unsafe {
-        mouse_wait(1);
-        outb(MOUSE_STATUS, 0xA8);
+        mouse_write_cmd(0xA8);
+        mouse_write_cmd(0x20);
+        let mut config = mouse_read_data();
+        config |= 0x02;
+        config |= 0x01;
+        config &= !0x20;
+        mouse_write_cmd(0x60);
+        mouse_wait_write();
+        outb(MOUSE_DATA_PORT, config);
 
-        mouse_wait(1);
-        outb(MOUSE_STATUS, 0x20);
-        mouse_wait(0);
-        let mut status = inb(MOUSE_PORT) | 2;
-        status &= !0x20;
+        mouse_write_device(0xF6);
+        let _ = mouse_read_data();
 
-        mouse_wait(1);
-        outb(MOUSE_STATUS, 0x60);
-        mouse_wait(1);
-        outb(MOUSE_PORT, status);
+        // IntelliMouse sequence
+        mouse_write_device(0xF3); let _ = mouse_read_data();
+        mouse_write_device(200);  let _ = mouse_read_data();
+        mouse_write_device(0xF3); let _ = mouse_read_data();
+        mouse_write_device(100);  let _ = mouse_read_data();
+        mouse_write_device(0xF3); let _ = mouse_read_data();
+        mouse_write_device(80);   let _ = mouse_read_data();
 
-        mouse_write(0xF6);
-        let _ = mouse_read();
+        mouse_write_device(0xF2); let _ = mouse_read_data();
+        let dev_id = mouse_read_data();
+        HAS_WHEEL = dev_id == 3 || dev_id == 4;
 
-        mouse_write(0xF3); let _ = mouse_read();
-        mouse_write(200);  let _ = mouse_read();
-        mouse_write(0xF3); let _ = mouse_read();
-        mouse_write(100);  let _ = mouse_read();
-        mouse_write(0xF3); let _ = mouse_read();
-        mouse_write(80);   let _ = mouse_read();
+        mouse_write_device(0xF4);
+        let _ = mouse_read_data();
 
-        mouse_write(0xF2);
-        let _ = mouse_read();
-        let mouse_id = mouse_read();
-        if mouse_id == 3 || mouse_id == 4 {
-            (*addr_of_mut!(MOUSE)).has_wheel = true;
-        }
-
-        mouse_write(0xF4);
-        let _ = mouse_read();
+        CYCLE = 0;
+        LAST_LEFT = false;
+        LAST_RIGHT = false;
+        crate::log_info!("MOUSE", "PS/2 Mouse Ready.");
     }
 }
 
-pub unsafe fn on_mouse_interrupt(current_input: &str, cursor_idx: usize) {
-    let raw = unsafe { inb(MOUSE_PORT) };
-    let mouse = unsafe { &mut *addr_of_mut!(MOUSE) };
-
-    match mouse.cycle {
-        0 => {
-            if (raw & 0x08) != 0 {
-                mouse.bytes[0] = raw;
-                mouse.cycle = 1;
+pub unsafe fn on_mouse_interrupt() {
+    unsafe {
+        let mut limit = 16;
+        while (inb(MOUSE_STATUS_PORT) & 0x01) != 0 && limit > 0 {
+            limit -= 1;
+            let status = inb(MOUSE_STATUS_PORT);
+            if (status & 0x20) == 0 { break; }
+            let raw = inb(MOUSE_DATA_PORT);
+            match CYCLE {
+                0 => {
+                    if (raw & 0x08) != 0 {
+                        BYTES[0] = raw;
+                        CYCLE = 1;
+                    }
+                },
+                1 => {
+                    BYTES[1] = raw;
+                    CYCLE = 2;
+                },
+                2 => {
+                    BYTES[2] = raw;
+                    if HAS_WHEEL {
+                        CYCLE = 3;
+                    } else {
+                        CYCLE = 0;
+                        process_packet();
+                    }
+                },
+                3 => {
+                    BYTES[3] = raw;
+                    CYCLE = 0;
+                    process_packet();
+                },
+                _ => CYCLE = 0,
             }
         }
-        1 => {
-            mouse.bytes[1] = raw;
-            mouse.cycle = 2;
-        }
-        2 => {
-            mouse.bytes[2] = raw;
-            if mouse.has_wheel {
-                mouse.cycle = 3;
-            } else {
-                mouse.cycle = 0;
-                unsafe {
-                    process_mouse_packet(mouse, current_input, cursor_idx, 0);
-                }
-            }
-        }
-        3 => {
-            mouse.bytes[3] = raw;
-            mouse.cycle = 0;
-            let wheel = (raw & 0x0F) as i8;
-            let dz = if (raw & 0x08) != 0 { wheel | !0x0F } else { wheel };
-            unsafe {
-                process_mouse_packet(mouse, current_input, cursor_idx, dz);
-            }
-        }
-        _ => mouse.cycle = 0,
     }
 }
 
-unsafe fn process_mouse_packet(mouse: &mut MouseState, current_input: &str, cursor_idx: usize, dz: i8) {
-    let flags = mouse.bytes[0];
-    let mut dx = mouse.bytes[1] as isize;
-    let mut dy = mouse.bytes[2] as isize;
+unsafe fn process_packet() {
+    unsafe {
+        let flags = BYTES[0];
+        if (flags & 0xC0) != 0 { return; }
 
-    if (flags & 0x10) != 0 { dx |= !0xFF; }
-    if (flags & 0x20) != 0 { dy |= !0xFF; }
+        let mut dx = BYTES[1] as isize;
+        let mut dy = BYTES[2] as isize;
 
-    mouse.left_button = (flags & 0x01) != 0;
-    mouse.right_button = (flags & 0x02) != 0;
+        if (flags & 0x10) != 0 { dx |= !0xFF; }
+        if (flags & 0x20) != 0 { dy |= !0xFF; }
 
-    let (max_w, max_h) = if let Some(writer) = unsafe { &*addr_of_mut!(WRITER) } {
-        (writer.width as isize, writer.height as isize)
-    } else {
-        (1280, 800)
-    };
+        let left = (flags & 0x01) != 0;
+        let right = (flags & 0x02) != 0;
 
-    mouse.x = (mouse.x + dx).clamp(0, max_w - 12);
-    mouse.y = (mouse.y - dy).clamp(0, max_h - 18);
+        // مضاعفة حساسية الماوس لتغطية شاشة 1080p بسلاسة وبدون تقطيع
+        if dx != 0 || dy != 0 {
+            push_event(InputEvent::MouseMove { x: dx * 2, y: -dy * 2 });
+        }
 
-    // 💡 نقل سريع ومباشر للأزرار والحركة بدون أي تعطيل
-    SHARED_MOUSE_X.store(mouse.x, Ordering::Relaxed);
-    SHARED_MOUSE_Y.store(mouse.y, Ordering::Relaxed);
-    let mut btn_mask: u64 = 0;
-    if mouse.left_button { btn_mask |= 1; }
-    if mouse.right_button { btn_mask |= 2; }
-    SHARED_MOUSE_BUTTONS.store(btn_mask, Ordering::Relaxed);
+        if left != LAST_LEFT {
+            LAST_LEFT = left;
+            push_event(InputEvent::MouseButton { button: 0, pressed: left });
+        }
+        if right != LAST_RIGHT {
+            LAST_RIGHT = right;
+            push_event(InputEvent::MouseButton { button: 1, pressed: right });
+        }
 
-    if !GUI_ACTIVE.load(Ordering::Relaxed) {
-        if let Some(writer) = unsafe { &mut *addr_of_mut!(WRITER) } {
-            if dz > 0 {
-                writer.scroll_view_up(3);
-            } else if dz < 0 {
-                writer.scroll_view_down(3);
+        if HAS_WHEEL {
+            let dz = (BYTES[3] as i8) as isize;
+            if dz != 0 {
+                push_event(InputEvent::Scroll { dy: dz });
             }
-            writer.update_mouse_cursor(mouse.x as usize, mouse.y as usize, mouse.left_button, current_input, cursor_idx);
         }
     }
 }

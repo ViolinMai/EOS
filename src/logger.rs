@@ -1,167 +1,128 @@
 use crate::serial_print;
-use crate::writer::WRITER;
 use core::fmt;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicUsize, AtomicBool, Ordering};
 
-#[allow(dead_code)]
 #[derive(Copy, Clone, PartialEq, Eq)]
-pub enum LogLevel {
-    Debug,
-    Info,
-    Warn,
-    Error,
-    Fatal,
+pub enum LogLevel { Debug, Info, Warn, Error, Fatal }
+
+pub struct LogEvent {
+    pub level: LogLevel,
+    pub timestamp: u64,
+    pub message: [u8; 128],
+    pub len: usize,
 }
+
+const LOG_CAPACITY: usize = 1024;
+static mut LOG_QUEUE: [Option<LogEvent>; LOG_CAPACITY] = [const { None }; LOG_CAPACITY];
+static LOG_HEAD: AtomicUsize = AtomicUsize::new(0);
+static LOG_TAIL: AtomicUsize = AtomicUsize::new(0);
+static WRITE_LOCK: AtomicBool = AtomicBool::new(false);
 
 pub struct KernelLogger;
 
-static PRINT_LOCK: AtomicBool = AtomicBool::new(false);
-
-#[inline(always)]
-fn get_current_core_id() -> u32 {
-    let cpuid = core::arch::x86_64::__cpuid(1);
-    (cpuid.ebx >> 24) & 0xFF
-}
-
 impl KernelLogger {
     pub fn log(level: LogLevel, subsystem: &'static str, args: fmt::Arguments) {
-        // قفل ذري Spinlock لمنع التداخل بين الأنوية عند الطباعة
-        while PRINT_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
-            core::hint::spin_loop();
+        let mut msg_buf = [0u8; 128];
+        let mut formatter = MessageBuffer { buf: &mut msg_buf, cursor: 0 };
+        let _ = core::fmt::write(&mut formatter, format_args!("[{}] {}", subsystem, args));
+        
+        let len = formatter.cursor;
+        let event = LogEvent {
+            level,
+            timestamp: crate::arch::x86_64::pit::get_ticks(),
+            message: msg_buf,
+            len,
+        };
+
+        let head = LOG_HEAD.load(Ordering::Relaxed);
+        let next_head = (head + 1) % LOG_CAPACITY;
+        unsafe { LOG_QUEUE[head] = Some(event); }
+        LOG_HEAD.store(next_head, Ordering::Release);
+
+        if WRITE_LOCK.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            Self::flush_to_serial();
+            WRITE_LOCK.store(false, Ordering::Release);
         }
+    }
 
-        let (tag, color_prefix) = match level {
-            LogLevel::Debug => ("[DEBUG]", "\x1b[36m"),
-            LogLevel::Info  => ("[INFO] ", "\x1b[32m"),
-            LogLevel::Warn  => ("[WARN] ", "\x1b[33m"),
-            LogLevel::Error => ("[ERROR]", "\x1b[31m"),
-            LogLevel::Fatal => ("[FATAL]", "\x1b[35m"),
-        };
-
-        let core_id = get_current_core_id();
-        let ticks = crate::arch::x86_64::pit::get_ticks();
-        let secs = ticks / 100;
-        let frac = (ticks % 100) * 10;
-
-        serial_print!("{}{}\x1b[0m \x1b[1;30m[{:03}.{:02}s]\x1b[0m \x1b[1;34m[CPU#{}]\x1b[0m \x1b[1;30m[{:<6}]\x1b[0m {}\n",
-            color_prefix, tag, secs, frac, core_id, subsystem, args
-        );
-
-        let (r, g, b) = match level {
-            LogLevel::Debug => (148, 163, 184),
-            LogLevel::Info  => (74, 222, 128),
-            LogLevel::Warn  => (250, 204, 21),
-            LogLevel::Error => (248, 113, 113),
-            LogLevel::Fatal => (236, 72, 153),
-        };
-
-        unsafe {
-            if let Some(writer) = &mut *core::ptr::addr_of_mut!(WRITER) {
-                // إذا كانت الواجهة الرسومية نشطة لا نكتب في Framebuffer مباشرة لمنع تشويه الرسم
-                if !crate::arch::x86_64::interrupts::GUI_ACTIVE.load(Ordering::Relaxed) {
-                    writer.write_str(tag, r, g, b);
-                    writer.write_str(" [C", 100, 116, 139);
-                    let c_char = (b'0' + (core_id as u8 % 10)) as char;
-                    writer.write_char(c_char, 56, 189, 248);
-                    writer.write_str("] [", 100, 116, 139);
-                    writer.write_str(subsystem, 148, 163, 184);
-                    writer.write_str("] ", 100, 116, 139);
-                    writer.write_fmt(args, 241, 245, 249);
-                    writer.write_char('\n', 255, 255, 255);
+    pub fn flush_to_serial() {
+        let mut tail = LOG_TAIL.load(Ordering::Acquire);
+        let head = LOG_HEAD.load(Ordering::Acquire);
+        while tail != head {
+            if let Some(event) = unsafe { &LOG_QUEUE[tail] } {
+                let color = match event.level {
+                    LogLevel::Debug => "\x1b[36m",
+                    LogLevel::Info  => "\x1b[32m",
+                    LogLevel::Warn  => "\x1b[33m",
+                    LogLevel::Error => "\x1b[31m",
+                    LogLevel::Fatal => "\x1b[35m",
+                };
+                let sec = event.timestamp / 100;
+                let frac = (event.timestamp % 100) * 10;
+                
+                if let Ok(s) = core::str::from_utf8(&event.message[..event.len]) {
+                    serial_print!("{}\x1b[1;30m[{:03}.{:02}s]\x1b[0m {}\n", color, sec, frac, s);
                 }
             }
+            tail = (tail + 1) % LOG_CAPACITY;
         }
+        LOG_TAIL.store(tail, Ordering::Release);
+    }
+}
 
-        PRINT_LOCK.store(false, Ordering::Release);
+struct MessageBuffer<'a> { buf: &'a mut [u8], cursor: usize }
+impl<'a> fmt::Write for MessageBuffer<'a> {
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let remaining = self.buf.len() - self.cursor;
+        let to_copy = core::cmp::min(remaining, s.len());
+        self.buf[self.cursor..self.cursor + to_copy].copy_from_slice(&s.as_bytes()[..to_copy]);
+        self.cursor += to_copy;
+        Ok(())
     }
 }
 
 #[macro_export]
 macro_rules! log_info {
     ($subsys:literal, $fmt:literal $(, $($arg:tt)*)?) => {
-        $crate::logger::KernelLogger::log(
-            $crate::logger::LogLevel::Info,
-            $subsys,
-            format_args!($fmt $(, $($arg)*)?)
-        )
+        $crate::logger::KernelLogger::log($crate::logger::LogLevel::Info, $subsys, format_args!($fmt $(, $($arg)*)?))
     };
     ($fmt:literal $(, $($arg:tt)*)?) => {
-        $crate::logger::KernelLogger::log(
-            $crate::logger::LogLevel::Info,
-            "KERNEL",
-            format_args!($fmt $(, $($arg)*)?)
-        )
+        $crate::logger::KernelLogger::log($crate::logger::LogLevel::Info, "KERNEL", format_args!($fmt $(, $($arg)*)?))
     };
 }
-
 #[macro_export]
 macro_rules! log_warn {
     ($subsys:literal, $fmt:literal $(, $($arg:tt)*)?) => {
-        $crate::logger::KernelLogger::log(
-            $crate::logger::LogLevel::Warn,
-            $subsys,
-            format_args!($fmt $(, $($arg)*)?)
-        )
+        $crate::logger::KernelLogger::log($crate::logger::LogLevel::Warn, $subsys, format_args!($fmt $(, $($arg)*)?))
     };
     ($fmt:literal $(, $($arg:tt)*)?) => {
-        $crate::logger::KernelLogger::log(
-            $crate::logger::LogLevel::Warn,
-            "KERNEL",
-            format_args!($fmt $(, $($arg)*)?)
-        )
+        $crate::logger::KernelLogger::log($crate::logger::LogLevel::Warn, "KERNEL", format_args!($fmt $(, $($arg)*)?))
     };
 }
-
 #[macro_export]
 macro_rules! log_error {
     ($subsys:literal, $fmt:literal $(, $($arg:tt)*)?) => {
-        $crate::logger::KernelLogger::log(
-            $crate::logger::LogLevel::Error,
-            $subsys,
-            format_args!($fmt $(, $($arg)*)?)
-        )
+        $crate::logger::KernelLogger::log($crate::logger::LogLevel::Error, $subsys, format_args!($fmt $(, $($arg)*)?))
     };
     ($fmt:literal $(, $($arg:tt)*)?) => {
-        $crate::logger::KernelLogger::log(
-            $crate::logger::LogLevel::Error,
-            "KERNEL",
-            format_args!($fmt $(, $($arg)*)?)
-        )
+        $crate::logger::KernelLogger::log($crate::logger::LogLevel::Error, "KERNEL", format_args!($fmt $(, $($arg)*)?))
     };
 }
-
 #[macro_export]
 macro_rules! log_debug {
     ($subsys:literal, $fmt:literal $(, $($arg:tt)*)?) => {
-        $crate::logger::KernelLogger::log(
-            $crate::logger::LogLevel::Debug,
-            $subsys,
-            format_args!($fmt $(, $($arg)*)?)
-        )
+        $crate::logger::KernelLogger::log($crate::logger::LogLevel::Debug, $subsys, format_args!($fmt $(, $($arg)*)?))
     };
     ($fmt:literal $(, $($arg:tt)*)?) => {
-        $crate::logger::KernelLogger::log(
-            $crate::logger::LogLevel::Debug,
-            "KERNEL",
-            format_args!($fmt $(, $($arg)*)?)
-        )
+        $crate::logger::KernelLogger::log($crate::logger::LogLevel::Debug, "KERNEL", format_args!($fmt $(, $($arg)*)?))
     };
 }
-
 #[macro_export]
 macro_rules! log_fatal {
     ($subsys:literal, $fmt:literal $(, $($arg:tt)*)?) => {
-        $crate::logger::KernelLogger::log(
-            $crate::logger::LogLevel::Fatal,
-            $subsys,
-            format_args!($fmt $(, $($arg)*)?)
-        )
+        $crate::logger::KernelLogger::log($crate::logger::LogLevel::Fatal, $subsys, format_args!($fmt $(, $($arg)*)?))
     };
     ($fmt:literal $(, $($arg:tt)*)?) => {
-        $crate::logger::KernelLogger::log(
-            $crate::logger::LogLevel::Fatal,
-            "KERNEL",
-            format_args!($fmt $(, $($arg)*)?)
-        )
+        $crate::logger::KernelLogger::log($crate::logger::LogLevel::Fatal, "KERNEL", format_args!($fmt $(, $($arg)*)?))
     };
 }

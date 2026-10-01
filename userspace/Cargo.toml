@@ -10,7 +10,6 @@ sha2 = { version = "0.10", default-features = false }
 rand = { version = "0.8", default-features = false, features = ["small_rng"] }
 regex-automata = { version = "0.4", default-features = false, features = ["alloc", "syntax", "meta", "unicode-perl"] }
 zune-jpeg = { version = "0.4.13", default-features = false }
-# 💡 مكتبة H.264 نقية 100% بلغة Rust تدعم Baseline و High Profile
 rust_h264 = "0.4"
 
 [profile.release]
