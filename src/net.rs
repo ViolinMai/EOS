@@ -1,4 +1,3 @@
-use alloc::vec::Vec;
 use crate::{log_info, log_error};
 use crate::drivers::e1000::get_driver;
 

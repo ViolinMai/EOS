@@ -4,7 +4,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 const PIT_CHANNEL_0: u16 = 0x40;
 const PIT_COMMAND: u16 = 0x43;
 const PIT_BASE_FREQUENCY: u32 = 1193182;
-pub const TARGET_HZ: u32 = 1000; // Raised to 1000 Hz (1ms tick)
+pub const TARGET_HZ: u32 = 1000;
 
 pub static TICKS: AtomicU64 = AtomicU64::new(0);
 pub static TSC_PER_MS: AtomicU64 = AtomicU64::new(0);
@@ -51,11 +51,12 @@ pub fn calibrate_tsc() {
 
 pub fn sleep_us(us: u64) {
     let tsc_per_ms = TSC_PER_MS.load(Ordering::Relaxed);
-    if tsc_per_ms == 0 { return; } // Not calibrated yet
+    if tsc_per_ms == 0 { return; }
     let target = read_tsc() + (us * tsc_per_ms) / 1000;
     unsafe { asm!("sti", options(nomem, nostack)); }
     while read_tsc() < target {
-        unsafe { asm!("pause", options(nomem, nostack)); }
+        // تم استبدال الـ pause بـ hlt لمنع الاستهلاك المفرط للمعالج وقت الخمول
+        unsafe { asm!("hlt", options(nomem, nostack)); }
     }
 }
 

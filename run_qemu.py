@@ -45,11 +45,20 @@ def build_userspace_app():
     cmd = [CARGO_BIN, "build", "--release", "--manifest-path", os.path.join(userspace_dir, "Cargo.toml"), "--target", "x86_64-unknown-linux-musl"]
     env = os.environ.copy()
     env.pop("RUSTFLAGS", None)
+    print(f"[*] Executing Cargo Build for Userspace: {' '.join(cmd)}")
     res = subprocess.run(cmd, shell=True, env=env)
-    if res.returncode != 0: return None
+    
+    if res.returncode != 0:
+        print(f"\n[!] ❌ Userspace Cargo Build FAILED with return code {res.returncode}")
+        print("[!] Please check the compilation errors above.\n")
+        return None
+        
     bin_path = os.path.join(userspace_dir, "target", "x86_64-unknown-linux-musl", "release", "user_app")
     if os.path.exists(bin_path):
-        with open(bin_path, "rb") as f: return f.read()
+        with open(bin_path, "rb") as f:
+            return f.read()
+            
+    print(f"[!] ❌ Built binary not found at expected path: {bin_path}")
     return None
 
 def create_demo_tar(user_elf_data):
@@ -64,6 +73,25 @@ def create_demo_tar(user_elf_data):
             ti3 = tarfile.TarInfo(name="user_app.elf")
             ti3.size = len(user_elf_data)
             tar.addfile(ti3, io.BytesIO(user_elf_data))
+
+        # حزم خطوط SF Pro المتاحة في C:\EOS_SHARE\fonts لضمان وصول الـ VFS إليها
+        font_paths = [
+            r"C:\EOS_SHARE\fonts\SFPRODISPLAYREGULAR.OTF",
+            r"C:\EOS_SHARE\fonts\SFPRODISPLAYMEDIUM.OTF",
+            r"C:\EOS_SHARE\fonts\SFPRODISPLAYBOLD.OTF"
+        ]
+        for fp in font_paths:
+            if os.path.exists(fp):
+                fname = os.path.basename(fp)
+                with open(fp, "rb") as ff:
+                    fb = ff.read()
+                t1 = tarfile.TarInfo(name=fname)
+                t1.size = len(fb)
+                tar.addfile(t1, io.BytesIO(fb))
+                t2 = tarfile.TarInfo(name="fonts/" + fname)
+                t2.size = len(fb)
+                tar.addfile(t2, io.BytesIO(fb))
+
     return buf.getvalue()
 
 def make_uefi_fat32_disk(img_path, files):
@@ -73,16 +101,13 @@ def make_uefi_fat32_disk(img_path, files):
     RESERVED_SECTORS = 32
     NUM_FATS = 2
     PART_START_SECTOR = 2048
-    PART_SECTORS = 262144 # 128 MB disk
+    PART_SECTORS = 262144
     TOTAL_SECTORS = PART_START_SECTOR + PART_SECTORS
     FAT_SIZE_SECTORS = 2048
     ROOT_CLUSTER = 2
 
     disk = bytearray(TOTAL_SECTORS * SECTOR_SIZE)
-    
-    # MBR Partition Table
     disk[510:512] = b"\x55\xAA"
-    # Type 0xEF = EFI System Partition (ESP)
     disk[446:462] = struct.pack("<BBBBBBBBII", 0x80, 0x00, 0x02, 0x00, 0xEF, 0xFF, 0xFF, 0xFF, PART_START_SECTOR, PART_SECTORS)
 
     vbr_offset = PART_START_SECTOR * SECTOR_SIZE
@@ -155,22 +180,18 @@ def make_uefi_fat32_disk(img_path, files):
         struct.pack_into("<I", entry, 28, size)
         return entry
 
-    # 1. Write file contents into data clusters
     bootx64_cluster = write_data(files["BOOTX64.EFI"])
     conf_cluster = write_data(files["limine.conf"])
     k_cluster = write_data(files["EOS"])
     tar_cluster = write_data(files["initrd.tar"])
 
-    # 2. Allocate directories
     boot_dir_cluster = allocate_clusters(1)
     efi_dir_cluster = allocate_clusters(1)
 
-    # LFN Helper for limine.conf
     chk_conf = lfn_checksum(b"LIMINE  CFG")
     lfn_conf = make_lfn_entry(1, "limine.conf", chk_conf, is_last=True)
     short_conf_entry = make_entry("LIMINE  CFG", 0x20, conf_cluster, len(files["limine.conf"]))
 
-    # Populate \EFI\BOOT directory
     boot_dir = bytearray(CLUSTER_SIZE)
     b_entries = [
         make_entry(".          ", 0x10, boot_dir_cluster, 0),
@@ -184,7 +205,6 @@ def make_uefi_fat32_disk(img_path, files):
     c_off_boot = data_start + ((boot_dir_cluster - 2) * CLUSTER_SIZE)
     disk[c_off_boot : c_off_boot + CLUSTER_SIZE] = boot_dir
 
-    # Populate \EFI directory
     efi_dir = bytearray(CLUSTER_SIZE)
     e_entries = [
         make_entry(".          ", 0x10, efi_dir_cluster, 0),
@@ -196,7 +216,6 @@ def make_uefi_fat32_disk(img_path, files):
     c_off_efi = data_start + ((efi_dir_cluster - 2) * CLUSTER_SIZE)
     disk[c_off_efi : c_off_efi + CLUSTER_SIZE] = efi_dir
 
-    # Populate Root Directory (Includes limine.conf and limine.cfg)
     root_dir = bytearray(CLUSTER_SIZE)
     root_entries = [
         make_entry("EFI        ", 0x10, efi_dir_cluster, 0),
@@ -210,7 +229,6 @@ def make_uefi_fat32_disk(img_path, files):
     c_off_root = data_start + ((ROOT_CLUSTER - 2) * CLUSTER_SIZE)
     disk[c_off_root : c_off_root + CLUSTER_SIZE] = root_dir
 
-    # Mirror FAT1 to FAT2
     fat2_offset = fat1_offset + (FAT_SIZE_SECTORS * SECTOR_SIZE)
     disk[fat2_offset : fat2_offset + (FAT_SIZE_SECTORS * SECTOR_SIZE)] = disk[fat1_offset : fat1_offset + (FAT_SIZE_SECTORS * SECTOR_SIZE)]
 
@@ -228,6 +246,10 @@ def prepare_and_run():
 
     print("[*] Building Userspace App...")
     user_elf = build_userspace_app()
+    if not user_elf:
+        print("\n[!] ❌ ABORTING: user_app.elf could not be built successfully.")
+        print("[!] Fix the Cargo build errors shown above and re-run.\n")
+        return
 
     print("[*] Building EOS Kernel (Release, LTO)...")
     env = os.environ.copy()

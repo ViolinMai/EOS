@@ -53,6 +53,9 @@ pub extern "C" fn _start() -> ! {
     serial::SERIAL2.init();
     crate::log_info!("KERNEL", "SERIAL CONSOLE INITIALIZED");
 
+    // تفعيل SSE على الـ BSP (Core 0)
+    arch::x86_64::smp::enable_sse();
+
     let hhdm_resp = HHDM_REQUEST.response().expect("HHDM failed");
     let hhdm_offset = hhdm_resp.offset;
     let mmap_resp = MEMORY_MAP_REQUEST.response().expect("MemMap failed");
@@ -103,14 +106,11 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    // Load user settings if saved
     config::CONFIG.load_from_disk();
-
     task::init();
 
     if let Some(mp_resp) = MP_REQUEST.response() {
         let cpus = mp_resp.cpus();
-        crate::log_info!("SMP", "Hardware CPUs detected: {}", cpus.len());
         for cpu in cpus {
             if cpu.lapic_id != 0 {
                 unsafe {
@@ -125,15 +125,18 @@ pub extern "C" fn _start() -> ! {
 
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-    // تشغيل تطبيق الـ Userspace تلقائياً في الخلفية على Core 2
-    let _ = task::request_elf_execution("user_app.elf", "");
-
-    crate::log_info!("DESKTOP", "Starting Compositor Core directly on BSP...");
-    arch::x86_64::interrupts::GUI_ACTIVE.store(true, Ordering::SeqCst);
-    compositor::compositor_core_entry();
+    crate::log_info!("DESKTOP", "Delegating Full UI Framework to Userspace...");
+    if let Err(e) = task::request_elf_execution("user_app.elf", "") {
+        crate::log_error!("DESKTOP", "Failed to launch user_app.elf: {}", e);
+    }
 
     loop {
         net::poll();
+
+        while let Some(ev) = input::poll_event() {
+            arch::x86_64::syscall::push_user_event(ev);
+        }
+
         if let Some(cmd) = arch::x86_64::interrupts::take_pending_command() {
             arch::x86_64::interrupts::execute_command(&cmd);
             arch::x86_64::interrupts::print_prompt();
@@ -143,11 +146,11 @@ pub extern "C" fn _start() -> ! {
 }
 
 extern "C" fn ap_startup_entry(info: &limine::mp::MpInfo) -> ! {
-    while !AP_BOOT_LATCH.load(Ordering::Acquire) {
-        core::hint::spin_loop();
-    }
+    while !AP_BOOT_LATCH.load(Ordering::Acquire) { core::hint::spin_loop(); }
     let core_id = info.lapic_id as usize;
     if core_id < 8 {
+        // تفعيل SSE/AVX عتادياً على الأنوية الثانوية قبل أي شيء
+        arch::x86_64::smp::enable_sse();
         arch::x86_64::gdt::init_core(core_id);
         unsafe {
             crate::arch::x86_64::idt::InterruptDescriptorTable::load_raw(

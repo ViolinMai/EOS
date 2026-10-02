@@ -1,15 +1,17 @@
-use core::sync::atomic::{AtomicUsize, Ordering};
 use core::arch::asm;
-use crate::config::CONFIG;
 
 pub fn enable_sse() {
     unsafe {
-        let mut cr0: u64; let mut cr4: u64;
+        let mut cr0: u64;
+        let mut cr4: u64;
         asm!("mov {}, cr0", out(reg) cr0);
-        cr0 &= !(1 << 2); cr0 |= 1 << 1;
+        cr0 &= !(1 << 2); // مسح بت EM (Emulation)
+        cr0 |= 1 << 1;    // تفعيل بت MP (Monitor Coprocessor)
         asm!("mov cr0, {}", in(reg) cr0);
+
         asm!("mov {}, cr4", out(reg) cr4);
-        cr4 |= 1 << 9; cr4 |= 1 << 10;
+        cr4 |= 1 << 9;  // تفعيل OSFXSR (FXSAVE/FXRSTOR و SSE تعليمات)
+        cr4 |= 1 << 10; // تفعيل OSXMMEXCPT (معالجة استثناءات SIMD)
         asm!("mov cr4, {}", in(reg) cr4);
     }
 }

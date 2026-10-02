@@ -4,8 +4,13 @@ use core::ptr::addr_of_mut;
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 #[allow(dead_code)]
 pub const KERNEL_DATA_SELECTOR: u16 = 0x10;
-pub const USER_CODE_SELECTOR: u16 = 0x18 | 3;
-pub const USER_DATA_SELECTOR: u16 = 0x20 | 3;
+
+// مطابقة متطلبات SYSRETQ في x86-64 بدقة:
+// عند ضبط STAR[63:48] = 0x10:
+// SS يحصل على STAR + 8  = 0x18 | 3
+// CS يحصل على STAR + 16 = 0x20 | 3
+pub const USER_DATA_SELECTOR: u16 = 0x18 | 3;
+pub const USER_CODE_SELECTOR: u16 = 0x20 | 3;
 pub const TSS_SELECTOR: u16 = 0x28;
 
 pub const MAX_CORES: usize = 8;
@@ -97,9 +102,11 @@ pub fn init_core(core_id: usize) {
         gdt.entries[1] = 0x00AF9A000000FFFF; // Kernel Code (0x08)
         gdt.entries[2] = 0x00CF92000000FFFF; // Kernel Data (0x10)
         
-        // 💡 للـ SYSRET: يجب أن يكون User Code أولاً ثم User Data مباشرة
-        gdt.entries[3] = 0x00AFFA000000FFFF; // User Code (0x18 | 3)
-        gdt.entries[4] = 0x00CFF2000000FFFF; // User Data (0x20 | 3)
+        // الترتيب الصحيح لمعمارية x86-64 SYSRET:
+        // Entry 3: User Data (0x18 | 3)
+        // Entry 4: User Code (0x20 | 3)
+        gdt.entries[3] = 0x00CFF2000000FFFF; // User Data (0x18 | 3)
+        gdt.entries[4] = 0x00AFFA000000FFFF; // User Code (0x20 | 3)
 
         let tss_base = tss as *const _ as u64;
         let tss_limit = (core::mem::size_of::<TaskStateSegment>() - 1) as u64;

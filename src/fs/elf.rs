@@ -2,8 +2,8 @@
 use crate::arch::x86_64::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::arch::x86_64::keyboard::clear_keyboard_buffer;
 use crate::arch::x86_64::syscall::{ELF_EXIT_REQUESTED, reset_core2_process};
-use crate::{log_info, log_debug};
-use crate::mm::paging::{invalidate_tlb, read_cr3, free_user_pages, PageTable, PAGE_PRESENT, PAGE_USER, PAGE_WRITABLE};
+use crate::log_info;
+use crate::mm::paging::{read_cr3, free_user_pages, PageTable};
 use crate::mm::paging::VMM;
 use alloc::vec::Vec;
 use core::arch::naked_asm;
@@ -31,13 +31,44 @@ pub struct Elf64ProgramHeader {
     pub p_paddr: u64, pub p_filesz: u64, pub p_memsz: u64, pub p_align: u64,
 }
 
+// System V AMD64 ABI:
+// rdi = entry
+// rsi = rsp
+// rdx = user_cs
+// rcx = user_ds
+// r8  = spawn_rsp_ptr
+// r9  = new_cr3
 #[unsafe(naked)]
 extern "C" fn jump_to_ring3(entry: u64, rsp: u64, user_cs: u64, user_ds: u64, spawn_rsp_ptr: *mut u64, new_cr3: u64) {
     naked_asm!(
         "push rbp", "push rbx", "push r12", "push r13", "push r14", "push r15",
-        "mov [r8], rsp", "mov cr3, r9", 
-        "mov ax, cx", "mov ds, ax", "mov es, ax", "mov fs, ax", "mov gs, ax",
-        "push rcx", "push rsi", "push 0x202", "push rdx", "push rdi", "iretq",
+        "mov [r8], rsp",
+        "mov cr3, r9",
+        "mov ax, cx",
+        "mov ds, ax", "mov es, ax", "mov fs, ax", "mov gs, ax",
+        // بناء IRETQ Frame (SS, RSP, RFLAGS, CS, RIP)
+        "push rcx",         // SS = user_ds
+        "push rsi",         // RSP = user_rsp
+        "push 0x202",       // RFLAGS (IF = 1, Reserved = 1)
+        "push rdx",         // CS = user_cs
+        "push rdi",         // RIP = entry
+        // تصفير المسجلات قبل الدخول إلى مساحة المستخدم
+        "xor rax, rax",
+        "xor rbx, rbx",
+        "xor rcx, rcx",
+        "xor rdx, rdx",
+        "xor rsi, rsi",
+        "xor rbp, rbp",
+        "xor r8, r8",
+        "xor r9, r9",
+        "xor r10, r10",
+        "xor r11, r11",
+        "xor r12, r12",
+        "xor r13, r13",
+        "xor r14, r14",
+        "xor r15, r15",
+        "xor rdi, rdi",
+        "iretq"
     );
 }
 
@@ -103,7 +134,8 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
     crate::mm::paging::map_user_pages(new_pml4_phys, stack_start, stack_pages as usize)?;
 
     let mut args: Vec<&str> = Vec::new();
-    if args_str.is_empty() { args.push("eos_app"); } else { for part in args_str.split_whitespace() { args.push(part); } }
+    if args_str.is_empty() { args.push("user_app"); } else { for part in args_str.split_whitespace() { args.push(part); } }
+
     let user_rsp_page = USER_STACK_TOP - 0x2000;
     let user_rsp;
 
@@ -114,26 +146,43 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
         let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
         let stack_base = (pt2.entries[p1_idx].physical_address() + vmm.hhdm_offset) as *mut u8;
-        
-        let mut string_cursor = 4096 - 512;
+
+        core::ptr::write_bytes(stack_base, 0, 4096);
+
+        let mut string_cursor = 4096 - 256;
         let mut arg_pointers: Vec<u64> = Vec::new();
         for arg in &args {
-            let bytes = arg.as_bytes(); string_cursor -= bytes.len() + 1;
+            let bytes = arg.as_bytes();
+            string_cursor -= bytes.len() + 1;
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), stack_base.add(string_cursor), bytes.len());
             *stack_base.add(string_cursor + bytes.len()) = 0;
             arg_pointers.push(user_rsp_page + string_cursor as u64);
         }
 
-        let stack_ptr = stack_base.add(0x800) as *mut u64; let mut idx = 0isize;
-        *stack_ptr.offset(idx) = arg_pointers.len() as u64; idx += 1;
-        for ptr in arg_pointers { *stack_ptr.offset(idx) = ptr; idx += 1; }
-        *stack_ptr.offset(idx) = 0; idx += 1; // argv null
-        *stack_ptr.offset(idx) = 0; idx += 1; // envp null
-        *stack_ptr.offset(idx) = 6; idx += 1; *stack_ptr.offset(idx) = 4096; idx += 1; // AT_PAGESZ
-        *stack_ptr.offset(idx) = 25; idx += 1; *stack_ptr.offset(idx) = user_rsp_page + 0x100; idx += 1; // AT_RANDOM
-        *stack_ptr.offset(idx) = 9; idx += 1; *stack_ptr.offset(idx) = entry_point; idx += 1; // AT_ENTRY
-        *stack_ptr.offset(idx) = 0; idx += 1; *stack_ptr.offset(idx) = 0;
-        user_rsp = (user_rsp_page + 0x800) & !0x0F;
+        let mut entries: Vec<u64> = Vec::new();
+        entries.push(arg_pointers.len() as u64); // argc
+        for ptr in arg_pointers {
+            entries.push(ptr); // argv[i]
+        }
+        entries.push(0); // argv NULL
+        entries.push(0); // envp NULL
+
+        // Auxiliary Vector (elf_auxv_t)
+        entries.push(6);  entries.push(4096);                         // AT_PAGESZ
+        entries.push(25); entries.push(user_rsp_page + 0x100);        // AT_RANDOM
+        entries.push(9);  entries.push(entry_point);                  // AT_ENTRY
+        entries.push(0);  entries.push(0);                            // AT_NULL
+
+        // محاذاة 16 بايت صارمة لـ System V ABI
+        if entries.len() % 2 != 0 {
+            entries.push(0);
+        }
+
+        let stack_offset = 0x800usize;
+        let stack_dst = stack_base.add(stack_offset) as *mut u64;
+        core::ptr::copy_nonoverlapping(entries.as_ptr(), stack_dst, entries.len());
+
+        user_rsp = user_rsp_page + stack_offset as u64;
     }
 
     clear_keyboard_buffer();
@@ -143,7 +192,8 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
     let spawn_rsp_ptr = unsafe { &mut (*state_ptr).kernel_spawn_rsp as *mut u64 };
 
     unsafe {
-        crate::arch::x86_64::syscall::wrmsr(0xC0000100, 0); crate::arch::x86_64::syscall::wrmsr(0xC0000101, 0);
+        crate::arch::x86_64::syscall::wrmsr(0xC0000100, 0); // FS_BASE = 0
+        crate::arch::x86_64::syscall::wrmsr(0xC0000101, 0); // GS_BASE = 0
         jump_to_ring3(entry_point, user_rsp, USER_CODE_SELECTOR as u64, USER_DATA_SELECTOR as u64, spawn_rsp_ptr, new_pml4_phys);
         core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3);
         free_user_pages(new_pml4_phys);
