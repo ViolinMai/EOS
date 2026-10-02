@@ -5,7 +5,7 @@ use rusttype::Font;
 
 use super::canvas::Canvas;
 use super::widget::{Widget, WindowFrame};
-use crate::apps::{FinderApp, TerminalApp, SettingsApp, TextEditApp};
+use crate::apps::{FinderApp, TerminalApp, SettingsApp, TextEditApp, PreviewApp};
 use crate::sdk;
 
 pub struct FrameworkApp<'a> {
@@ -22,6 +22,7 @@ pub struct FrameworkApp<'a> {
     pub dock_hovered: Option<usize>,
     pub on_dock_click: Option<Box<dyn FnMut(usize)>>,
     pub needs_redraw: bool,
+    pub pending_open: Option<(String, String)>, // (AppType, Path)
 }
 
 impl<'a> FrameworkApp<'a> {
@@ -44,11 +45,24 @@ impl<'a> FrameworkApp<'a> {
             dock_hovered: None,
             on_dock_click: None,
             needs_redraw: true,
+            pending_open: None,
         }
     }
 
     pub fn set_dock_handler(&mut self, handler: impl FnMut(usize) + 'static) {
         self.on_dock_click = Some(Box::new(handler));
+    }
+
+    pub fn open_file(&mut self, path: &str) {
+        let lower = path.to_ascii_lowercase();
+        if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+            let win = Box::new(WindowFrame::new("Preview", 200, 100, 640, 520, Box::new(PreviewApp::new(path))));
+            self.root_widgets.push(win);
+        } else {
+            let win = Box::new(WindowFrame::new("TextEdit", 220, 120, 680, 480, Box::new(TextEditApp::open_file(path))));
+            self.root_widgets.push(win);
+        }
+        self.needs_redraw = true;
     }
 
     pub fn spawn_app(&mut self, name: &str) {
@@ -62,12 +76,11 @@ impl<'a> FrameworkApp<'a> {
             }
         }
 
-        // Window Initial Sizes Scaled Up (~1.5x)
         let new_win: Box<dyn Widget> = match name {
-            "Finder" => Box::new(WindowFrame::new("Finder", 120, 70, 1100, 680, Box::new(FinderApp::new()))),
-            "Terminal" => Box::new(WindowFrame::new("Terminal", 200, 120, 920, 580, Box::new(TerminalApp::new()))),
-            "TextEdit" => Box::new(WindowFrame::new("TextEdit", 280, 160, 880, 600, Box::new(TextEditApp::new()))),
-            "Settings" => Box::new(WindowFrame::new("Settings", 320, 100, 860, 560, Box::new(SettingsApp::new()))),
+            "Finder" => Box::new(WindowFrame::new("Finder", 140, 80, 880, 520, Box::new(FinderApp::new()))),
+            "Terminal" => Box::new(WindowFrame::new("Terminal", 220, 140, 680, 420, Box::new(TerminalApp::new()))),
+            "TextEdit" => Box::new(WindowFrame::new("TextEdit", 280, 160, 640, 440, Box::new(TextEditApp::new()))),
+            "Settings" => Box::new(WindowFrame::new("Settings", 320, 120, 620, 400, Box::new(SettingsApp::new()))),
             _ => return,
         };
 
@@ -78,18 +91,17 @@ impl<'a> FrameworkApp<'a> {
     pub fn render_frame(&mut self) {
         self.buffer.fill(0xFF0F172A);
 
-        // Scaled Top Menubar (Height: 48px, Font: 20px)
-        let mb_h = 48usize;
+        // Menubar
         {
             let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-            canvas.draw_rect(0, 0, self.width, mb_h, 0xFF18181B, 0);
-            canvas.draw_line_h(0, mb_h, self.width, 0xFF27272A);
-            canvas.draw_text(24, 12, " EOS", 0xFFFFFFFF, 22);
-            canvas.draw_text(110, 13, "File    Edit    View    Window    Help", 0xFF94A3B8, 18);
-            canvas.draw_text(self.width - 280, 13, "Oct 2 | 8 Cores Online", 0xFF38BDF8, 18);
+            canvas.draw_rect(0, 0, self.width, 32, 0xFF18181B, 0);
+            canvas.draw_line_h(0, 32, self.width, 0xFF27272A);
+            canvas.draw_text(18, 8, " EOS", 0xFFFFFFFF, 14);
+            canvas.draw_text(75, 8, "File   Edit   View   Window   Help", 0xFF94A3B8, 13);
+            canvas.draw_text(self.width - 220, 8, "8 Cores SMP | 60 FPS", 0xFF38BDF8, 13);
         }
 
-        // Active Windows
+        // Windows
         {
             let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
             for w in &self.root_widgets {
@@ -97,27 +109,27 @@ impl<'a> FrameworkApp<'a> {
             }
         }
 
-        // Scaled Dock (Height: 96px, Items: 76px)
+        // Dock
         {
             let item_count = self.dock_items.len();
-            let base_item_w = 76usize;
-            let gap = 18usize;
+            let base_item_w = 54usize;
+            let gap = 12usize;
             let total_dock_w = (item_count * base_item_w) + ((item_count + 1) * gap);
-            let dock_h = 96usize;
+            let dock_h = 68usize;
             let dock_x = (self.width - total_dock_w) / 2;
-            let dock_y = self.height - dock_h - 18;
+            let dock_y = self.height - dock_h - 12;
 
             let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-            canvas.draw_rect(dock_x, dock_y, total_dock_w, dock_h, 0xFF1E293B, 26);
+            canvas.draw_rect(dock_x, dock_y, total_dock_w, dock_h, 0xFF1E293B, 20);
 
             let mut cur_x = dock_x + gap;
             for (idx, &(name, label, color)) in self.dock_items.iter().enumerate() {
                 let is_hovered = self.dock_hovered == Some(idx);
-                let sz = if is_hovered { 84 } else { base_item_w };
-                let iy = if is_hovered { dock_y + 6 } else { dock_y + 10 };
+                let sz = if is_hovered { 58 } else { base_item_w };
+                let iy = if is_hovered { dock_y + 5 } else { dock_y + 8 };
 
-                canvas.draw_rect(cur_x, iy, sz, sz, color, 18);
-                canvas.draw_text(cur_x + 18, iy + 26, label, 0xFFFFFFFF, 20);
+                canvas.draw_rect(cur_x, iy, sz, sz, color, 14);
+                canvas.draw_text(cur_x + 13, iy + 18, label, 0xFFFFFFFF, 14);
 
                 let is_running = self.root_widgets.iter().any(|w| {
                     if let Some(frame) = w.as_any().downcast_ref::<WindowFrame>() {
@@ -125,26 +137,26 @@ impl<'a> FrameworkApp<'a> {
                     } else { false }
                 });
                 if is_running {
-                    canvas.draw_rect(cur_x + (sz / 2) - 3, dock_y + dock_h - 8, 6, 6, 0xFF38BDF8, 3);
+                    canvas.draw_rect(cur_x + (sz / 2) - 2, dock_y + dock_h - 6, 4, 4, 0xFF38BDF8, 2);
                 }
 
                 if is_hovered {
-                    let tip_w = name.len() * 12 + 32;
+                    let tip_w = name.len() * 9 + 20;
                     let tip_x = cur_x.saturating_add(sz / 2).saturating_sub(tip_w / 2);
-                    let tip_y = dock_y.saturating_sub(38);
-                    canvas.draw_rect(tip_x, tip_y, tip_w, 32, 0xFF334155, 8);
-                    canvas.draw_text(tip_x + 14, tip_y + 6, name, 0xFFFFFFFF, 16);
+                    let tip_y = dock_y.saturating_sub(30);
+                    canvas.draw_rect(tip_x, tip_y, tip_w, 24, 0xFF334155, 6);
+                    canvas.draw_text(tip_x + 10, tip_y + 4, name, 0xFFFFFFFF, 12);
                 }
 
                 cur_x += base_item_w + gap;
             }
         }
 
-        // Scaled Cursor (18x18)
+        // Cursor
         {
             let cursor_col = if self.mouse_clicked { 0xFF22C55E } else { 0xFFFFFFFF };
             let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-            canvas.draw_rect(self.mouse_x.saturating_sub(3), self.mouse_y.saturating_sub(3), 18, 18, cursor_col, 9);
+            canvas.draw_rect(self.mouse_x.saturating_sub(2), self.mouse_y.saturating_sub(2), 12, 12, cursor_col, 6);
         }
 
         sdk::window::present(self.buffer.as_ptr(), self.width, self.height);
@@ -181,14 +193,30 @@ impl<'a> FrameworkApp<'a> {
 
             if has_input { self.needs_redraw = true; }
 
-            // Dock Bounds Check (Scaled)
+            // Check if any app requested file opening
+            let mut requested_file = None;
+            for w in self.root_widgets.iter_mut() {
+                if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                    if let Some(finder) = frame.content.as_any_mut().downcast_mut::<FinderApp>() {
+                        if let Some(file_path) = finder.take_requested_open() {
+                            requested_file = Some(file_path);
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Some(fp) = requested_file {
+                self.open_file(&fp);
+            }
+
+            // Dock Interaction
             let item_count = self.dock_items.len();
-            let base_item_w = 76usize;
-            let gap = 18usize;
+            let base_item_w = 54usize;
+            let gap = 12usize;
             let total_dock_w = (item_count * base_item_w) + ((item_count + 1) * gap);
-            let dock_h = 96usize;
+            let dock_h = 68usize;
             let dock_x = (self.width - total_dock_w) / 2;
-            let dock_y = self.height - dock_h - 18;
+            let dock_y = self.height - dock_h - 12;
 
             self.dock_hovered = None;
             let mut dock_clicked = false;
@@ -210,6 +238,7 @@ impl<'a> FrameworkApp<'a> {
                 }
             }
 
+            // Bring to front
             if !dock_clicked && self.mouse_clicked && !last_click_state {
                 let mut clicked_win_idx = None;
                 for (idx, w) in self.root_widgets.iter_mut().enumerate().rev() {
@@ -227,6 +256,7 @@ impl<'a> FrameworkApp<'a> {
                 }
             }
 
+            // Window handling
             let mut handled = false;
             for w in self.root_widgets.iter_mut().rev() {
                 if has_input && !handled && !dock_clicked {

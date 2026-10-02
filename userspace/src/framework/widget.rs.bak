@@ -131,7 +131,7 @@ pub struct Button {
 impl Button {
     pub fn new(label: impl Into<String>, on_click: impl FnMut() + 'static) -> Self {
         Self {
-            bounds: Rect { x: 0, y: 0, w: 180, h: 48 },
+            bounds: Rect { x: 0, y: 0, w: 120, h: 36 },
             label: label.into(),
             color_normal: 0xFF0284C7,
             color_hover: 0xFF38BDF8,
@@ -150,18 +150,18 @@ impl Widget for Button {
         self.bounds = Rect {
             x: origin_x,
             y: origin_y,
-            w: 180.min(max_w),
-            h: 48.min(max_h),
+            w: 140.min(max_w),
+            h: 36.min(max_h),
         };
         self.bounds
     }
 
     fn paint(&self, canvas: &mut Canvas) {
         let col = if self.is_hovered { self.color_hover } else { self.color_normal };
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, col, 10);
-        let text_x = self.bounds.x + 24;
-        let text_y = self.bounds.y + 12;
-        canvas.draw_text(text_x, text_y, &self.label, 0xFFFFFFFF, 20);
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, col, 6);
+        let text_x = self.bounds.x + 18;
+        let text_y = self.bounds.y + 8;
+        canvas.draw_text(text_x, text_y, &self.label, 0xFFFFFFFF, 15);
     }
 
     fn handle_mouse(&mut self, mx: usize, my: usize, pressed: bool) -> bool {
@@ -268,45 +268,40 @@ impl Widget for WindowFrame {
     fn layout(&mut self, _origin_x: usize, _origin_y: usize, max_w: usize, max_h: usize) -> Rect {
         self.bounds.w = self.bounds.w.min(max_w);
         self.bounds.h = self.bounds.h.min(max_h);
-        let titlebar_h = 52usize;
-        let content_y = self.bounds.y + titlebar_h;
-        let content_h = self.bounds.h.saturating_sub(titlebar_h + 4);
-        self.content.layout(self.bounds.x + 3, content_y, self.bounds.w.saturating_sub(6), content_h);
+        let content_y = self.bounds.y + 40;
+        let content_h = self.bounds.h.saturating_sub(44);
+        self.content.layout(self.bounds.x + 2, content_y, self.bounds.w.saturating_sub(4), content_h);
         self.bounds
     }
 
     fn paint(&self, canvas: &mut Canvas) {
         if self.is_closed { return; }
-        let titlebar_h = 52usize;
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF1E293B, 16);
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, titlebar_h, 0xFF334155, 16);
-        canvas.draw_rect(self.bounds.x, self.bounds.y + titlebar_h - 14, self.bounds.w, 14, 0xFF334155, 0);
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF1E293B, 12);
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, 40, 0xFF334155, 12);
+        canvas.draw_rect(self.bounds.x, self.bounds.y + 30, self.bounds.w, 10, 0xFF334155, 0);
 
-        // macOS Traffic Light Buttons (Scaled to 18x18)
-        let btn_y = self.bounds.y + 17;
-        canvas.draw_rect(self.bounds.x + 20, btn_y, 18, 18, 0xFFFF5F56, 9);
-        canvas.draw_rect(self.bounds.x + 46, btn_y, 18, 18, 0xFFFFBD2E, 9);
-        canvas.draw_rect(self.bounds.x + 72, btn_y, 18, 18, 0xFF27C93F, 9);
+        canvas.draw_rect(self.bounds.x + 14, self.bounds.y + 14, 12, 12, 0xFFFF5F56, 6);
+        canvas.draw_rect(self.bounds.x + 32, self.bounds.y + 14, 12, 12, 0xFFFFBD2E, 6);
+        canvas.draw_rect(self.bounds.x + 50, self.bounds.y + 14, 12, 12, 0xFF27C93F, 6);
 
-        let title_x = self.bounds.x + 105;
-        canvas.draw_text(title_x, self.bounds.y + 14, &self.title, 0xFFFFFFFF, 20);
+        let title_x = self.bounds.x + 75;
+        canvas.draw_text(title_x, self.bounds.y + 11, &self.title, 0xFFFFFFFF, 15);
 
-        canvas.set_clip(self.bounds.x + 3, self.bounds.y + titlebar_h, self.bounds.w.saturating_sub(6), self.bounds.h.saturating_sub(titlebar_h + 4));
+        canvas.set_clip(self.bounds.x + 2, self.bounds.y + 40, self.bounds.w.saturating_sub(4), self.bounds.h.saturating_sub(44));
         self.content.paint(canvas);
         canvas.reset_clip();
     }
 
     fn handle_mouse(&mut self, mx: usize, my: usize, pressed: bool) -> bool {
         if self.is_closed { return false; }
-        let titlebar_h = 52usize;
 
-        let close_rect = Rect { x: self.bounds.x + 20, y: self.bounds.y + 17, w: 18, h: 18 };
+        let close_rect = Rect { x: self.bounds.x + 14, y: self.bounds.y + 14, w: 12, h: 12 };
         if close_rect.contains(mx, my) && pressed {
             self.is_closed = true;
             return true;
         }
 
-        let title_rect = Rect { x: self.bounds.x, y: self.bounds.y, w: self.bounds.w, h: titlebar_h };
+        let title_rect = Rect { x: self.bounds.x, y: self.bounds.y, w: self.bounds.w, h: 40 };
         if title_rect.contains(mx, my) {
             if pressed && !self.is_dragging {
                 self.is_dragging = true;
@@ -321,8 +316,8 @@ impl Widget for WindowFrame {
         }
 
         if self.is_dragging {
-            self.bounds.x = mx.saturating_sub(self.drag_offset_x).min(1920 - 150);
-            self.bounds.y = my.saturating_sub(self.drag_offset_y).max(48).min(1080 - 80);
+            self.bounds.x = mx.saturating_sub(self.drag_offset_x).min(1920 - 100);
+            self.bounds.y = my.saturating_sub(self.drag_offset_y).max(36).min(1080 - 60);
             return true;
         }
 

@@ -47,34 +47,23 @@ def build_userspace_app():
     env.pop("RUSTFLAGS", None)
     print(f"[*] Executing Cargo Build for Userspace: {' '.join(cmd)}")
     res = subprocess.run(cmd, shell=True, env=env)
-    
-    if res.returncode != 0:
-        print(f"\n[!] ❌ Userspace Cargo Build FAILED with return code {res.returncode}")
-        print("[!] Please check the compilation errors above.\n")
-        return None
-        
+    if res.returncode != 0: return None
     bin_path = os.path.join(userspace_dir, "target", "x86_64-unknown-linux-musl", "release", "user_app")
     if os.path.exists(bin_path):
-        with open(bin_path, "rb") as f:
-            return f.read()
-            
-    print(f"[!] ❌ Built binary not found at expected path: {bin_path}")
+        with open(bin_path, "rb") as f: return f.read()
     return None
 
 def create_demo_tar(user_elf_data):
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
-        f1_data = b"Welcome to EOS Kernel!\r\nThis file is read from TarFS.\r\n"
-        ti1 = tarfile.TarInfo(name="readme.txt")
-        ti1.size = len(f1_data)
-        tar.addfile(ti1, io.BytesIO(f1_data))
+        def add_file(name, data):
+            ti = tarfile.TarInfo(name=name)
+            ti.size = len(data)
+            tar.addfile(ti, io.BytesIO(data))
+            
+        add_file("readme.txt", b"Welcome to EOS Kernel!\r\nThis file is read from TarFS.\r\n")
+        if user_elf_data: add_file("user_app.elf", user_elf_data)
 
-        if user_elf_data:
-            ti3 = tarfile.TarInfo(name="user_app.elf")
-            ti3.size = len(user_elf_data)
-            tar.addfile(ti3, io.BytesIO(user_elf_data))
-
-        # حزم خطوط SF Pro المتاحة في C:\EOS_SHARE\fonts لضمان وصول الـ VFS إليها
         font_paths = [
             r"C:\EOS_SHARE\fonts\SFPRODISPLAYREGULAR.OTF",
             r"C:\EOS_SHARE\fonts\SFPRODISPLAYMEDIUM.OTF",
@@ -83,184 +72,111 @@ def create_demo_tar(user_elf_data):
         for fp in font_paths:
             if os.path.exists(fp):
                 fname = os.path.basename(fp)
-                with open(fp, "rb") as ff:
-                    fb = ff.read()
-                t1 = tarfile.TarInfo(name=fname)
-                t1.size = len(fb)
-                tar.addfile(t1, io.BytesIO(fb))
-                t2 = tarfile.TarInfo(name="fonts/" + fname)
-                t2.size = len(fb)
-                tar.addfile(t2, io.BytesIO(fb))
+                with open(fp, "rb") as ff: fb = ff.read()
+                add_file(fname, fb)
+                add_file("fonts/" + fname, fb)
+                
+        # Sample Image for Preview App
+        png_magic = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDAT\x08\x1d\x01\x05\x00\xfa\xff\x89P\x4E\x47\x00\x00\x00\x00IEND\xaeB`\x82"
+        add_file("sample.png", png_magic)
 
     return buf.getvalue()
 
 def make_uefi_fat32_disk(img_path, files):
-    SECTOR_SIZE = 512
-    SECTORS_PER_CLUSTER = 1
-    CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE
-    RESERVED_SECTORS = 32
-    NUM_FATS = 2
-    PART_START_SECTOR = 2048
-    PART_SECTORS = 262144
-    TOTAL_SECTORS = PART_START_SECTOR + PART_SECTORS
-    FAT_SIZE_SECTORS = 2048
-    ROOT_CLUSTER = 2
-
+    SECTOR_SIZE = 512; SECTORS_PER_CLUSTER = 1; CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE
+    RESERVED_SECTORS = 32; NUM_FATS = 2; PART_START_SECTOR = 2048; PART_SECTORS = 262144
+    TOTAL_SECTORS = PART_START_SECTOR + PART_SECTORS; FAT_SIZE_SECTORS = 2048; ROOT_CLUSTER = 2
     disk = bytearray(TOTAL_SECTORS * SECTOR_SIZE)
-    disk[510:512] = b"\x55\xAA"
-    disk[446:462] = struct.pack("<BBBBBBBBII", 0x80, 0x00, 0x02, 0x00, 0xEF, 0xFF, 0xFF, 0xFF, PART_START_SECTOR, PART_SECTORS)
+    disk[510:512] = b"\x55\xAA"; disk[446:462] = struct.pack("<BBBBBBBBII", 0x80, 0x00, 0x02, 0x00, 0xEF, 0xFF, 0xFF, 0xFF, PART_START_SECTOR, PART_SECTORS)
 
     vbr_offset = PART_START_SECTOR * SECTOR_SIZE
     vbr = bytearray(SECTOR_SIZE)
-    vbr[0:3] = b"\xEB\x58\x90"
-    vbr[3:11] = b"MSWIN4.1"
+    vbr[0:3] = b"\xEB\x58\x90"; vbr[3:11] = b"MSWIN4.1"
     struct.pack_into("<H", vbr, 11, SECTOR_SIZE)
-    vbr[13] = SECTORS_PER_CLUSTER
-    struct.pack_into("<H", vbr, 14, RESERVED_SECTORS)
-    vbr[16] = NUM_FATS
-    vbr[21] = 0xF8
-    struct.pack_into("<H", vbr, 24, 63)
-    struct.pack_into("<H", vbr, 26, 255)
-    struct.pack_into("<I", vbr, 28, PART_START_SECTOR)
-    struct.pack_into("<I", vbr, 32, PART_SECTORS)
-    struct.pack_into("<I", vbr, 36, FAT_SIZE_SECTORS)
-    struct.pack_into("<I", vbr, 44, ROOT_CLUSTER)
-    struct.pack_into("<H", vbr, 48, 1)
-    struct.pack_into("<H", vbr, 50, 6)
-    vbr[64] = 0x80
-    vbr[66] = 0x29
-    struct.pack_into("<I", vbr, 67, 0x12345678)
-    vbr[71:82] = b"EOS_BOOT   "
-    vbr[82:90] = b"FAT32   "
-    vbr[510:512] = b"\x55\xAA"
-
-    disk[vbr_offset : vbr_offset + SECTOR_SIZE] = vbr
-    disk[vbr_offset + (6 * SECTOR_SIZE) : vbr_offset + (7 * SECTOR_SIZE)] = vbr
-
-    fat1_offset = vbr_offset + (RESERVED_SECTORS * SECTOR_SIZE)
-    data_start = fat1_offset + (NUM_FATS * FAT_SIZE_SECTORS * SECTOR_SIZE)
+    vbr[13] = SECTORS_PER_CLUSTER; struct.pack_into("<H", vbr, 14, RESERVED_SECTORS)
+    vbr[16] = NUM_FATS; vbr[21] = 0xF8; struct.pack_into("<H", vbr, 24, 63); struct.pack_into("<H", vbr, 26, 255)
+    struct.pack_into("<I", vbr, 28, PART_START_SECTOR); struct.pack_into("<I", vbr, 32, PART_SECTORS); struct.pack_into("<I", vbr, 36, FAT_SIZE_SECTORS)
+    struct.pack_into("<I", vbr, 44, ROOT_CLUSTER); struct.pack_into("<H", vbr, 48, 1); struct.pack_into("<H", vbr, 50, 6)
+    vbr[64] = 0x80; vbr[66] = 0x29; struct.pack_into("<I", vbr, 67, 0x12345678)
+    vbr[71:82] = b"EOS_BOOT   "; vbr[82:90] = b"FAT32   "; vbr[510:512] = b"\x55\xAA"
+    disk[vbr_offset : vbr_offset + SECTOR_SIZE] = vbr; disk[vbr_offset + (6 * SECTOR_SIZE) : vbr_offset + (7 * SECTOR_SIZE)] = vbr
+    fat1_offset = vbr_offset + (RESERVED_SECTORS * SECTOR_SIZE); data_start = fat1_offset + (NUM_FATS * FAT_SIZE_SECTORS * SECTOR_SIZE)
 
     def set_fat(cluster, val):
-        off = fat1_offset + (cluster * 4)
-        struct.pack_into("<I", disk, off, val & 0x0FFFFFFF)
+        struct.pack_into("<I", disk, fat1_offset + (cluster * 4), val & 0x0FFFFFFF)
 
-    set_fat(0, 0x0FFFFFF8)
-    set_fat(1, 0x0FFFFFFF)
-    set_fat(ROOT_CLUSTER, 0x0FFFFFFF)
+    set_fat(0, 0x0FFFFFF8); set_fat(1, 0x0FFFFFFF); set_fat(ROOT_CLUSTER, 0x0FFFFFFF)
     current_cluster = 3
 
     def allocate_clusters(num_clusters):
         nonlocal current_cluster
         start = current_cluster
-        for i in range(num_clusters):
-            c = start + i
-            nxt = 0x0FFFFFFF if i == num_clusters - 1 else c + 1
-            set_fat(c, nxt)
+        for i in range(num_clusters): set_fat(start + i, 0x0FFFFFFF if i == num_clusters - 1 else start + i + 1)
         current_cluster += num_clusters
         return start
 
     def write_data(data):
-        if len(data) == 0:
-            return 0
+        if len(data) == 0: return 0
         needed = (len(data) + CLUSTER_SIZE - 1) // CLUSTER_SIZE
         start_c = allocate_clusters(needed)
         for i in range(needed):
-            c = start_c + i
-            c_offset = data_start + ((c - 2) * CLUSTER_SIZE)
+            c_offset = data_start + ((start_c + i - 2) * CLUSTER_SIZE)
             chunk = data[i * CLUSTER_SIZE : (i + 1) * CLUSTER_SIZE]
             disk[c_offset : c_offset + len(chunk)] = chunk
         return start_c
 
     def make_entry(short_name, attr, cluster, size):
-        entry = bytearray(32)
-        entry[0:11] = short_name.encode("ascii")
-        entry[11] = attr
-        struct.pack_into("<H", entry, 20, (cluster >> 16) & 0xFFFF)
-        struct.pack_into("<H", entry, 26, cluster & 0xFFFF)
+        entry = bytearray(32); entry[0:11] = short_name.encode("ascii"); entry[11] = attr
+        struct.pack_into("<H", entry, 20, (cluster >> 16) & 0xFFFF); struct.pack_into("<H", entry, 26, cluster & 0xFFFF)
         struct.pack_into("<I", entry, 28, size)
         return entry
 
-    bootx64_cluster = write_data(files["BOOTX64.EFI"])
-    conf_cluster = write_data(files["limine.conf"])
-    k_cluster = write_data(files["EOS"])
-    tar_cluster = write_data(files["initrd.tar"])
-
-    boot_dir_cluster = allocate_clusters(1)
-    efi_dir_cluster = allocate_clusters(1)
-
-    chk_conf = lfn_checksum(b"LIMINE  CFG")
-    lfn_conf = make_lfn_entry(1, "limine.conf", chk_conf, is_last=True)
+    bootx64_cluster = write_data(files["BOOTX64.EFI"]); conf_cluster = write_data(files["limine.conf"])
+    k_cluster = write_data(files["EOS"]); tar_cluster = write_data(files["initrd.tar"])
+    boot_dir_cluster = allocate_clusters(1); efi_dir_cluster = allocate_clusters(1)
+    
+    lfn_conf = make_lfn_entry(1, "limine.conf", lfn_checksum(b"LIMINE  CFG"), is_last=True)
     short_conf_entry = make_entry("LIMINE  CFG", 0x20, conf_cluster, len(files["limine.conf"]))
 
     boot_dir = bytearray(CLUSTER_SIZE)
-    b_entries = [
-        make_entry(".          ", 0x10, boot_dir_cluster, 0),
-        make_entry("..         ", 0x10, efi_dir_cluster, 0),
-        make_entry("BOOTX64 EFI", 0x20, bootx64_cluster, len(files["BOOTX64.EFI"])),
-        lfn_conf,
-        short_conf_entry
-    ]
-    for i, ent in enumerate(b_entries):
+    for i, ent in enumerate([make_entry(".          ", 0x10, boot_dir_cluster, 0), make_entry("..         ", 0x10, efi_dir_cluster, 0), make_entry("BOOTX64 EFI", 0x20, bootx64_cluster, len(files["BOOTX64.EFI"])), lfn_conf, short_conf_entry]):
         boot_dir[i * 32 : (i + 1) * 32] = ent
-    c_off_boot = data_start + ((boot_dir_cluster - 2) * CLUSTER_SIZE)
-    disk[c_off_boot : c_off_boot + CLUSTER_SIZE] = boot_dir
+    disk[data_start + ((boot_dir_cluster - 2) * CLUSTER_SIZE) : data_start + ((boot_dir_cluster - 1) * CLUSTER_SIZE)] = boot_dir
 
     efi_dir = bytearray(CLUSTER_SIZE)
-    e_entries = [
-        make_entry(".          ", 0x10, efi_dir_cluster, 0),
-        make_entry("..         ", 0x10, ROOT_CLUSTER, 0),
-        make_entry("BOOT       ", 0x10, boot_dir_cluster, 0)
-    ]
-    for i, ent in enumerate(e_entries):
+    for i, ent in enumerate([make_entry(".          ", 0x10, efi_dir_cluster, 0), make_entry("..         ", 0x10, ROOT_CLUSTER, 0), make_entry("BOOT       ", 0x10, boot_dir_cluster, 0)]):
         efi_dir[i * 32 : (i + 1) * 32] = ent
-    c_off_efi = data_start + ((efi_dir_cluster - 2) * CLUSTER_SIZE)
-    disk[c_off_efi : c_off_efi + CLUSTER_SIZE] = efi_dir
+    disk[data_start + ((efi_dir_cluster - 2) * CLUSTER_SIZE) : data_start + ((efi_dir_cluster - 1) * CLUSTER_SIZE)] = efi_dir
 
     root_dir = bytearray(CLUSTER_SIZE)
-    root_entries = [
-        make_entry("EFI        ", 0x10, efi_dir_cluster, 0),
-        make_entry("EOS        ", 0x20, k_cluster, len(files["EOS"])),
-        make_entry("INITRD  TAR", 0x20, tar_cluster, len(files["initrd.tar"])),
-        lfn_conf,
-        short_conf_entry
-    ]
-    for i, ent in enumerate(root_entries):
+    for i, ent in enumerate([make_entry("EFI        ", 0x10, efi_dir_cluster, 0), make_entry("EOS        ", 0x20, k_cluster, len(files["EOS"])), make_entry("INITRD  TAR", 0x20, tar_cluster, len(files["initrd.tar"])), lfn_conf, short_conf_entry]):
         root_dir[i * 32 : (i + 1) * 32] = ent
-    c_off_root = data_start + ((ROOT_CLUSTER - 2) * CLUSTER_SIZE)
-    disk[c_off_root : c_off_root + CLUSTER_SIZE] = root_dir
+    disk[data_start + ((ROOT_CLUSTER - 2) * CLUSTER_SIZE) : data_start + ((ROOT_CLUSTER - 1) * CLUSTER_SIZE)] = root_dir
 
     fat2_offset = fat1_offset + (FAT_SIZE_SECTORS * SECTOR_SIZE)
     disk[fat2_offset : fat2_offset + (FAT_SIZE_SECTORS * SECTOR_SIZE)] = disk[fat1_offset : fat1_offset + (FAT_SIZE_SECTORS * SECTOR_SIZE)]
-
-    with open(img_path, "wb") as f:
-        f.write(disk)
+    with open(img_path, "wb") as f: f.write(disk)
 
 def make_ext2_disk(img_path):
-    if os.path.exists(img_path) and os.path.getsize(img_path) > 0: return
-    with open(img_path, "wb") as f: f.truncate(10 * 1024 * 1024)
+    if not os.path.exists(img_path):
+        with open(img_path, "wb") as f: f.truncate(10 * 1024 * 1024)
 
 def prepare_and_run():
     share_dir = r"C:\EOS_SHARE"
-    os.makedirs(share_dir, exist_ok=True)
-    os.makedirs(os.path.join(share_dir, "fonts"), exist_ok=True)
+    os.makedirs(share_dir, exist_ok=True); os.makedirs(os.path.join(share_dir, "fonts"), exist_ok=True)
 
     print("[*] Building Userspace App...")
     user_elf = build_userspace_app()
     if not user_elf:
         print("\n[!] ❌ ABORTING: user_app.elf could not be built successfully.")
-        print("[!] Fix the Cargo build errors shown above and re-run.\n")
         return
 
     print("[*] Building EOS Kernel (Release, LTO)...")
-    env = os.environ.copy()
-    env.pop("RUSTFLAGS", None)
+    env = os.environ.copy(); env.pop("RUSTFLAGS", None)
     res = subprocess.run([CARGO_BIN, "build", "--release", "-Z", "build-std=core,alloc"], shell=True, env=env)
-    if res.returncode != 0: 
-        print("[!] Kernel build failed.")
-        return
+    if res.returncode != 0: return
 
-    target_dir = "target"
-    os.makedirs(target_dir, exist_ok=True)
+    target_dir = "target"; os.makedirs(target_dir, exist_ok=True)
     kernel_src = os.path.join(target_dir, "x86_64-unknown-none", "release", "EOS")
     bootx64_path = os.path.join(target_dir, "BOOTX64.EFI")
 
@@ -274,17 +190,9 @@ def prepare_and_run():
 
     tar_data = create_demo_tar(user_elf)
     img_path = os.path.join(target_dir, "uefi_hdd.img")
+    make_uefi_fat32_disk(img_path, { "EOS": kernel_data, "limine.conf": conf_data, "BOOTX64.EFI": bootx64_data, "initrd.tar": tar_data })
     
-    print("[*] Generating Compliant UEFI ESP Boot Disk with LFN limine.conf...")
-    make_uefi_fat32_disk(img_path, {
-        "EOS": kernel_data,
-        "limine.conf": conf_data,
-        "BOOTX64.EFI": bootx64_data,
-        "initrd.tar": tar_data
-    })
-    
-    ext2_img_path = os.path.join(target_dir, "rootfs.ext2")
-    make_ext2_disk(ext2_img_path)
+    ext2_img_path = os.path.join(target_dir, "rootfs.ext2"); make_ext2_disk(ext2_img_path)
 
     qemu_share = os.path.join(os.path.dirname(QEMU_EXE), "share")
     if not os.path.exists(qemu_share): qemu_share = r"C:\Program Files\qemu\share"
@@ -293,20 +201,17 @@ def prepare_and_run():
     with open(vars_dst, "wb") as f: f.write(b"\x00" * (128 * 1024))
 
     print("[*] Starting Gamepad Bridge Server...")
-    bridge_proc = subprocess.Popen([sys.executable, "gamepad_bridge.py"])
-    time.sleep(0.3)
+    bridge_proc = subprocess.Popen([sys.executable, "gamepad_bridge.py"]); time.sleep(0.3)
 
     qemu_cmd = [
         QEMU_EXE, "-M", "q35", "-m", "8192M", "-smp", "8",
-        "-drive", f"if=pflash,format=raw,readonly=on,file={code_fd}",
-        "-drive", f"if=pflash,format=raw,file={vars_dst}",
+        "-drive", f"if=pflash,format=raw,readonly=on,file={code_fd}", "-drive", f"if=pflash,format=raw,file={vars_dst}",
         "-device", "piix3-ide,id=ide",
         "-drive", f"id=disk0,file={img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=0,drive=disk0",
         "-drive", f"file=fat:rw:{share_dir},format=raw,if=none,id=disk1", "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
         "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",
         "-netdev", "user,id=n0,hostfwd=udp::68-:68", "-device", "e1000,netdev=n0",
-        "-serial", "stdio",
-        "-d", "cpu_reset,guest_errors", "-no-reboot", "-no-shutdown"
+        "-serial", "stdio", "-d", "cpu_reset,guest_errors", "-no-reboot", "-no-shutdown"
     ]
     try: subprocess.run(qemu_cmd)
     finally: bridge_proc.terminate()

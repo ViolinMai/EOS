@@ -51,7 +51,7 @@ pub struct FinderApp {
 
 impl FinderApp {
     pub fn new() -> Self {
-        let items = crate::fs::vfs_list_dir("EOS SHARE").unwrap_or_default();
+        let items = crate::fs::list_directory_contents("EOS SHARE", 0);
         let initial_sel = if !items.is_empty() { Some(0) } else { None };
         Self {
             current_folder: String::from("EOS SHARE"),
@@ -75,7 +75,7 @@ impl FinderApp {
         self.current_folder = String::from(loc);
         self.path_stack.clear();
         self.current_cluster = 0;
-        self.items = crate::fs::vfs_list_dir(loc).unwrap_or_default();
+        self.items = crate::fs::list_directory_contents(loc, 0);
         self.selected_idx = if !self.items.is_empty() { Some(0) } else { None };
         self.scroll_offset = 0;
         self.status = alloc::format!("Location: /{} ({} items)", loc, self.items.len());
@@ -87,13 +87,13 @@ impl FinderApp {
             if let Some((prev_name, prev_cluster)) = self.path_stack.pop() {
                 self.current_cluster = prev_cluster;
                 let full_folder = if self.path_stack.is_empty() { self.current_folder.clone() } else { alloc::format!("{}/{}", self.current_folder, prev_name) };
-                self.items = crate::fs::vfs_list_dir(&full_folder).unwrap_or_default();
+                self.items = crate::fs::list_directory_contents(&full_folder, self.current_cluster);
             } else { self.open_root_location(&self.current_folder.clone()); }
         } else {
             self.path_stack.push((String::from(name), self.current_cluster));
             self.current_cluster = cluster;
             let full_folder = alloc::format!("{}/{}", self.current_folder, name);
-            self.items = crate::fs::vfs_list_dir(&full_folder).unwrap_or_default();
+            self.items = crate::fs::list_directory_contents(&full_folder, cluster);
         }
         self.selected_idx = if !self.items.is_empty() { Some(0) } else { None };
         self.scroll_offset = 0;
@@ -139,6 +139,31 @@ impl FinderApp {
                     self.pending_action = Some(AppAction::LaunchElf { name, arg: String::new() });
                 } else {
                     self.status = alloc::format!("File '{}' ({} B)", name, size);
+                    self.needs_redraw = true;
+                }
+            }
+        }
+    }
+
+    fn create_new_file(&mut self) {
+        let count = self.items.len();
+        let fname = alloc::format!("NewFile_{}.txt", count + 1);
+        if crate::fs::vfs_save_text_file(&fname, b"Created by EOS Finder\n").is_ok() {
+            self.status = alloc::format!("Created '{}'", fname);
+            self.items = crate::fs::list_directory_contents(&self.current_folder, self.current_cluster);
+            self.needs_redraw = true;
+        }
+    }
+
+    fn delete_selected(&mut self) {
+        if let Some(idx) = self.selected_idx {
+            let filtered = self.get_filtered_items();
+            if idx < filtered.len() {
+                if let FsItem::File(fname, _, _) = &filtered[idx] {
+                    let _ = crate::fs::vfs_save_text_file(fname.as_str(), &[]);
+                    self.status = alloc::format!("Deleted '{}'", fname);
+                    self.items = crate::fs::list_directory_contents(&self.current_folder, self.current_cluster);
+                    self.selected_idx = None;
                     self.needs_redraw = true;
                 }
             }
@@ -218,7 +243,7 @@ impl App for FinderApp {
                     draw::draw_text(fb, col3, cur_y + 10, "Folder", sub_col, 1);
                 }
                 FsItem::File(fname, sz, mtype) => {
-                    let prefix = if fname.ends_with(".elf") { "⚙️ " } else if fname.ends_with(".png") || fname.ends_with(".jpg") || fname.ends_with(".jpeg") { "🖼 " } else { "📄 " };
+                    let prefix = if fname.ends_with(".elf") { "⚙️ " } else if fname.ends_with(".png") || fname.ends_with(".jpg") { "🖼 " } else { "📄 " };
                     draw::draw_text_clipped(fb, col1, cur_y + 10, col2 - col1 - 10, &alloc::format!("{}{}", prefix, fname), text_col, 1);
                     draw::draw_text(fb, col2, cur_y + 10, &alloc::format!("{} B", sz), sub_col, 1);
                     let type_str = match mtype { crate::drivers::ata::MediaType::Executable => "Binary", crate::drivers::ata::MediaType::Image => "Image", _ => "File" };

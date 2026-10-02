@@ -15,14 +15,17 @@ fn main() {
 
     let font_bytes = fs::read("/EOS SHARE/fonts/SFPRODISPLAYREGULAR.OTF")
         .or_else(|_| fs::read("/RootFS/fonts/SFPRODISPLAYREGULAR.OTF"))
-        .or_else(|_| fs::read("SFPRODISPLAYREGULAR.OTF"))
         .unwrap_or_default();
 
     let mut app = FrameworkApp::new(&font_bytes, SCREEN_W, SCREEN_H);
 
-    // تسجيل التطبيقات لفتحها فقط عبر النقر على الدوك دون تشغيل تلقائي
+    app.add_widget(Box::new(WindowFrame::new("Finder", 120, 70, 760, 480, Box::new(FinderApp::new()))));
+    app.add_widget(Box::new(WindowFrame::new("Terminal", 200, 140, 640, 420, Box::new(TerminalApp::new()))));
+    app.add_widget(Box::new(WindowFrame::new("TextEdit", 280, 210, 600, 400, Box::new(TextEditApp::new()))));
+    app.add_widget(Box::new(WindowFrame::new("Preview", 320, 100, 500, 400, Box::new(PreviewApp::new("/sample.png")))));
+
     app.set_dock_handler(|idx| {
-        // يتم التعامل مع فتح النوافذ تفاعلياً داخل حلقة التشغيل
+        println!("Dock clicked: {}", idx);
     });
 
     app.run_loop();

@@ -11,7 +11,11 @@ use core::sync::atomic::{AtomicBool, Ordering};
 pub const TASK_STACK_SIZE: usize = 16 * 1024;
 
 #[derive(Clone, Debug)]
-pub enum FileSource { Memory(Vec<u8>), AtaDisk { drive: u8, first_cluster: u32, size: usize } }
+pub enum FileSource {
+    Memory(Vec<u8>),
+    AtaDisk { drive: u8, first_cluster: u32, size: usize },
+    Directory(Vec<crate::fs::FsItem>, usize),
+}
 
 #[derive(Clone)]
 pub struct FileDescriptor { pub path: String, pub source: FileSource, pub offset: usize }
