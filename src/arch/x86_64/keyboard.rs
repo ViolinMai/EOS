@@ -1,6 +1,6 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, Ordering};
-use crate::input::{push_event, InputEvent, NavAction, MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_CAPS};
+use crate::input::{push_event, InputEvent, NavAction, MOD_SHIFT, MOD_CTRL, MOD_ALT, MOD_CAPS, MOD_WIN};
 
 const KEYBOARD_PORT: u16 = 0x60;
 
@@ -8,23 +8,21 @@ static SHIFT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CTRL_ACTIVE: AtomicBool = AtomicBool::new(false);
 static ALT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static CAPS_ACTIVE: AtomicBool = AtomicBool::new(false);
+static WIN_ACTIVE: AtomicBool = AtomicBool::new(false);
 static EXTENDED_PREFIX: AtomicBool = AtomicBool::new(false);
 
-pub fn clear_keyboard_buffer() { }
+pub fn clear_keyboard_buffer() {}
 
 #[inline]
 unsafe fn inb(port: u16) -> u8 {
     let val: u8;
-    unsafe {
-        asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags));
-    }
+    unsafe { asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags)); }
     val
 }
 
 pub unsafe fn read_scancode() -> Option<u8> {
     unsafe {
         let status = inb(0x64);
-        // التأكد من أن البايت جاهز وينتمي للكيبورد (Bit 5 == 0) لمنع ابتلاع بايتات الماوس
         if (status & 0x01) != 0 && (status & 0x20) == 0 {
             Some(inb(KEYBOARD_PORT))
         } else {
@@ -39,6 +37,7 @@ fn get_current_mods() -> u8 {
     if CTRL_ACTIVE.load(Ordering::Relaxed) { m |= MOD_CTRL; }
     if ALT_ACTIVE.load(Ordering::Relaxed) { m |= MOD_ALT; }
     if CAPS_ACTIVE.load(Ordering::Relaxed) { m |= MOD_CAPS; }
+    if WIN_ACTIVE.load(Ordering::Relaxed) { m |= MOD_WIN; }
     m
 }
 
@@ -57,6 +56,7 @@ pub fn handle_scancode(scancode: u8) {
             0x2A | 0x36 => { SHIFT_ACTIVE.store(false, Ordering::Relaxed); }
             0x1D => { CTRL_ACTIVE.store(false, Ordering::Relaxed); }
             0x38 => { ALT_ACTIVE.store(false, Ordering::Relaxed); }
+            0x5B | 0x5C => { WIN_ACTIVE.store(false, Ordering::Relaxed); }
             _ => {}
         }
         push_event(InputEvent::KeyUp { keycode: code });
@@ -71,6 +71,7 @@ pub fn handle_scancode(scancode: u8) {
             0x4D => { push_event(InputEvent::Nav(NavAction::Right)); push_event(InputEvent::KeyDown { keycode: 0x4D, mods: get_current_mods() }); }
             0x1D => { CTRL_ACTIVE.store(true, Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: 0x1D, mods: get_current_mods() }); }
             0x38 => { ALT_ACTIVE.store(true, Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: 0x38, mods: get_current_mods() }); }
+            0x5B | 0x5C => { WIN_ACTIVE.store(true, Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); }
             _ => { push_event(InputEvent::KeyDown { keycode: code | 0x80, mods: get_current_mods() }); }
         }
         return;
@@ -88,7 +89,6 @@ pub fn handle_scancode(scancode: u8) {
             push_event(InputEvent::Char('\n')); 
             return; 
         }
-        0x0F => { push_event(InputEvent::Nav(NavAction::Right)); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; }
         _ => {}
     }
 

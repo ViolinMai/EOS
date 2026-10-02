@@ -1,6 +1,6 @@
 use alloc::collections::BTreeMap;
-use alloc::vec;
 use alloc::vec::Vec;
+use alloc::vec;
 use core::ptr::addr_of_mut;
 use crate::gui::draw::{FrameBuffer, blend_color};
 
@@ -17,6 +17,10 @@ pub struct GlyphCacheEntry {
     pub coverage: Vec<u8>,
 }
 
+pub enum FontWeight {
+    Regular, Medium, Bold, Heavy
+}
+
 pub struct FontManager {
     glyph_cache: BTreeMap<(usize, char), GlyphCacheEntry>,
 }
@@ -30,25 +34,11 @@ impl FontManager {
         }
     }
 
-    pub fn char_advance(&mut self, c: char, size_px: usize) -> usize {
-        self.get_glyph(size_px, c).advance
-    }
-
-    pub fn measure_text(&mut self, text: &str, size_px: usize) -> usize {
-        let mut width = 0;
-        for c in text.chars() {
-            if c == '\n' || c == '\r' { continue; }
-            width += self.char_advance(c, size_px);
-        }
-        width
-    }
-
-    pub fn rasterize_glyph(&self, c: char, size: usize) -> GlyphCacheEntry {
-        let scale = (size.max(8)) / 8;
+    pub fn rasterize_glyph(&mut self, c: char, size_px: usize) -> GlyphCacheEntry {
+        let scale = (size_px.max(8)) / 8;
         let w = FONT_WIDTH * scale;
         let h = FONT_HEIGHT * scale;
-        let target_h = h;
-        let mut coverage = vec![0u8; w * target_h];
+        let mut coverage = vec![0u8; w * h];
         let raw = get_glyph(c);
 
         for gy in 0..16 {
@@ -59,7 +49,7 @@ impl FontManager {
                         for dx in 0..scale {
                             let px = gx * scale + dx;
                             let py = gy * scale + dy;
-                            if px < w && py < target_h {
+                            if px < w && py < h {
                                 coverage[py * w + px] = 255;
                             }
                         }
@@ -68,23 +58,15 @@ impl FontManager {
             }
         }
 
-        // Multi-Directional Gaussian-Style Anti-Aliasing (Fixed-Point Math)
         let mut smooth_cov = coverage.clone();
-        for y in 1..target_h.saturating_sub(1) {
+        for y in 1..h.saturating_sub(1) {
             for x in 1..w.saturating_sub(1) {
                 if coverage[y * w + x] == 0 {
                     let mut sum: u32 = 0;
-                    // Orthogonal pixels (weight 2)
                     sum += (coverage[(y - 1) * w + x] as u32) * 2;
                     sum += (coverage[(y + 1) * w + x] as u32) * 2;
                     sum += (coverage[y * w + (x - 1)] as u32) * 2;
                     sum += (coverage[y * w + (x + 1)] as u32) * 2;
-                    // Diagonal pixels (weight 1)
-                    sum += coverage[(y - 1) * w + (x - 1)] as u32;
-                    sum += coverage[(y - 1) * w + (x + 1)] as u32;
-                    sum += coverage[(y + 1) * w + (x - 1)] as u32;
-                    sum += coverage[(y + 1) * w + (x + 1)] as u32;
-
                     let avg = (sum / 12) as u8;
                     if avg > 8 {
                         smooth_cov[y * w + x] = avg;
@@ -93,7 +75,6 @@ impl FontManager {
             }
         }
 
-        // Proportional character widths
         let char_w = match c {
             ' ' => (w * 5) / 8,
             'i' | 'l' | '!' | '|' | ':' | ';' | '.' | '\'' | '`' => (w * 4) / 8 + 2,
@@ -105,7 +86,7 @@ impl FontManager {
 
         GlyphCacheEntry {
             width: w,
-            height: target_h,
+            height: h,
             bearing_x: 0,
             bearing_y: 0,
             advance: char_w,
@@ -116,34 +97,35 @@ impl FontManager {
     pub fn get_glyph(&mut self, size: usize, c: char) -> &GlyphCacheEntry {
         let key = (size, c);
         if !self.glyph_cache.contains_key(&key) {
+            if self.glyph_cache.len() > 4096 { self.glyph_cache.clear(); }
             let entry = self.rasterize_glyph(c, size);
             self.glyph_cache.insert(key, entry);
         }
         self.glyph_cache.get(&key).unwrap()
     }
 
-    pub fn draw_text_aa(&mut self, fb: &mut FrameBuffer, x: usize, y: usize, text: &str, color: u32, size_idx: usize) {
-        let base_sz = if size_idx == 2 { 24 } else if size_idx == 3 { 36 } else { 16 };
-        let ui_scale = crate::config::CONFIG.get_ui_scale();
-        let size = (base_sz * (ui_scale + 1)) / 3;
+    pub fn measure_text(&mut self, text: &str, size_px: usize) -> usize {
+        let mut width = 0;
+        for c in text.chars() {
+            if c != '\n' && c != '\r' {
+                width += self.get_glyph(size_px, c).advance;
+            }
+        }
+        width
+    }
+
+    pub fn draw_text_aa(&mut self, fb: &mut FrameBuffer, x: usize, y: usize, text: &str, color: u32, size_px: usize, _weight: FontWeight) {
         let mut cur_x = x;
         let mut cur_y = y;
-        let line_height = size + 6;
+        let line_height = (size_px * 5) / 4;
 
         for c in text.chars() {
-            if c == '\n' {
-                cur_x = x;
-                cur_y += line_height;
-                continue;
-            }
-            if c == '\r' {
-                cur_x = x;
-                continue;
-            }
+            if c == '\n' { cur_x = x; cur_y += line_height; continue; }
+            if c == '\r' { cur_x = x; continue; }
 
-            let glyph = self.get_glyph(size, c).clone();
+            let glyph = self.get_glyph(size_px, c).clone();
             let gx = (cur_x as isize + glyph.bearing_x).max(0) as usize;
-            let gy = cur_y;
+            let gy = (cur_y as isize + glyph.bearing_y).max(0) as usize;
 
             for r in 0..glyph.height {
                 let py = gy + r;
@@ -165,45 +147,32 @@ impl FontManager {
         }
     }
 
-    pub fn draw_text_wrapped(&mut self, fb: &mut FrameBuffer, x: usize, y: usize, max_width: usize, text: &str, color: u32, size_idx: usize) {
-        let base_sz = if size_idx == 2 { 24 } else if size_idx == 3 { 36 } else { 16 };
-        let ui_scale = crate::config::CONFIG.get_ui_scale();
-        let size = (base_sz * (ui_scale + 1)) / 3;
+    pub fn draw_text_clipped(&mut self, fb: &mut FrameBuffer, x: usize, y: usize, max_w: usize, text: &str, color: u32, size_px: usize, _weight: FontWeight) {
         let mut cur_x = x;
-        let mut cur_y = y;
-        let line_height = size + 6;
-
-        for word in text.split(' ') {
-            let word_w = self.measure_text(word, size);
-            if cur_x + word_w > x + max_width && cur_x > x {
-                cur_x = x;
-                cur_y += line_height;
-            }
-
-            for c in word.chars() {
-                let glyph = self.get_glyph(size, c).clone();
-                let gx = cur_x;
-                let gy = cur_y;
-
-                for r in 0..glyph.height {
-                    let py = gy + r;
-                    if py >= fb.height { break; }
-                    for col in 0..glyph.width {
-                        let px = gx + col;
-                        if px >= fb.width { break; }
-                        let idx = r * glyph.width + col;
-                        if idx < glyph.coverage.len() {
-                            let alpha = glyph.coverage[idx] as u32;
-                            if alpha > 0 {
-                                let fb_idx = py * fb.pitch_pixels + px;
-                                fb.pixels[fb_idx] = blend_color(fb.pixels[fb_idx], color, alpha);
-                            }
+        let cur_y = y;
+        for c in text.chars() {
+            if c == '\n' || c == '\r' { continue; }
+            let glyph = self.get_glyph(size_px, c).clone();
+            if cur_x + glyph.advance > x + max_w { break; }
+            let gx = (cur_x as isize + glyph.bearing_x).max(0) as usize;
+            let gy = (cur_y as isize + glyph.bearing_y).max(0) as usize;
+            for r in 0..glyph.height {
+                let py = gy + r;
+                if py >= fb.height { break; }
+                for col in 0..glyph.width {
+                    let px = gx + col;
+                    if px >= fb.width || px >= x + max_w { break; }
+                    let idx = r * glyph.width + col;
+                    if idx < glyph.coverage.len() {
+                        let alpha = glyph.coverage[idx] as u32;
+                        if alpha > 0 {
+                            let fb_idx = py * fb.pitch_pixels + px;
+                            fb.pixels[fb_idx] = blend_color(fb.pixels[fb_idx], color, alpha);
                         }
                     }
                 }
-                cur_x += glyph.advance;
             }
-            cur_x += self.char_advance(' ', size);
+            cur_x += glyph.advance;
         }
     }
 }
@@ -280,12 +249,6 @@ pub fn get_glyph(c: char) -> [u8; 16] {
         'X' => [0x00, 0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'Y' => [0x00, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'Z' => [0x00, 0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '[' => [0x00, 0x3C, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '\\' => [0x00, 0x40, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        ']' => [0x00, 0x3C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '^' => [0x00, 0x18, 0x3C, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '_' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '`' => [0x00, 0x18, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'a' => [0x00, 0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'b' => [0x00, 0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'c' => [0x00, 0x00, 0x00, 0x3C, 0x66, 0x60, 0x66, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
@@ -312,13 +275,6 @@ pub fn get_glyph(c: char) -> [u8; 16] {
         'x' => [0x00, 0x00, 0x00, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'y' => [0x00, 0x00, 0x00, 0x66, 0x66, 0x66, 0x3E, 0x06, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'z' => [0x00, 0x00, 0x00, 0x7E, 0x0C, 0x18, 0x30, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '{' => [0x00, 0x0E, 0x18, 0x18, 0x70, 0x18, 0x18, 0x0E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '|' => [0x00, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '}' => [0x00, 0x70, 0x18, 0x18, 0x0E, 0x18, 0x18, 0x70, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '~' => [0x00, 0x3B, 0x6E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '،' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x18, 0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '؛' => [0x00, 0x00, 0x18, 0x18, 0x00, 0x00, 0x18, 0x18, 0x08, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '؟' => [0x00, 0x3C, 0x66, 0x30, 0x18, 0x18, 0x00, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         _   => [0x00, 0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
     }
 }

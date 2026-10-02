@@ -56,6 +56,10 @@ impl KernelConfig {
         let dark_str = if self.is_dark_mode() { "true" } else { "false" };
         let scale = self.get_ui_scale();
         let config_str = alloc::format!("dark_mode={}\nui_scale={}\n", dark_str, scale);
-        let _ = crate::fs::vfs_save_text_file("settings.ini", config_str.as_bytes());
+        if let Err(e) = crate::fs::vfs_save_text_file("settings.ini", config_str.as_bytes()) {
+            crate::log_error!("CONFIG", "Failed to save settings: {}", e);
+        } else {
+            crate::log_info!("CONFIG", "Settings persisted successfully.");
+        }
     }
 }

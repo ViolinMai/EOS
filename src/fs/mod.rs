@@ -20,13 +20,13 @@ pub fn list_directory_contents(folder: &str, dir_cluster: u32) -> Vec<FsItem> {
     let mut items = Vec::new();
 
     if folder == "" {
-        items.push(FsItem::Directory(String::from("Storage"), 0));
+        items.push(FsItem::Directory(String::from("EOS SHARE"), 0));
         items.push(FsItem::Directory(String::from("RootFS"), 0));
         items.push(FsItem::Directory(String::from("Initrd"), 0));
         return items;
     }
 
-    if folder.starts_with("Storage") {
+    if folder.starts_with("EOS SHARE") {
         if dir_cluster >= 2 {
             if let Ok(files) = scan_dir_cluster(1, dir_cluster) {
                 for f in files {
@@ -119,7 +119,6 @@ pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
         if let Some(f) = files.iter().find(|x| x.name.eq_ignore_ascii_case(clean)) {
             return read_entire_file(1, f);
         }
-        // Subdirectory check (e.g. fonts/SFPRODISPLAYREGULAR.OTF)
         if clean.contains('/') {
             let parts: Vec<&str> = clean.split('/').collect();
             if let Some(sub) = files.iter().find(|x| x.is_dir && x.name.eq_ignore_ascii_case(parts[0])) {

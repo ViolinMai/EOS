@@ -20,9 +20,10 @@ pub enum InputEvent {
 }
 
 pub const MOD_SHIFT: u8 = 1 << 0;
-pub const MOD_CTRL: u8  = 1 << 1;
-pub const MOD_ALT: u8   = 1 << 2;
-pub const MOD_CAPS: u8  = 1 << 3;
+pub const MOD_CTRL:  u8 = 1 << 1;
+pub const MOD_ALT:   u8 = 1 << 2;
+pub const MOD_CAPS:  u8 = 1 << 3;
+pub const MOD_WIN:   u8 = 1 << 4;
 
 const QUEUE_SIZE: usize = 512;
 static mut EVENT_QUEUE: [Option<InputEvent>; QUEUE_SIZE] = [None; QUEUE_SIZE];
@@ -40,9 +41,7 @@ pub fn push_event(event: InputEvent) {
 
 pub fn poll_event() -> Option<InputEvent> {
     let tail = TAIL.load(Ordering::Relaxed);
-    if tail == HEAD.load(Ordering::Acquire) {
-        return None;
-    }
+    if tail == HEAD.load(Ordering::Acquire) { return None; }
     let event = unsafe { EVENT_QUEUE[tail].take() };
     TAIL.store((tail + 1) % QUEUE_SIZE, Ordering::Release);
     event

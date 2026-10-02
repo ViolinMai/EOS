@@ -33,7 +33,7 @@ impl App for UserAppOverlay {
                 OVERLAY_LOCK.store(false, Ordering::Release);
             }
         } else {
-            draw::draw_text(fb, x + w / 2 - 80, y + h / 2 - 10, "Loading Userspace Application...", 0xFFFFFFFF, 1);
+            draw::draw_text(fb, x + w / 2 - 110, y + h / 2 - 10, "Starting Ring 3 Userspace Desktop...", 0xFFFFFFFF, 1);
         }
     }
 
@@ -45,6 +45,6 @@ impl App for UserAppOverlay {
         push_user_event(InputEvent::MouseMove { x: new_w as isize, y: new_h as isize });
     }
     
-    fn title(&self) -> &str { "Userspace Application" }
+    fn title(&self) -> &str { "Userspace Desktop" }
     fn icon(&self) -> &'static str { "USR" }
 }

@@ -125,6 +125,9 @@ pub extern "C" fn _start() -> ! {
 
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
+    // تشغيل تطبيق الـ Userspace تلقائياً في الخلفية على Core 2
+    let _ = task::request_elf_execution("user_app.elf", "");
+
     crate::log_info!("DESKTOP", "Starting Compositor Core directly on BSP...");
     arch::x86_64::interrupts::GUI_ACTIVE.store(true, Ordering::SeqCst);
     compositor::compositor_core_entry();

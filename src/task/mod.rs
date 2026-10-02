@@ -25,7 +25,7 @@ impl Task {
         let stack_top = stack.as_ptr() as u64 + TASK_STACK_SIZE as u64;
         let mut current_sp = stack_top;
         unsafe {
-            current_sp &= !0xF; current_sp -= 512; // FPU Save Area
+            current_sp &= !0xF; current_sp -= 512;
             current_sp -= 8; *(current_sp as *mut u64) = 0x10;
             current_sp -= 8; *(current_sp as *mut u64) = stack_top - 512;
             current_sp -= 8; *(current_sp as *mut u64) = 0x202;
@@ -45,7 +45,7 @@ pub enum JobState { Idle, Submitted, Running, Finished, Failed }
 
 pub struct PerCoreJob { pub task_fn: Option<fn()>, pub state: JobState, pub result: u64 }
 static JOB_LOCKS: [AtomicBool; 8] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
-static mut CORE_JOBS: [PerCoreJob; 8] = [PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }];
+pub static mut CORE_JOBS: [PerCoreJob; 8] = [PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }, PerCoreJob { task_fn: None, state: JobState::Idle, result: 0 }];
 
 pub static mut ELF_TARGET_FILE: [u8; 128] = [0; 128];
 pub static mut ELF_TARGET_ARG: [u8; 128] = [0; 128];

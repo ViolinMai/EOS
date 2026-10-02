@@ -216,6 +216,7 @@ pub fn scan_dir_cluster(drive: u8, cluster: u32) -> Result<Vec<DiskFileInfo>, &'
     let mut files = Vec::new();
     let mut current_cluster = cluster;
     let mut sector = [0u8; 512];
+    let mut lfn_parts: Vec<(u8, String)> = Vec::new();
 
     while current_cluster >= 2 && current_cluster < 0x0FFF_FFF8 {
         let start_lba = layout.data_start_lba + (current_cluster - 2) * layout.spc;
@@ -223,17 +224,39 @@ pub fn scan_dir_cluster(drive: u8, cluster: u32) -> Result<Vec<DiskFileInfo>, &'
             if read_sector_drive(drive, start_lba + s, &mut sector).is_err() { break; }
             for entry_idx in 0..16 {
                 let offset = entry_idx * 32;
-                if sector[offset] == 0x00 { return Ok(files); }
-                if sector[offset] == 0xE5 || sector[offset + 11] == 0x0F { continue; }
+                let first_byte = sector[offset];
+                if first_byte == 0x00 { return Ok(files); }
+                if first_byte == 0xE5 { lfn_parts.clear(); continue; }
 
                 let attr = sector[offset + 11];
-                let is_dir = (attr & 0x10) != 0;
+                if attr == 0x0F {
+                    // Long File Name (LFN) Entry
+                    let seq = first_byte & 0x1F;
+                    let mut chars = Vec::new();
+                    let offsets = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+                    for &o in &offsets {
+                        let c = u16::from_le_bytes([sector[offset + o], sector[offset + o + 1]]);
+                        if c == 0 || c == 0xFFFF { break; }
+                        chars.push(c as u8 as char);
+                    }
+                    let part_str: String = chars.into_iter().collect();
+                    lfn_parts.push((seq, part_str));
+                    continue;
+                }
 
+                let is_dir = (attr & 0x10) != 0;
                 let mut name = String::new();
-                for &b in &sector[offset..offset + 8] { if b != b' ' { name.push(b as char); } }
-                let mut ext = String::new();
-                for &b in &sector[offset + 8..offset + 11] { if b != b' ' { ext.push(b as char); } }
-                if !ext.is_empty() { name.push('.'); name.push_str(&ext); }
+
+                if !lfn_parts.is_empty() {
+                    lfn_parts.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (_, part) in &lfn_parts { name.push_str(part); }
+                    lfn_parts.clear();
+                } else {
+                    for &b in &sector[offset..offset + 8] { if b != b' ' { name.push(b as char); } }
+                    let mut ext = String::new();
+                    for &b in &sector[offset + 8..offset + 11] { if b != b' ' { ext.push(b as char); } }
+                    if !ext.is_empty() { name.push('.'); name.push_str(&ext); }
+                }
 
                 if name == "." { continue; }
 
@@ -246,7 +269,7 @@ pub fn scan_dir_cluster(drive: u8, cluster: u32) -> Result<Vec<DiskFileInfo>, &'
                 } else {
                     let l = name.to_ascii_lowercase();
                     if l.ends_with(".elf") { MediaType::Executable }
-                    else if l.ends_with(".png") || l.ends_with(".jpg") { MediaType::Image }
+                    else if l.ends_with(".png") || l.ends_with(".jpg") || l.ends_with(".jpeg") { MediaType::Image }
                     else if l.ends_with(".mkv") || l.ends_with(".mp4") { MediaType::Video }
                     else { MediaType::Text }
                 };

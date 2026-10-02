@@ -1,4 +1,6 @@
 use alloc::vec::Vec;
+use crate::font::FontWeight;
+use crate::gui::metrics::get_metrics;
 
 pub struct FrameBuffer<'a> { pub pixels: &'a mut [u32], pub width: usize, pub height: usize, pub pitch_pixels: usize }
 
@@ -35,7 +37,7 @@ pub fn blend_color(bg: u32, fg: u32, alpha: u32) -> u32 {
 pub fn draw_rect(fb: &mut FrameBuffer, x: usize, y: usize, w: usize, h: usize, color: u32) {
     let ex = (x + w).min(fb.width); let ey = (y + h).min(fb.height);
     if x >= ex || y >= ey { return; }
-    for cy in y..ey { fb.pixels[cy * fb.pitch_pixels + x..cy * fb.pitch_pixels + ex].fill(color); }
+    for cy in y..ey { fb.pixels[cy * fb.pitch_pixels + x..cy * fb.pitch_pixels + ex].fill(color | 0xFF000000); }
 }
 
 pub fn draw_rect_alpha(fb: &mut FrameBuffer, x: usize, y: usize, w: usize, h: usize, color: u32, alpha: u32) {
@@ -62,7 +64,7 @@ pub fn draw_rect_rounded(fb: &mut FrameBuffer, x: usize, y: usize, w: usize, h: 
         let start = cy * fb.pitch_pixels + x;
         
         if !is_top && !is_bottom {
-            if alpha >= 255 { fb.pixels[start..start + len].fill(color); }
+            if alpha >= 255 { fb.pixels[start..start + len].fill(color | 0xFF000000); }
             else { for px in &mut fb.pixels[start..start + len] { *px = blend_color(*px, color, alpha); } }
         } else {
             let dy = if is_top { (y + r - 1).saturating_sub(cy) } else { cy.saturating_sub(ey - r) };
@@ -75,7 +77,7 @@ pub fn draw_rect_rounded(fb: &mut FrameBuffer, x: usize, y: usize, w: usize, h: 
                     if dist_sq > r_sq.saturating_sub(r * 2) { p_alpha = (alpha * (r_sq - dist_sq) as u32) / (r * 2) as u32; }
                 }
                 let idx = cy * fb.pitch_pixels + cx;
-                if p_alpha >= 255 { fb.pixels[idx] = blend_color(fb.pixels[idx], color, 255); } else { fb.pixels[idx] = blend_color(fb.pixels[idx], color, p_alpha); }
+                fb.pixels[idx] = blend_color(fb.pixels[idx], color, p_alpha);
             }
         }
     }
@@ -85,16 +87,28 @@ pub fn draw_rect_outline(fb: &mut FrameBuffer, x: usize, y: usize, w: usize, h: 
     if r == 0 {
         draw_line_h(fb, x, y, w, color); draw_line_h(fb, x, y + h - 1, w, color);
         draw_line_v(fb, x, y, h, color); draw_line_v(fb, x + w - 1, y, h, color);
-    } else {
-        // Draw hollow rounded border using dual rounded rects conceptually
-        // Simplified for bounds
-        draw_rect_rounded(fb, x, y, w, h, r, color, 100); 
-    }
+    } else { draw_rect_rounded(fb, x, y, w, h, r, color, 120); }
 }
 
 pub fn draw_text(fb: &mut FrameBuffer, x: usize, y: usize, text: &str, color: u32, size_idx: usize) {
+    let metrics = get_metrics();
+    let size_px = match size_idx { 0 => metrics.font_caption, 1 => metrics.font_body, 2 => metrics.font_title, _ => metrics.font_heading };
+    let weight = match size_idx { 0 | 1 => FontWeight::Regular, 2 => FontWeight::Medium, _ => FontWeight::Bold };
     let font_mgr = unsafe { crate::font::get_font_manager() };
-    font_mgr.draw_text_aa(fb, x, y, text, color, size_idx);
+    font_mgr.draw_text_aa(fb, x, y, text, color, size_px, weight);
+}
+
+pub fn draw_text_weight(fb: &mut FrameBuffer, x: usize, y: usize, text: &str, color: u32, size_px: usize, weight: FontWeight) {
+    let font_mgr = unsafe { crate::font::get_font_manager() };
+    font_mgr.draw_text_aa(fb, x, y, text, color, size_px, weight);
+}
+
+pub fn draw_text_clipped(fb: &mut FrameBuffer, x: usize, y: usize, max_w: usize, text: &str, color: u32, size_idx: usize) {
+    let metrics = get_metrics();
+    let size_px = match size_idx { 0 => metrics.font_caption, 1 => metrics.font_body, 2 => metrics.font_title, _ => metrics.font_heading };
+    let weight = match size_idx { 0 | 1 => FontWeight::Regular, 2 => FontWeight::Medium, _ => FontWeight::Bold };
+    let font_mgr = unsafe { crate::font::get_font_manager() };
+    font_mgr.draw_text_clipped(fb, x, y, max_w, text, color, size_px, weight);
 }
 
 pub fn draw_cursor(fb: &mut FrameBuffer, mx: usize, my: usize) {

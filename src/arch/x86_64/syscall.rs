@@ -10,8 +10,8 @@ use alloc::string::String;
 pub static mut KERNEL_SYSCALL_STACKS: [u64; 8] = [0; 8];
 pub static ELF_EXIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 
-pub const OVERLAY_MAX_W: usize = 1200;
-pub const OVERLAY_MAX_H: usize = 800;
+pub const OVERLAY_MAX_W: usize = 1920;
+pub const OVERLAY_MAX_H: usize = 1080;
 pub static OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);
 pub static OVERLAY_WIDTH: AtomicUsize = AtomicUsize::new(0);
 pub static OVERLAY_HEIGHT: AtomicUsize = AtomicUsize::new(0);
