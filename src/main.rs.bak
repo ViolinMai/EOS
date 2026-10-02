@@ -44,16 +44,6 @@ static MP_REQUEST: MpRequest = MpRequest::new(0);
 static STACK_SIZE_REQUEST: StackSizeRequest = StackSizeRequest::new(128 * 1024);
 
 pub static CORES_ONLINE: AtomicU64 = AtomicU64::new(1);
-pub static CORE_READY: [AtomicBool; 8] = [
-    AtomicBool::new(true),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-    AtomicBool::new(false),
-];
 pub static CORE_HEARTBEAT: [AtomicU64; 8] = [const { AtomicU64::new(0) }; 8];
 static AP_BOOT_LATCH: AtomicBool = AtomicBool::new(false);
 
@@ -132,11 +122,6 @@ pub extern "C" fn _start() -> ! {
         AP_BOOT_LATCH.store(true, Ordering::SeqCst);
     }
 
-    // الانتظار حتى تستقر الأنوية الثانوية
-    for _ in 0..100_000 {
-        core::hint::spin_loop();
-    }
-
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
     crate::log_info!("DESKTOP", "Requesting execution of 'user_app.elf'...");
@@ -182,15 +167,14 @@ extern "C" fn ap_startup_entry(info: &limine::mp::MpInfo) -> ! {
         arch::x86_64::syscall::init_core_syscall(core_id);
     }
     CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
-    if core_id < 8 {
-        CORE_READY[core_id].store(true, Ordering::SeqCst);
-    }
-    crate::log_info!("SMP", "Core {} online and active.", core_id);
+    crate::log_info!("SMP", "Core {} initialized and entering work loop", core_id);
 
     loop {
         if core_id < 8 { CORE_HEARTBEAT[core_id].fetch_add(1, Ordering::Relaxed); }
-        task::core_poll_and_execute(core_id);
-        core::hint::spin_loop();
+        let busy = task::core_poll_and_execute(core_id);
+        if !busy {
+            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
+        }
     }
 }
 

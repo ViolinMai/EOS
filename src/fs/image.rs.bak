@@ -1,6 +1,9 @@
 use alloc::vec;
 use alloc::vec::Vec;
 use alloc::string::String;
+use crate::arch::x86_64::syscall::{OVERLAY_ACTIVE, OVERLAY_WIDTH, OVERLAY_HEIGHT, OVERLAY_MAX_W, OVERLAY_MAX_H, OVERLAY_PIXELS};
+use core::ptr::addr_of_mut;
+use core::sync::atomic::Ordering;
 use zune_jpeg::JpegDecoder;
 
 pub static mut CUSTOM_WALLPAPER: Option<Vec<u32>> = None;

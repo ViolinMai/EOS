@@ -67,13 +67,7 @@ def create_demo_tar(user_elf_data):
         font_paths = [
             r"C:\EOS_SHARE\fonts\SFPRODISPLAYREGULAR.OTF",
             r"C:\EOS_SHARE\fonts\SFPRODISPLAYMEDIUM.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYBOLD.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYSEMIBOLDITALIC.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYLIGHTITALIC.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYHEAVYITALIC.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYBLACKITALIC.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYTHINITALIC.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYULTRALIGHTITALIC.OTF",
+            r"C:\EOS_SHARE\fonts\SFPRODISPLAYBOLD.OTF"
         ]
         for fp in font_paths:
             if os.path.exists(fp):

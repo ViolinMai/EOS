@@ -77,20 +77,12 @@ pub fn dispatch_job(core_id: usize, job: fn()) -> Result<(), &'static str> {
 
 pub fn request_elf_execution(filename: &str, argument: &str) -> Result<usize, &'static str> {
     let mut selected_core = None;
-    for c in 2..8 {
-        if crate::CORE_READY[c].load(Ordering::Acquire) && !CORE_IS_BUSY[c].load(Ordering::Acquire) {
-            selected_core = Some(c);
-            break;
-        }
-    }
-    let core_id = selected_core.unwrap_or(2);
+    for c in 2..8 { if !CORE_IS_BUSY[c].load(Ordering::Acquire) { selected_core = Some(c); break; } }
+    let core_id = selected_core.ok_or("All Cores (2-7) are currently busy!")?;
     unsafe {
-        core::ptr::write_bytes(addr_of_mut!(ELF_TARGET_FILE) as *mut u8, 0, 128);
-        core::ptr::write_bytes(addr_of_mut!(ELF_TARGET_ARG) as *mut u8, 0, 128);
-        let fb = filename.as_bytes(); let flen = core::cmp::min(fb.len(), 127);
-        core::ptr::copy_nonoverlapping(fb.as_ptr(), addr_of_mut!(ELF_TARGET_FILE) as *mut u8, flen);
-        let ab = argument.as_bytes(); let alen = core::cmp::min(ab.len(), 127);
-        core::ptr::copy_nonoverlapping(ab.as_ptr(), addr_of_mut!(ELF_TARGET_ARG) as *mut u8, alen);
+        core::ptr::write_bytes(addr_of_mut!(ELF_TARGET_FILE) as *mut u8, 0, 128); core::ptr::write_bytes(addr_of_mut!(ELF_TARGET_ARG) as *mut u8, 0, 128);
+        let fb = filename.as_bytes(); let flen = core::cmp::min(fb.len(), 127); core::ptr::copy_nonoverlapping(fb.as_ptr(), addr_of_mut!(ELF_TARGET_FILE) as *mut u8, flen);
+        let ab = argument.as_bytes(); let alen = core::cmp::min(ab.len(), 127); core::ptr::copy_nonoverlapping(ab.as_ptr(), addr_of_mut!(ELF_TARGET_ARG) as *mut u8, alen);
     }
     CORE_IS_BUSY[core_id].store(true, Ordering::SeqCst);
     CORE_ELF_SPAWN_REQ[core_id].store(true, Ordering::SeqCst);
@@ -100,21 +92,15 @@ pub fn request_elf_execution(filename: &str, argument: &str) -> Result<usize, &'
 
 fn elf_runner_worker(core_id: usize) {
     let mut file_buf = [0u8; 128]; let mut arg_buf = [0u8; 128];
-    unsafe {
-        core::ptr::copy_nonoverlapping(addr_of_mut!(ELF_TARGET_FILE) as *const u8, file_buf.as_mut_ptr(), 128);
-        core::ptr::copy_nonoverlapping(addr_of_mut!(ELF_TARGET_ARG) as *const u8, arg_buf.as_mut_ptr(), 128);
-    }
-    let file_len = file_buf.iter().position(|&b| b == 0).unwrap_or(128);
-    let arg_len = arg_buf.iter().position(|&b| b == 0).unwrap_or(128);
-    let filename = core::str::from_utf8(&file_buf[..file_len]).unwrap_or("");
-    let arg = core::str::from_utf8(&arg_buf[..arg_len]).unwrap_or("");
-
-    crate::log_info!("PROC", "Core {} -> Starting ELF binary '{}'...", core_id, filename);
+    unsafe { core::ptr::copy_nonoverlapping(addr_of_mut!(ELF_TARGET_FILE) as *const u8, file_buf.as_mut_ptr(), 128); core::ptr::copy_nonoverlapping(addr_of_mut!(ELF_TARGET_ARG) as *const u8, arg_buf.as_mut_ptr(), 128); }
+    let file_len = file_buf.iter().position(|&b| b == 0).unwrap_or(128); let arg_len = arg_buf.iter().position(|&b| b == 0).unwrap_or(128);
+    let filename = core::str::from_utf8(&file_buf[..file_len]).unwrap_or(""); let arg = core::str::from_utf8(&arg_buf[..arg_len]).unwrap_or("");
+    crate::log_info!("PROC", "Core {} -> Loading ELF binary '{}'...", core_id, filename);
     let t_start = crate::arch::x86_64::pit::read_tsc();
 
     match crate::fs::vfs_read_bytes(filename) {
         Ok(elf_bytes) => {
-            crate::log_info!("PROC", "Core {} -> VFS read success ({} bytes). Launching Ring 3...", core_id, elf_bytes.len());
+            crate::log_info!("PROC", "Core {} -> Binary '{}' read from VFS successfully ({} bytes). Executing...", core_id, filename, elf_bytes.len());
             IS_RUNNING_PROGRAM.store(true, Ordering::SeqCst);
             if let Err(err) = crate::fs::elf::load_and_run_elf(&elf_bytes, arg) {
                 crate::log_error!("PROC", "Core {} -> ELF load error: {}", core_id, err);
@@ -122,7 +108,7 @@ fn elf_runner_worker(core_id: usize) {
             IS_RUNNING_PROGRAM.store(false, Ordering::SeqCst);
         }
         Err(e) => {
-            crate::log_error!("PROC", "Core {} -> VFS failed to read '{}': {}", core_id, filename, e);
+            crate::log_error!("PROC", "Core {} -> Failed to read binary '{}' from VFS: {}", core_id, filename, e);
         }
     }
 

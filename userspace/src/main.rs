@@ -5,25 +5,46 @@ mod apps;
 
 use std::fs;
 use framework::*;
-use apps::*;
 
 const SCREEN_W: usize = 1920;
 const SCREEN_H: usize = 1080;
 
+fn try_read_font(paths: &[&str]) -> Vec<u8> {
+    for p in paths {
+        if let Ok(data) = fs::read(p) {
+            if !data.is_empty() {
+                println!("[FONT] Loaded font successfully from: {}", p);
+                return data;
+            }
+        }
+    }
+    Vec::new()
+}
+
 fn main() {
     println!("🚀 Launching EOS macOS Desktop (Ring 3 Userspace)...");
 
-    let font_bytes = fs::read("/EOS SHARE/fonts/SFPRODISPLAYREGULAR.OTF")
-        .or_else(|_| fs::read("/RootFS/fonts/SFPRODISPLAYREGULAR.OTF"))
-        .or_else(|_| fs::read("SFPRODISPLAYREGULAR.OTF"))
-        .unwrap_or_default();
+    let font_paths = [
+        "/EOS SHARE/fonts/SFPRODISPLAYREGULAR.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYMEDIUM.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYBOLD.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYSEMIBOLDITALIC.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYLIGHTITALIC.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYHEAVYITALIC.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYBLACKITALIC.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYTHINITALIC.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYULTRALIGHTITALIC.OTF",
+        "/RootFS/fonts/SFPRODISPLAYREGULAR.OTF",
+        "SFPRODISPLAYREGULAR.OTF",
+    ];
 
+    let font_bytes = try_read_font(&font_paths);
     let mut app = FrameworkApp::new(&font_bytes, SCREEN_W, SCREEN_H);
 
-    // تسجيل التطبيقات لفتحها فقط عبر النقر على الدوك دون تشغيل تلقائي
-    app.set_dock_handler(|idx| {
-        // يتم التعامل مع فتح النوافذ تفاعلياً داخل حلقة التشغيل
-    });
+    // Initial default windows to display upon startup
+    app.spawn_app("Finder");
+    app.spawn_app("Terminal");
 
+    app.set_dock_handler(|_idx| {});
     app.run_loop();
 }

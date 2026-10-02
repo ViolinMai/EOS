@@ -5,28 +5,43 @@ mod apps;
 
 use std::fs;
 use framework::*;
-use apps::*;
 
 const SCREEN_W: usize = 1920;
 const SCREEN_H: usize = 1080;
 
+fn try_read_font(paths: &[&str]) -> Vec<u8> {
+    for p in paths {
+        if let Ok(data) = fs::read(p) {
+            if !data.is_empty() {
+                return data;
+            }
+        }
+    }
+    Vec::new()
+}
+
 fn main() {
     println!("🚀 Launching EOS macOS Desktop (Ring 3 Userspace)...");
 
-    let font_bytes = fs::read("/EOS SHARE/fonts/SFPRODISPLAYREGULAR.OTF")
-        .or_else(|_| fs::read("/RootFS/fonts/SFPRODISPLAYREGULAR.OTF"))
-        .unwrap_or_default();
+    let font_paths = [
+        "/EOS SHARE/fonts/SFPRODISPLAYREGULAR.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYMEDIUM.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYBOLD.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYSEMIBOLDITALIC.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYLIGHTITALIC.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYHEAVYITALIC.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYBLACKITALIC.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYTHINITALIC.OTF",
+        "/EOS SHARE/fonts/SFPRODISPLAYULTRALIGHTITALIC.OTF",
+        "/RootFS/fonts/SFPRODISPLAYREGULAR.OTF",
+        "SFPRODISPLAYREGULAR.OTF",
+    ];
+
+    let font_bytes = try_read_font(&font_paths);
 
     let mut app = FrameworkApp::new(&font_bytes, SCREEN_W, SCREEN_H);
 
-    app.add_widget(Box::new(WindowFrame::new("Finder", 120, 70, 760, 480, Box::new(FinderApp::new()))));
-    app.add_widget(Box::new(WindowFrame::new("Terminal", 200, 140, 640, 420, Box::new(TerminalApp::new()))));
-    app.add_widget(Box::new(WindowFrame::new("TextEdit", 280, 210, 600, 400, Box::new(TextEditApp::new()))));
-    app.add_widget(Box::new(WindowFrame::new("Preview", 320, 100, 500, 400, Box::new(PreviewApp::new("/sample.png")))));
-
-    app.set_dock_handler(|idx| {
-        println!("Dock clicked: {}", idx);
-    });
+    app.set_dock_handler(|_idx| {});
 
     app.run_loop();
 }

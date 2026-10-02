@@ -171,13 +171,8 @@ pub fn get_fat_layout(drive: u8) -> Result<FatLayout, &'static str> {
         let cluster_offset = (root_cluster.saturating_sub(2)).saturating_mul(spc);
         let root_lba = data_start + cluster_offset;
         Ok(FatLayout {
-            fat_type: FatType::Fat32,
-            spc,
-            fat_start_lba: start_lba + reserved_sectors,
-            data_start_lba: data_start,
-            root_dir_lba: root_lba,
-            root_dir_sectors: spc,
-            root_cluster,
+            fat_type: FatType::Fat32, spc, fat_start_lba: start_lba + reserved_sectors,
+            data_start_lba: data_start, root_dir_lba: root_lba, root_dir_sectors: spc, root_cluster,
         })
     } else {
         let real_fat_sz = if fat_size == 0 { u32::from_le_bytes([sector[36], sector[37], sector[38], sector[39]]) } else { fat_size };
@@ -188,115 +183,113 @@ pub fn get_fat_layout(drive: u8) -> Result<FatLayout, &'static str> {
         let t_c = data_sectors / spc;
         let f_type = if t_c < 4085 { FatType::Fat12 } else { FatType::Fat16 };
         Ok(FatLayout {
-            fat_type: f_type,
-            spc,
-            fat_start_lba: start_lba + reserved_sectors,
-            data_start_lba: data_start,
-            root_dir_lba: root_lba,
-            root_dir_sectors: root_sectors,
-            root_cluster: 2,
+            fat_type: f_type, spc, fat_start_lba: start_lba + reserved_sectors,
+            data_start_lba: data_start, root_dir_lba: root_lba, root_dir_sectors: root_sectors, root_cluster: 0,
         })
     }
 }
 
 pub fn get_next_cluster(drive: u8, layout: &FatLayout, cluster: u32) -> Result<u32, &'static str> {
+    let fat_offset = if let FatType::Fat32 = layout.fat_type { cluster * 4 } else { cluster * 2 };
+    let fat_sector_lba = layout.fat_start_lba + (fat_offset / 512);
+    let mut buf = [0u8; 512];
+    read_sector_drive(drive, fat_sector_lba, &mut buf)?;
+    let entry_offset = (fat_offset % 512) as usize;
     if let FatType::Fat32 = layout.fat_type {
-        let fat_offset = cluster * 4;
-        let fat_sector_lba = layout.fat_start_lba + (fat_offset / 512);
-        let mut buf = [0u8; 512];
-        read_sector_drive(drive, fat_sector_lba, &mut buf)?;
-        let entry_offset = (fat_offset % 512) as usize;
-        let next_c = u32::from_le_bytes([buf[entry_offset], buf[entry_offset + 1], buf[entry_offset + 2], buf[entry_offset + 3]]) & 0x0FFF_FFFF;
-        Ok(next_c)
-    } else { Err("Only FAT32 supported") }
+        Ok(u32::from_le_bytes([buf[entry_offset], buf[entry_offset + 1], buf[entry_offset + 2], buf[entry_offset + 3]]) & 0x0FFF_FFFF)
+    } else {
+        Ok(u16::from_le_bytes([buf[entry_offset], buf[entry_offset + 1]]) as u32)
+    }
 }
 
 pub fn scan_dir_cluster(drive: u8, cluster: u32) -> Result<Vec<DiskFileInfo>, &'static str> {
     let layout = get_fat_layout(drive)?;
     let mut files = Vec::new();
-    let mut current_cluster = cluster;
     let mut sector = [0u8; 512];
     let mut lfn_parts: Vec<(u8, String)> = Vec::new();
 
-    while current_cluster >= 2 && current_cluster < 0x0FFF_FFF8 {
-        let start_lba = layout.data_start_lba + (current_cluster - 2) * layout.spc;
-        for s in 0..layout.spc {
-            if read_sector_drive(drive, start_lba + s, &mut sector).is_err() { break; }
-            for entry_idx in 0..16 {
-                let offset = entry_idx * 32;
-                let first_byte = sector[offset];
-                if first_byte == 0x00 { return Ok(files); }
-                if first_byte == 0xE5 { lfn_parts.clear(); continue; }
+    let mut read_dir_sector = |start_lba: u32, s: u32| -> Result<bool, &'static str> {
+        if read_sector_drive(drive, start_lba + s, &mut sector).is_err() { return Ok(false); }
+        for entry_idx in 0..16 {
+            let offset = entry_idx * 32;
+            let first_byte = sector[offset];
+            if first_byte == 0x00 { return Ok(false); }
+            if first_byte == 0xE5 { lfn_parts.clear(); continue; }
 
-                let attr = sector[offset + 11];
-                if attr == 0x0F {
-                    // Long File Name (LFN) Entry with UTF-16 decoding
-                    let seq = first_byte & 0x1F;
-                    let mut chars = Vec::new();
-                    let offsets = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
-                    for &o in &offsets {
-                        let c = u16::from_le_bytes([sector[offset + o], sector[offset + o + 1]]);
-                        if c == 0 || c == 0xFFFF { break; }
-                        if let Some(ch) = char::from_u32(c as u32) {
-                            chars.push(ch);
-                        } else {
-                            chars.push('?');
-                        }
-                    }
-                    let part_str: String = chars.into_iter().collect();
-                    lfn_parts.push((seq, part_str));
-                    continue;
+            let attr = sector[offset + 11];
+            if attr == 0x08 { lfn_parts.clear(); continue; } // Skip vol labels properly
+            if attr == 0x0F {
+                let seq = first_byte & 0x1F;
+                let mut chars = Vec::new();
+                let offsets = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+                for &o in &offsets {
+                    let c = u16::from_le_bytes([sector[offset + o], sector[offset + o + 1]]);
+                    if c == 0 || c == 0xFFFF { break; }
+                    if let Some(ch) = char::from_u32(c as u32) { chars.push(ch); } else { chars.push('?'); }
                 }
-
-                let is_dir = (attr & 0x10) != 0;
-                let mut name = String::new();
-
-                if !lfn_parts.is_empty() {
-                    lfn_parts.sort_by(|a, b| a.0.cmp(&b.0));
-                    for (_, part) in &lfn_parts { name.push_str(part); }
-                    lfn_parts.clear();
-                } else {
-                    for &b in &sector[offset..offset + 8] { if b != b' ' { name.push(b as char); } }
-                    let mut ext = String::new();
-                    for &b in &sector[offset + 8..offset + 11] { if b != b' ' { ext.push(b as char); } }
-                    if !ext.is_empty() { name.push('.'); name.push_str(&ext); }
-                }
-
-                if name == "." { continue; }
-
-                let first_cluster = ((u16::from_le_bytes([sector[offset + 20], sector[offset + 21]]) as u32) << 16)
-                    | (u16::from_le_bytes([sector[offset + 26], sector[offset + 27]]) as u32);
-                let size = u32::from_le_bytes([sector[offset + 28], sector[offset + 29], sector[offset + 30], sector[offset + 31]]);
-
-                let mtype = if is_dir {
-                    MediaType::Directory
-                } else {
-                    let l = name.to_ascii_lowercase();
-                    if l.ends_with(".elf") { MediaType::Executable }
-                    else if l.ends_with(".png") || l.ends_with(".jpg") || l.ends_with(".jpeg") { MediaType::Image }
-                    else if l.ends_with(".mkv") || l.ends_with(".mp4") { MediaType::Video }
-                    else { MediaType::Text }
-                };
-
-                files.push(DiskFileInfo {
-                    name,
-                    size,
-                    first_cluster,
-                    dir_entry_lba: start_lba + s,
-                    dir_entry_offset: offset,
-                    media_type: mtype,
-                    is_dir,
-                });
+                let part_str: String = chars.into_iter().collect();
+                lfn_parts.push((seq, part_str));
+                continue;
             }
+
+            let is_dir = (attr & 0x10) != 0;
+            let mut name = String::new();
+
+            if !lfn_parts.is_empty() {
+                lfn_parts.sort_by(|a, b| a.0.cmp(&b.0));
+                for (_, part) in &lfn_parts { name.push_str(part); }
+                lfn_parts.clear();
+            } else {
+                for &b in &sector[offset..offset + 8] { if b != b' ' { name.push(b as char); } }
+                let mut ext = String::new();
+                for &b in &sector[offset + 8..offset + 11] { if b != b' ' { ext.push(b as char); } }
+                if !ext.is_empty() { name.push('.'); name.push_str(&ext); }
+            }
+
+            if name == "." || name == ".." { continue; }
+
+            let first_cluster = ((u16::from_le_bytes([sector[offset + 20], sector[offset + 21]]) as u32) << 16)
+                | (u16::from_le_bytes([sector[offset + 26], sector[offset + 27]]) as u32);
+            let size = u32::from_le_bytes([sector[offset + 28], sector[offset + 29], sector[offset + 30], sector[offset + 31]]);
+
+            let mtype = if is_dir { MediaType::Directory } else {
+                let l = name.to_ascii_lowercase();
+                if l.ends_with(".elf") { MediaType::Executable }
+                else if l.ends_with(".png") || l.ends_with(".jpg") || l.ends_with(".jpeg") { MediaType::Image }
+                else if l.ends_with(".mkv") || l.ends_with(".mp4") { MediaType::Video }
+                else { MediaType::Text }
+            };
+
+            files.push(DiskFileInfo {
+                name, size, first_cluster,
+                dir_entry_lba: start_lba + s, dir_entry_offset: offset, media_type: mtype, is_dir,
+            });
         }
-        current_cluster = get_next_cluster(drive, &layout, current_cluster)?;
+        Ok(true)
+    };
+
+    if cluster == 0 { // FAT16 root directory behavior
+        let start_lba = layout.root_dir_lba;
+        for s in 0..layout.root_dir_sectors {
+            if !read_dir_sector(start_lba, s)? { break; }
+        }
+    } else {
+        let mut current_cluster = cluster;
+        while current_cluster >= 2 && current_cluster < 0x0FFF_FFF8 {
+            let start_lba = layout.data_start_lba + (current_cluster - 2) * layout.spc;
+            for s in 0..layout.spc {
+                if !read_dir_sector(start_lba, s)? { return Ok(files); }
+            }
+            current_cluster = get_next_cluster(drive, &layout, current_cluster)?;
+        }
     }
     Ok(files)
 }
 
 pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
     let layout = get_fat_layout(1)?;
-    scan_dir_cluster(1, layout.root_cluster)
+    let start_cluster = if let FatType::Fat32 = layout.fat_type { layout.root_cluster } else { 0 };
+    scan_dir_cluster(1, start_cluster)
 }
 
 pub fn read_entire_file(drive: u8, file_info: &DiskFileInfo) -> Result<Vec<u8>, &'static str> {

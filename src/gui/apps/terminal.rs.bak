@@ -18,18 +18,13 @@ impl TerminalApp {
 
     fn execute(&mut self) {
         let cmd = self.input.clone();
-        let echo = alloc::format!("eos> {}", cmd);
-        self.history.push(echo.clone());
-        crate::serial_println!("[TERM] {}", echo);
+        self.history.push(alloc::format!("eos> {}", cmd));
         self.input.clear();
         let parts: Vec<&str> = cmd.trim().split_whitespace().collect();
         if parts.is_empty() { return; }
         
         match parts[0] {
-            "help" => { 
-                self.history.push("  run <file.elf> : Spawn isolated Ring 3 process".to_string()); 
-                self.history.push("  ls [dir]       : Directory enumeration".to_string()); 
-            },
+            "help" => { self.history.push("  run <file.elf> : Spawn isolated Ring 3 process".to_string()); self.history.push("  ls [dir]       : Directory enumeration".to_string()); },
             "run" => {
                 if parts.len() > 1 {
                     let arg = if parts.len() > 2 { parts[2] } else { "" };
@@ -43,20 +38,7 @@ impl TerminalApp {
             "ls" => {
                 let folder = if parts.len() > 1 { parts[1] } else { "Storage" };
                 let items = crate::fs::list_directory_contents(folder, 0);
-                for item in items { 
-                    match item { 
-                        crate::fs::FsItem::Directory(d, _) => {
-                            let msg = alloc::format!("[DIR]  {}", d);
-                            self.history.push(msg.clone());
-                            crate::serial_println!("{}", msg);
-                        }, 
-                        crate::fs::FsItem::File(f, sz, _) => {
-                            let msg = alloc::format!("[FILE] {:<20} ({} B)", f, sz);
-                            self.history.push(msg.clone());
-                            crate::serial_println!("{}", msg);
-                        } 
-                    } 
-                }
+                for item in items { match item { crate::fs::FsItem::Directory(d, _) => self.history.push(alloc::format!("[DIR]  {}", d)), crate::fs::FsItem::File(f, sz, _) => self.history.push(alloc::format!("[FILE] {:<20} ({} B)", f, sz)), } }
             },
             _ => self.history.push(alloc::format!("Command not found: '{}'. Type 'help'.", parts[0])),
         }

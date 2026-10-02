@@ -17,12 +17,6 @@ pub mod window {
         }
     }
 
-    pub fn present_rects(pixels: *const u32, width: usize, height: usize, rects: &[[u32; 4]]) {
-        unsafe {
-            asm!("syscall", in("rax") 504, in("rdi") pixels as u64, in("rsi") rects.as_ptr() as u64, in("rdx") rects.len() as u64, in("r10") width as u64, in("r8") height as u64, out("rcx") _, out("r11") _);
-        }
-    }
-
     pub fn poll_event() -> Option<[u64; 2]> {
         let type_val: u64;
         let data_val: u64;

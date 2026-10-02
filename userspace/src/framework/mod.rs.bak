@@ -1,11 +1,7 @@
 pub mod canvas;
 pub mod widget;
 pub mod app;
-pub mod theme;
-pub mod menu;
 
 pub use canvas::Canvas;
 pub use widget::*;
 pub use app::FrameworkApp;
-pub use theme::*;
-pub use menu::*;

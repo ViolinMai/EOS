@@ -51,7 +51,7 @@ pub fn reset_core2_process() {
 }
 
 pub fn validate_user_range(ptr: u64, len: usize) -> bool {
-    ptr.checked_add(len as u64).map_or(false, |end| end < 0x0000_8000_0000_0000)
+    ptr != 0 && ptr.checked_add(len as u64).map_or(false, |end| end < 0x0000_8000_0000_0000)
 }
 
 pub fn copy_from_user(dst: &mut [u8], src: u64, len: usize) -> Result<(), ()> {
@@ -135,6 +135,13 @@ pub fn init_core_syscall(core_id: usize) {
 }
 
 pub fn init() { init_core_syscall(0); }
+
+fn fill_stat_buffer(statbuf: u64, size: u64, mode: u32) -> Result<(), ()> {
+    let mut st = [0u8; 144];
+    st[24..28].copy_from_slice(&mode.to_ne_bytes());
+    st[48..56].copy_from_slice(&size.to_ne_bytes());
+    copy_to_user(statbuf, &st)
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
@@ -241,10 +248,10 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     if !fd_allocated { frame.rax = -24i64 as u64; }
                 }
             } else {
-                frame.rax = -2i64 as u64; // -ENOENT
+                frame.rax = -2i64 as u64;
             }
         }
-        3 | 6 => { // close (Linux syscall 3 and legacy 6)
+        3 | 6 => { // close
             let fd = frame.rdi as usize;
             if fd < 64 {
                 unsafe {
@@ -261,9 +268,29 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 }
             } else { frame.rax = -9i64 as u64; }
         }
+        4 => { // stat
+            let path_ptr = frame.rdi;
+            let statbuf = frame.rsi;
+            let mut buf = [0u8; 512];
+            let mut len = 0;
+            while len < 511 {
+                let mut b = [0u8; 1];
+                if copy_from_user(&mut b, path_ptr + len, 1).is_err() || b[0] == 0 { break; }
+                buf[len as usize] = b[0]; len += 1;
+            }
+            let path = core::str::from_utf8(&buf[..len as usize]).unwrap_or("").trim();
+            if let Ok((sz, kind)) = crate::fs::vfs_stat(path) {
+                if fill_stat_buffer(statbuf, sz, kind).is_ok() {
+                    frame.rax = 0;
+                } else {
+                    frame.rax = -14i64 as u64;
+                }
+            } else {
+                frame.rax = -2i64 as u64;
+            }
+        }
         5 | 262 => { // fstat, newfstatat
             let (fd, path_ptr, statbuf) = if frame.rax == 5 { (frame.rdi as usize, 0, frame.rsi) } else { (frame.rdi as usize, frame.rsi, frame.rdx) };
-            let mut st = [0u8; 144];
             let mut is_ok = false;
             let mut mode = 0o100644u32;
             let mut size = 0u64;
@@ -295,9 +322,7 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 }
             }
             if is_ok {
-                st[24..28].copy_from_slice(&mode.to_ne_bytes());
-                st[48..56].copy_from_slice(&size.to_ne_bytes());
-                if copy_to_user(statbuf, &st).is_ok() { frame.rax = 0; } else { frame.rax = -14i64 as u64; }
+                if fill_stat_buffer(statbuf, size, mode).is_ok() { frame.rax = 0; } else { frame.rax = -14i64 as u64; }
             } else { frame.rax = -2i64 as u64; }
         }
         7 | 271 => { // poll, ppoll
@@ -348,7 +373,7 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 }
             }
         }
-        16 => { frame.rax = 0; } // ioctl stub (success for standard TTY calls)
+        16 => { frame.rax = 0; }
         20 => { // writev
             let fd = frame.rdi; let iov_ptr = frame.rsi as *const [u64; 2]; let iovcnt = frame.rdx as usize;
             if fd == 1 || fd == 2 {
@@ -365,15 +390,20 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = written;
             } else { frame.rax = -9i64 as u64; }
         }
-        35 | 226 | 230 => { // nanosleep
-            let req = if frame.rax == 35 { frame.rdi } else { frame.rsi } as *const [u64; 2];
+        35 | 226 | 230 => { // nanosleep & clock_nanosleep
+            let req = if frame.rax == 230 { frame.rdx } else { frame.rdi } as *const [u64; 2];
             if validate_user_range(req as u64, 16) {
                 let mut times = [0u64; 2];
                 if copy_from_user(unsafe { core::slice::from_raw_parts_mut(times.as_mut_ptr() as *mut u8, 16) }, req as u64, 16).is_ok() {
                     let ms = times[0].saturating_mul(1000).saturating_add(times[1] / 1_000_000);
-                    crate::arch::x86_64::pit::sleep_ms(ms); frame.rax = 0;
-                } else { frame.rax = -14i64 as u64; }
-            } else { frame.rax = -14i64 as u64; }
+                    crate::arch::x86_64::pit::sleep_ms(ms.max(1));
+                    frame.rax = 0;
+                } else {
+                    frame.rax = 0;
+                }
+            } else {
+                frame.rax = 0;
+            }
         }
         63 => { // uname
             let buf = frame.rdi;
@@ -387,12 +417,12 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = 0;
             } else { frame.rax = -14i64 as u64; }
         }
-        72 => { // fcntl (Vital for Rust std::fs file handling)
+        72 => { // fcntl
             let cmd = frame.rsi;
             match cmd {
-                1 | 2 => { frame.rax = 0; }, // F_GETFD / F_SETFD
-                3 => { frame.rax = 0o2; },   // F_GETFL (O_RDWR)
-                4 => { frame.rax = 0; },     // F_SETFL
+                1 | 2 => { frame.rax = 0; },
+                3 => { frame.rax = 0o2; },
+                4 => { frame.rax = 0; },
                 _ => { frame.rax = 0; },
             }
         }
@@ -416,6 +446,9 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             }
         }
         186 | 218 => { frame.rax = 2; }
+        200 => { // tkill
+            frame.rax = 0;
+        }
         217 => { // getdents64
             let fd = frame.rdi as usize; let dirp = frame.rsi; let count = frame.rdx as usize;
             if fd < 64 {
@@ -445,7 +478,7 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                                 }
                                 if copy_to_user(dirp, &out_buf[..written]).is_ok() { frame.rax = written as u64; } else { frame.rax = -14i64 as u64; }
                             }
-                            _ => frame.rax = -20i64 as u64, // -ENOTDIR
+                            _ => frame.rax = -20i64 as u64,
                         }
                     } else { frame.rax = -9i64 as u64; }
                 }
@@ -458,27 +491,54 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 let _ = copy_to_user(tp_ptr, unsafe { core::slice::from_raw_parts(tp.as_ptr() as *const u8, 16) }); frame.rax = 0;
             } else { frame.rax = -14i64 as u64; }
         }
+        234 => { // tgkill
+            frame.rax = 0;
+        }
         302 => { frame.rax = 0; }
         318 => { // getrandom
             let mut buf = alloc::vec![0u8; frame.rsi as usize]; let mut r = pit::read_tsc();
             for b in buf.iter_mut() { *b = (r & 0xFF) as u8; r >>= 3; }
             if copy_to_user(frame.rdi, &buf).is_ok() { frame.rax = frame.rsi; } else { frame.rax = -14i64 as u64; }
         }
-        502 => { // sys_present
-            let target_w = core::cmp::min(frame.r10 as usize, 1920); let target_h = core::cmp::min(frame.r8 as usize, 1080);
+        502 | 504 => { // sys_present & sys_present_rects
+            let target_w = core::cmp::min(frame.r10 as usize, 1920);
+            let target_h = core::cmp::min(frame.r8 as usize, 1080);
             let total_bytes = target_w * target_h * 4;
             if target_w > 0 && target_h > 0 && validate_user_range(frame.rdi, total_bytes) {
                 unsafe {
                     if let Some(writer) = &mut *core::ptr::addr_of_mut!(crate::writer::WRITER) {
-                        let src = frame.rdi as *const u8; let dst = writer.buffer; let line_bytes = target_w.min(writer.width) * 4;
-                        for y in 0..target_h.min(writer.height) { core::ptr::copy_nonoverlapping(src.add(y * target_w * 4), dst.add(y * writer.pitch), line_bytes); }
+                        let src = frame.rdi as *const u8;
+                        let dst = writer.buffer;
+                        let line_bytes = target_w.min(writer.width) * 4;
+
+                        if frame.rax == 502 || frame.rdx == 0 {
+                            for y in 0..target_h.min(writer.height) {
+                                core::ptr::copy_nonoverlapping(src.add(y * target_w * 4), dst.add(y * writer.pitch), line_bytes);
+                            }
+                        } else if validate_user_range(frame.rsi, frame.rdx as usize * 16) {
+                            let rects_ptr = frame.rsi as *const u32;
+                            for i in 0..frame.rdx as usize {
+                                let rx = (*rects_ptr.add(i * 4) as usize).min(writer.width);
+                                let ry = (*rects_ptr.add(i * 4 + 1) as usize).min(writer.height);
+                                let rw = (*rects_ptr.add(i * 4 + 2) as usize).min(writer.width.saturating_sub(rx));
+                                let rh = (*rects_ptr.add(i * 4 + 3) as usize).min(writer.height.saturating_sub(ry));
+                                if rw > 0 && rh > 0 {
+                                    for cy in ry..(ry + rh) {
+                                        let s_idx = (cy * target_w + rx) * 4;
+                                        let d_idx = cy * writer.pitch + rx * 4;
+                                        core::ptr::copy_nonoverlapping(src.add(s_idx), dst.add(d_idx), rw * 4);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
             frame.rax = 0;
         }
         503 => { // sys_poll_event
-            let tail = USER_EVENT_TAIL.load(Ordering::Acquire); let head = USER_EVENT_HEAD.load(Ordering::Acquire);
+            let tail = USER_EVENT_TAIL.load(Ordering::Acquire);
+            let head = USER_EVENT_HEAD.load(Ordering::Acquire);
             if head != tail {
                 if let Some(ev) = unsafe { USERSPACE_EVENTS[tail] } {
                     match ev {

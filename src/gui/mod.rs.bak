@@ -44,6 +44,7 @@ pub fn run() {
     let mut mouse_y = (height / 2) as isize;
     let mut prev_mouse_rect = Rect { x: mouse_x as usize, y: mouse_y as usize, w: 24, h: 24 };
 
+    // Default open window: Finder
     wm.add_window(Box::new(FinderApp::new()), 100, 70, 840, 560);
     damage.add(Rect { x: 0, y: 0, w: width, h: height }); 
     
@@ -196,16 +197,28 @@ pub fn run() {
         }
         
         let mut pending_actions = Vec::new();
-        for win in &mut wm.windows { if let Some(act) = win.app.poll_action() { pending_actions.push(act); } }
+        for win in &mut wm.windows {
+            if let Some(act) = win.app.poll_action() { pending_actions.push(act); }
+        }
         for act in pending_actions {
             match act {
-                AppAction::OpenImage { name, width: iw, height: ih, pixels } => { wm.add_window(Box::new(PreviewApp::new(name, iw, ih, pixels)), 140, 90, 720, 520); damage.add(Rect { x: 140, y: 90, w: 720, h: 520 }); }
-                AppAction::OpenText { name, content } => { wm.add_window(Box::new(TextEditApp::new(name, content)), 160, 100, 640, 480); damage.add(Rect { x: 160, y: 100, w: 640, h: 480 }); }
-                AppAction::LaunchElf { name, arg } => { let _ = crate::task::request_elf_execution(&name, &arg); }
+                AppAction::OpenImage { name, width: iw, height: ih, pixels } => {
+                    wm.add_window(Box::new(PreviewApp::new(name, iw, ih, pixels)), 140, 90, 720, 520);
+                    damage.add(Rect { x: 140, y: 90, w: 720, h: 520 });
+                }
+                AppAction::OpenText { name, content } => {
+                    wm.add_window(Box::new(TextEditApp::new(name, content)), 160, 100, 640, 480);
+                    damage.add(Rect { x: 160, y: 100, w: 640, h: 480 });
+                }
+                AppAction::LaunchElf { name, arg } => {
+                    let _ = crate::task::request_elf_execution(&name, &arg);
+                }
             }
         }
 
-        for win in &mut wm.windows { if !win.is_minimized && win.app.wants_redraw() { win.is_dirty = true; damage.add(Rect { x: win.x, y: win.y, w: win.w, h: win.h }); } }
+        for win in &mut wm.windows {
+            if !win.is_minimized && win.app.wants_redraw() { win.is_dirty = true; damage.add(Rect { x: win.x, y: win.y, w: win.w, h: win.h }); }
+        }
 
         let mut dock_animating = false;
         let mut cur_accum_x = dock_x + 20;
@@ -234,7 +247,10 @@ pub fn run() {
         if dock_animating { damage.add(Rect { x: (dock_x - 30).max(0) as usize, y: (dock_y - 60).max(0) as usize, w: total_dock_content_w as usize + 60, h: dock_h as usize + 72 }); }
 
         let current_tick = crate::arch::x86_64::pit::get_ticks();
-        if current_tick.saturating_sub(last_clock_tick) >= 1000 { damage.add(Rect { x: width.saturating_sub(280), y: 0, w: 280, h: 36 }); last_clock_tick = current_tick; }
+        if current_tick.saturating_sub(last_clock_tick) >= 1000 {
+            damage.add(Rect { x: width.saturating_sub(280), y: 0, w: 280, h: 36 });
+            last_clock_tick = current_tick;
+        }
 
         if mouse_moved || click_processed {
             damage.add(prev_mouse_rect);
@@ -251,7 +267,10 @@ pub fn run() {
         if !damage.get_rects().is_empty() {
             for d_rect in damage.get_rects() {
                 let rect = d_rect.clip(width, height);
-                for cy in rect.y..rect.y + rect.h { fb.pixels[cy * width + rect.x..cy * width + rect.x + rect.w].fill(theme.desktop_bg); }
+                for cy in rect.y..rect.y + rect.h {
+                    let idx = cy * width + rect.x;
+                    fb.pixels[idx..idx + rect.w].fill(theme.desktop_bg);
+                }
             }
             
             wm.draw(&mut fb, theme, &damage);
@@ -260,22 +279,9 @@ pub fn run() {
             if damage.get_rects().iter().any(|r| r.intersects(&mb_rect)) {
                 draw::draw_rect(&mut fb, 0, 0, width, 34, theme.menubar_bg);
                 draw::draw_line_h(&mut fb, 0, 34, width, theme.menubar_border);
-                
-                let mut focused_app = "Desktop";
-                if let Some(w) = wm.windows.iter().find(|w| w.active) { focused_app = w.app.title(); }
-                
-                draw::draw_text(&mut fb, 18, 10, " EOS", theme.text_main, 2);
-                draw::draw_text(&mut fb, 90, 10, focused_app, theme.text_main, 2);
-                
-                let mut cur_x = 90 + (focused_app.len() * 10) + 30;
-                let menu_items = ["File", "Edit", "View", "Window", "Help"];
-                for item in menu_items.iter() {
-                    draw::draw_text(&mut fb, cur_x, 10, item, theme.text_dim, 1);
-                    cur_x += (item.len() * 8) + 20;
-                }
-
+                draw::draw_text(&mut fb, 18, 10, " EOS", theme.text_main, 1);
                 let current_time = crate::drivers::rtc::get_riyadh_time();
-                let status_right = alloc::format!("{} Cores | {:02}/{:02} | {:02}:{:02}:{:02}", crate::CORES_ONLINE.load(Ordering::Relaxed), current_time.day, current_time.month, current_time.hour, current_time.minute, current_time.second);
+                let status_right = alloc::format!("Cores: {} | {:02}:{:02}:{:02}", crate::CORES_ONLINE.load(Ordering::Relaxed), current_time.hour, current_time.minute, current_time.second);
                 draw::draw_text(&mut fb, width - 260, 10, &status_right, theme.text_main, 1);
             }
             
