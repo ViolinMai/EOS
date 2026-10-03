@@ -1,6 +1,7 @@
 mod syscall;
 mod sdk;
 mod framework;
+pub mod png;
 mod apps;
 
 use std::fs;
@@ -13,6 +14,7 @@ fn try_read_font(paths: &[&str]) -> Vec<u8> {
     for p in paths {
         if let Ok(data) = fs::read(p) {
             if !data.is_empty() {
+                println!("[FONT] Loaded font successfully from: {}", p);
                 return data;
             }
         }
@@ -38,10 +40,11 @@ fn main() {
     ];
 
     let font_bytes = try_read_font(&font_paths);
-
     let mut app = FrameworkApp::new(&font_bytes, SCREEN_W, SCREEN_H);
 
-    app.set_dock_handler(|_idx| {});
+    app.spawn_app("Finder");
+    app.spawn_app("Terminal");
 
+    app.set_dock_handler(|_idx| {});
     app.run_loop();
 }

@@ -1,11 +1,12 @@
+pub mod theme;
 pub mod canvas;
 pub mod widget;
-pub mod app;
-pub mod theme;
 pub mod menu;
+pub mod app;
 
-pub use canvas::Canvas;
-pub use widget::*;
-pub use app::FrameworkApp;
 pub use theme::*;
+pub use canvas::*;
+pub use widget::*;
+#[allow(unused_imports)]
 pub use menu::*;
+pub use app::*;

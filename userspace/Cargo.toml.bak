@@ -8,7 +8,7 @@ edition = "2021"
 [dependencies]
 zune-jpeg = { version = "0.4.13", default-features = false }
 rusttype = { version = "0.9.3", default-features = true }
-png = "0.18.1"
+miniz_oxide = { version = "0.7.4", default-features = false, features = ["with-alloc"] }
 
 [profile.release]
 opt-level = 3

@@ -260,6 +260,12 @@ impl PreviewApp {
                     }
                 }
             }
+        } else if self.image_data.starts_with(b"\x89PNG\r\n\x1a\n") {
+            if let Ok((px, w, h)) = crate::png::decode_png(&self.image_data) {
+                self.width = w;
+                self.height = h;
+                self.raw_pixels = px;
+            }
         }
     }
 }
@@ -385,8 +391,9 @@ impl TerminalApp {
                     let full_path = if p.starts_with('/') { p.to_string() } else { format!("{}/{}", self.cwd, p) };
                     if let Ok(content) = std::fs::read_to_string(&full_path).or_else(|_| std::fs::read_to_string(p)) {
                         for l in content.lines() {
-                            self.history.push((l.to_string(), 0xFFE2E8F0));
-                            println!("{}", l);
+                            let clean_line = l.replace('\t', "    ");
+                            self.history.push((clean_line.clone(), 0xFFE2E8F0));
+                            println!("{}", clean_line);
                         }
                     } else {
                         let err = format!("cat: {}: No such file", p);
@@ -487,7 +494,8 @@ impl Widget for TextEditApp {
         for (i, line) in self.lines.iter().enumerate() {
             if cy + line_h > editor_y + editor_h { break; }
             canvas.draw_text(self.bounds.x + theme.pt(12.0), cy, &format!("{:2}", i + 1), theme.text_muted, theme.font_caption());
-            canvas.draw_text(self.bounds.x + gutter_w + theme.pt(16.0), cy, line, theme.text_primary, theme.font_body());
+            let clean_line = line.replace('\t', "    ");
+            canvas.draw_text(self.bounds.x + gutter_w + theme.pt(16.0), cy, &clean_line, theme.text_primary, theme.font_body());
 
             if i == self.cursor_row {
                 let cursor_x = self.bounds.x + gutter_w + theme.pt(16.0) + (self.cursor_col * theme.pt(9.0));
@@ -521,6 +529,10 @@ impl Widget for TextEditApp {
                 self.lines[self.cursor_row].push_str(&curr_line);
                 self.cursor_col = prev_len;
             }
+            return true;
+        } else if c == '\t' {
+            self.lines[self.cursor_row].insert_str(self.cursor_col, "    ");
+            self.cursor_col += 4;
             return true;
         } else if c >= ' ' && c <= '~' {
             self.lines[self.cursor_row].insert(self.cursor_col, c);
@@ -556,7 +568,6 @@ impl Widget for ActivityMonitorApp {
         let theme = get_theme();
         canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, 0);
 
-        // macOS Segmented Control Toolbar
         let tb_h = theme.pt(44.0);
         canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, 0);
         canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
@@ -582,9 +593,8 @@ impl Widget for ActivityMonitorApp {
         let content_y = self.bounds.y + tb_h + theme.pt(16.0);
         let pad_x = self.bounds.x + theme.pt(24.0);
 
-        // Hardware Real-time Cards
         match self.selected_tab {
-            0 => { // CPU
+            0 => {
                 let card_h = theme.pt(120.0);
                 let card_w = self.bounds.w.saturating_sub(theme.pt(48.0));
                 canvas.draw_rect(pad_x, content_y, card_w, card_h, theme.bg_titlebar, theme.pt(10.0));
@@ -593,7 +603,6 @@ impl Widget for ActivityMonitorApp {
                 canvas.draw_text(pad_x + theme.pt(20.0), content_y + theme.pt(16.0), "Processor: 8 Symmetrical Cores (x86_64 SMP)", theme.text_primary, theme.font_title());
                 canvas.draw_text(pad_x + theme.pt(20.0), content_y + theme.pt(48.0), "System Load: 14% | User Space: 8% | Idle: 78%", theme.accent_hover, theme.font_body());
 
-                // Simulated CPU Core usage bars
                 let bar_w = card_w.saturating_sub(theme.pt(40.0)) / 8;
                 for c in 0..8 {
                     let bx = pad_x + theme.pt(20.0) + (c * bar_w);
@@ -603,7 +612,6 @@ impl Widget for ActivityMonitorApp {
                     canvas.draw_rect(bx, by, load_fill, theme.pt(24.0), theme.accent, theme.pt(4.0));
                 }
 
-                // Process Table List
                 let table_y = content_y + card_h + theme.pt(18.0);
                 canvas.draw_rect(pad_x, table_y, card_w, theme.pt(32.0), theme.bg_titlebar, 0);
                 canvas.draw_line_h(pad_x, table_y + theme.pt(32.0), card_w, theme.border_window);
@@ -629,7 +637,7 @@ impl Widget for ActivityMonitorApp {
                     canvas.draw_text(pad_x + theme.pt(440.0), ry + theme.pt(5.0), mem, theme.text_secondary, theme.font_body());
                 }
             }
-            1 => { // Memory
+            1 => {
                 canvas.draw_text(pad_x, content_y, "Physical Memory Configuration", theme.text_primary, theme.font_large());
                 canvas.draw_text(pad_x, content_y + theme.pt(36.0), "Total RAM: 8179 MB Configured", theme.text_secondary, theme.font_body());
                 canvas.draw_text(pad_x, content_y + theme.pt(66.0), "Kernel Heap: 256 MB Dedicated", theme.accent_hover, theme.font_body());
@@ -728,59 +736,4 @@ impl Widget for SettingsApp {
         }
         true
     }
-}
-
-    fn decode(&mut self) {
-        if self.image_data.is_empty() { return; }
-        if self.image_data.starts_with(&[0xFF, 0xD8, 0xFF]) {
-            let mut decoder = zune_jpeg::JpegDecoder::new(&self.image_data);
-            if let Ok(px) = decoder.decode() {
-                if let Some(info) = decoder.info() {
-                    self.width = info.width as usize;
-                    self.height = info.height as usize;
-                    self.raw_pixels = vec![0u32; self.width * self.height];
-                    for i in 0..self.width * self.height {
-                        let o = i * 3;
-                        if o + 2 < px.len() {
-                            self.raw_pixels[i] = (0xFF << 24) | ((px[o] as u32) << 16) | ((px[o+1] as u32) << 8) | (px[o+2] as u32);
-                        }
-                    }
-                }
-            }
-        } else if self.image_data.starts_with(b"\x89PNG\r\n\x1a\n") {
-            if let Ok((px, w, h)) = decode_userspace_png(&self.image_data) {
-                self.width = w;
-                self.height = h;
-                self.raw_pixels = px;
-            }
-        }
-    }
-
-fn decode_userspace_png(data: &[u8]) -> Result<(Vec<u32>, usize, usize), &'static str> {
-    if data.len() < 33 { return Err("PNG too short"); }
-    let w = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as usize;
-    let h = u32::from_be_bytes([data[20], data[21], data[22], data[23]]) as usize;
-    let bpp = match data[25] { 2 => 3, 6 => 4, _ => return Err("Unsupported color type") };
-    let mut idat = Vec::new();
-    let mut off = 33;
-    while off + 8 <= data.len() {
-        let len = u32::from_be_bytes([data[off], data[off+1], data[off+2], data[off+3]]) as usize;
-        let ctype = &data[off+4..off+8];
-        let doff = off + 8;
-        if doff + len > data.len() { break; }
-        if ctype == b"IDAT" { idat.extend_from_slice(&data[doff..doff+len]); }
-        else if ctype == b"IEND" { break; }
-        off = doff + len + 4;
-    }
-    
-    // Fallback pixel fill if no decompression library present in userspace crate
-    let mut out = vec![0xFF38BDF8; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            if x == 0 || y == 0 || x == w - 1 || y == h - 1 {
-                out[y * w + x] = 0xFFFFFFFF;
-            }
-        }
-    }
-    Ok((out, w, h))
 }

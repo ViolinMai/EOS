@@ -30,7 +30,12 @@ pub struct FrameworkApp<'a> {
 
 impl<'a> FrameworkApp<'a> {
     pub fn new(font_bytes: &'a [u8], width: usize, height: usize) -> Self {
-        let font = if !font_bytes.is_empty() { Font::try_from_bytes(font_bytes) } else { None };
+        let font = if !font_bytes.is_empty() && crate::is_valid_truetype_font(font_bytes) {
+            Font::try_from_bytes(font_bytes)
+        } else {
+            None
+        };
+
         let mut buffer = Vec::new();
         buffer.resize(width * height, 0xFF0F172A);
 
@@ -168,12 +173,11 @@ impl<'a> FrameworkApp<'a> {
             canvas.draw_rect(self.mouse_x.saturating_sub(2), self.mouse_y.saturating_sub(2), cur_sz, cur_sz, cursor_col, cur_sz / 2);
         }
 
-        // Direct Full Frame Present to ensure display
+        // Direct Full Frame Present
         sdk::window::present(self.buffer.as_ptr(), self.width, self.height);
     }
 
     pub fn run_loop(&mut self) -> ! {
-        // Immediate paint on loop entry
         self.render_frame();
         let mut last_click_state = false;
 

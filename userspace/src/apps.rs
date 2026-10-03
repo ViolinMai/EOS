@@ -245,45 +245,53 @@ impl PreviewApp {
 
     fn decode(&mut self) {
         if self.image_data.is_empty() { return; }
-        if self.image_data.starts_with(&[0xFF, 0xD8, 0xFF]) {
+
+        if self.image_data.len() >= 2 && self.image_data[0] == 0xFF && self.image_data[1] == 0xD8 {
             let mut decoder = zune_jpeg::JpegDecoder::new(&self.image_data);
             if let Ok(px) = decoder.decode() {
                 if let Some(info) = decoder.info() {
                     self.width = info.width as usize;
                     self.height = info.height as usize;
-                    self.raw_pixels = vec![0u32; self.width * self.height];
-                    for i in 0..self.width * self.height {
-                        let o = i * 3;
-                        if o + 2 < px.len() {
-                            self.raw_pixels[i] = (0xFF << 24) | ((px[o] as u32) << 16) | ((px[o+1] as u32) << 8) | (px[o+2] as u32);
+                    let total_pixels = self.width * self.height;
+                    self.raw_pixels = vec![0u32; total_pixels];
+
+                    let channels = if px.len() >= total_pixels * 4 {
+                        4
+                    } else if px.len() >= total_pixels * 3 {
+                        3
+                    } else {
+                        1
+                    };
+
+                    for i in 0..total_pixels {
+                        let o = i * channels;
+                        if o + channels <= px.len() {
+                            if channels == 4 {
+                                self.raw_pixels[i] = ((px[o + 3] as u32) << 24)
+                                    | ((px[o] as u32) << 16)
+                                    | ((px[o + 1] as u32) << 8)
+                                    | (px[o + 2] as u32);
+                            } else if channels == 3 {
+                                self.raw_pixels[i] = (0xFF << 24)
+                                    | ((px[o] as u32) << 16)
+                                    | ((px[o + 1] as u32) << 8)
+                                    | (px[o + 2] as u32);
+                            } else {
+                                let v = px[o] as u32;
+                                self.raw_pixels[i] = (0xFF << 24) | (v << 16) | (v << 8) | v;
+                            }
                         }
                     }
                 }
             }
         } else if self.image_data.starts_with(b"\x89PNG\r\n\x1a\n") {
-            if let Ok((px, w, h)) = decode_userspace_png(&self.image_data) {
+            if let Ok((px, w, h)) = crate::png::decode_png(&self.image_data) {
                 self.width = w;
                 self.height = h;
                 self.raw_pixels = px;
             }
         }
     }
-}
-
-fn decode_userspace_png(data: &[u8]) -> Result<(Vec<u32>, usize, usize), &'static str> {
-    if data.len() < 33 { return Err("PNG too short"); }
-    let w = u32::from_be_bytes([data[16], data[17], data[18], data[19]]) as usize;
-    let h = u32::from_be_bytes([data[20], data[21], data[22], data[23]]) as usize;
-    let _bpp = match data[25] { 2 => 3, 6 => 4, _ => return Err("Unsupported color type") };
-    let mut out = vec![0xFF38BDF8; w * h];
-    for y in 0..h {
-        for x in 0..w {
-            if x == 0 || y == 0 || x == w - 1 || y == h - 1 {
-                out[y * w + x] = 0xFFFFFFFF;
-            }
-        }
-    }
-    Ok((out, w, h))
 }
 
 impl Widget for PreviewApp {
@@ -407,8 +415,9 @@ impl TerminalApp {
                     let full_path = if p.starts_with('/') { p.to_string() } else { format!("{}/{}", self.cwd, p) };
                     if let Ok(content) = std::fs::read_to_string(&full_path).or_else(|_| std::fs::read_to_string(p)) {
                         for l in content.lines() {
-                            self.history.push((l.to_string(), 0xFFE2E8F0));
-                            println!("{}", l);
+                            let clean_line = l.replace('\t', "    ");
+                            self.history.push((clean_line.clone(), 0xFFE2E8F0));
+                            println!("{}", clean_line);
                         }
                     } else {
                         let err = format!("cat: {}: No such file", p);
@@ -509,7 +518,8 @@ impl Widget for TextEditApp {
         for (i, line) in self.lines.iter().enumerate() {
             if cy + line_h > editor_y + editor_h { break; }
             canvas.draw_text(self.bounds.x + theme.pt(12.0), cy, &format!("{:2}", i + 1), theme.text_muted, theme.font_caption());
-            canvas.draw_text(self.bounds.x + gutter_w + theme.pt(16.0), cy, line, theme.text_primary, theme.font_body());
+            let clean_line = line.replace('\t', "    ");
+            canvas.draw_text(self.bounds.x + gutter_w + theme.pt(16.0), cy, &clean_line, theme.text_primary, theme.font_body());
 
             if i == self.cursor_row {
                 let cursor_x = self.bounds.x + gutter_w + theme.pt(16.0) + (self.cursor_col * theme.pt(9.0));
@@ -543,6 +553,10 @@ impl Widget for TextEditApp {
                 self.lines[self.cursor_row].push_str(&curr_line);
                 self.cursor_col = prev_len;
             }
+            return true;
+        } else if c == '\t' {
+            self.lines[self.cursor_row].insert_str(self.cursor_col, "    ");
+            self.cursor_col += 4;
             return true;
         } else if c >= ' ' && c <= '~' {
             self.lines[self.cursor_row].insert(self.cursor_col, c);

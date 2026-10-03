@@ -4,8 +4,7 @@ pub fn decode_png(data: &[u8]) -> Result<(Vec<u32>, usize, usize), &'static str>
     let cursor = Cursor::new(data);
     let decoder = png::Decoder::new(cursor);
     let mut reader = decoder.read_info().map_err(|_| "Failed to parse PNG header")?;
-    let buf_size = reader.output_buffer_size().ok_or("Failed to calculate PNG output buffer size")?;
-    let mut raw_buf = vec![0u8; buf_size];
+    let mut raw_buf = vec![0u8; reader.output_buffer_size()];
     let output_info = reader.next_frame(&mut raw_buf).map_err(|_| "Failed to decode PNG frame")?;
 
     let width = output_info.width as usize;

@@ -58,11 +58,17 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn measure_text(&mut self, text: &str, size: usize) -> (usize, usize) {
-        let mut width = 0;
         let scale = (size / 10).max(1);
+        let mut width = 0;
         for c in text.chars() {
             if c == '\n' || c == '\r' { continue; }
-            width += get_clean_advance(c) * scale;
+            let adv = match c {
+                ' ' => 5,
+                'i' | 'l' | '!' | '|' | ':' | ';' | '.' | '\'' => 4,
+                'm' | 'w' | 'M' | 'W' | '@' => 10,
+                _ => 8,
+            };
+            width += adv * scale;
         }
         (width, size)
     }
@@ -104,45 +110,52 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn draw_rect_outline(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32, radius: usize) {
-        if w == 0 || h == 0 { return; }
-        if radius == 0 {
-            self.draw_line_h(x, y, w, color);
-            self.draw_line_h(x, y + h.saturating_sub(1), w, color);
-            self.draw_line_v(x, y, h, color);
-            self.draw_line_v(x + w.saturating_sub(1), y, h, color);
-            return;
-        }
-
         let clip = self.current_clip();
         let sx = x.max(clip.x);
         let sy = y.max(clip.y);
         let ex = (x + w).min(clip.x + clip.w);
         let ey = (y + h).min(clip.y + clip.h);
-        if sx >= ex || sy >= ey { return; }
+        if sx >= ex || sy >= ey || w == 0 || h == 0 { return; }
 
-        let r_outer = radius as isize;
-        let r_inner = (radius.saturating_sub(1)) as isize;
-        let ro_sq = r_outer * r_outer;
-        let ri_sq = r_inner * r_inner;
+        let r = radius.min(w / 2).min(h / 2);
+        let stroke_color = color | 0xFF000000;
+
+        if r == 0 {
+            for cx in sx..ex {
+                if y >= clip.y && y < clip.y + clip.h { self.buffer[y * self.width + cx] = stroke_color; }
+                if y + h - 1 >= clip.y && y + h - 1 < clip.y + clip.h { self.buffer[(y + h - 1) * self.width + cx] = stroke_color; }
+            }
+            for cy in sy..ey {
+                if x >= clip.x && x < clip.x + clip.w { self.buffer[cy * self.width + x] = stroke_color; }
+                if x + w - 1 >= clip.x && x + w - 1 < clip.x + clip.w { self.buffer[cy * self.width + (x + w - 1)] = stroke_color; }
+            }
+            return;
+        }
+
+        let r_outer_sq = (r * r) as isize;
+        let r_inner = r.saturating_sub(1);
+        let r_inner_sq = (r_inner * r_inner) as isize;
 
         for cy in sy..ey {
             let row = cy * self.width;
-            let is_top = cy < y + radius;
-            let is_bottom = cy >= (y + h).saturating_sub(radius);
-            let dy = if is_top { (y + radius - 1) as isize - cy as isize } else if is_bottom { cy as isize - (y + h - radius) as isize } else { 0 };
+            let is_top = cy < y + r;
+            let is_bottom = cy >= (y + h).saturating_sub(r);
+            let dy = if is_top { (y + r - 1) as isize - cy as isize } else if is_bottom { cy as isize - (y + h - r) as isize } else { 0 };
 
             for cx in sx..ex {
-                let is_left = cx < x + radius;
-                let is_right = cx >= (x + w).saturating_sub(radius);
+                let is_left = cx < x + r;
+                let is_right = cx >= (x + w).saturating_sub(r);
 
                 if (is_top || is_bottom) && (is_left || is_right) {
-                    let dx = if is_left { (x + radius - 1) as isize - cx as isize } else { cx as isize - (x + w - radius) as isize };
-                    let dist = dx * dx + dy * dy;
-                    if dist <= ro_sq && dist >= ri_sq {
-                        self.buffer[row + cx] = color | 0xFF000000;
+                    let dx = if is_left { (x + r - 1) as isize - cx as isize } else { cx as isize - (x + w - r) as isize };
+                    let dist_sq = dx * dx + dy * dy;
+                    if dist_sq <= r_outer_sq && dist_sq >= r_inner_sq {
+                        self.buffer[row + cx] = stroke_color;
                     }
-                } else if cy == y || cy == y + h - 1 || cx == x || cx == x + w - 1 {
-                    self.buffer[row + cx] = color | 0xFF000000;
+                } else {
+                    if cx == x || cx == x + w - 1 || cy == y || cy == y + h - 1 {
+                        self.buffer[row + cx] = stroke_color;
+                    }
                 }
             }
         }
@@ -158,63 +171,76 @@ impl<'a> Canvas<'a> {
 
     pub fn draw_text(&mut self, x: usize, y: usize, text: &str, color: u32, size: usize) {
         let clip = self.current_clip();
-        let scale = (size / 10).max(1);
-        let mut cur_x = x;
+        let scale_mul = (size / 10).max(1);
 
-        for c in text.chars() {
-            if c == '\n' { cur_x = x; continue; }
-            if c == '\r' { continue; }
+        if let Some(font) = self.font {
+            let scale = Scale::uniform(size as f32);
+            let v_metrics = font.v_metrics(scale);
+            let mut cur_x = x;
 
-            let glyph = get_clean_glyph(c);
-            let adv = get_clean_advance(c) * scale;
+            for c in text.chars() {
+                if c == '\n' || c == '\r' { continue; }
+                let key = (size, c);
+                if !self.font_cache.contains_key(&key) {
+                    let glyph = font.glyph(c).scaled(scale).positioned(point(0.0, v_metrics.ascent));
+                    let adv = glyph.unpositioned().h_metrics().advance_width.round() as usize;
+                    if let Some(bb) = glyph.pixel_bounding_box() {
+                        let mut cov = vec![0u8; bb.width() as usize * bb.height() as usize];
+                        glyph.draw(|gx, gy, v| cov[gy as usize * bb.width() as usize + gx as usize] = (v * 255.0) as u8);
+                        self.font_cache.insert(key, (bb.width() as usize, bb.height() as usize, bb.min.x as isize, bb.min.y as isize, adv.max(1), cov));
+                    } else {
+                        self.font_cache.insert(key, (0, 0, 0, 0, adv.max(size / 3), Vec::new()));
+                    }
+                }
+                let (gw, gh, bx, by, adv, cov) = self.font_cache.get(&key).unwrap();
+                let gx = (cur_x as isize + bx).max(0) as usize;
+                let gy = (y as isize + by).max(0) as usize;
 
-            for gy in 0..16 {
-                let byte = glyph[gy];
-                for gx in 0..8 {
-                    if (byte & (1 << (7 - gx))) != 0 {
-                        for dy in 0..scale {
-                            for dx in 0..scale {
-                                let px = cur_x + gx * scale + dx;
-                                let py = y + gy * scale + dy;
-                                if px >= clip.x && px < clip.x + clip.w && py >= clip.y && py < clip.y + clip.h {
-                                    self.buffer[py * self.width + px] = color | 0xFF000000;
-                                }
-                            }
+                for row in 0..*gh {
+                    let py = gy + row;
+                    if py < clip.y || py >= clip.y + clip.h || py >= self.height { continue; }
+                    for col in 0..*gw {
+                        let px = gx + col;
+                        if px < clip.x || px >= clip.x + clip.w || px >= self.width { continue; }
+                        let alpha = cov[row * gw + col] as u32;
+                        if alpha > 0 {
+                            let idx = py * self.width + px;
+                            self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
                         }
-                    } else if scale > 1 {
-                        // Anti-aliasing softening for edges: check neighboring bits
-                        let has_left = gx > 0 && (byte & (1 << (7 - (gx - 1)))) != 0;
-                        let has_right = gx < 7 && (byte & (1 << (7 - (gx + 1)))) != 0;
-                        let has_top = gy > 0 && (glyph[gy - 1] & (1 << (7 - gx))) != 0;
-                        let has_bottom = gy < 15 && (glyph[gy + 1] & (1 << (7 - gx))) != 0;
-
-                        if (has_left && has_top) || (has_right && has_bottom) || (has_left && has_bottom) || (has_right && has_top) {
-                            let px = cur_x + gx * scale;
-                            let py = y + gy * scale;
-                            if px >= clip.x && px < clip.x + clip.w && py >= clip.y && py < clip.y + clip.h {
-                                self.buffer[py * self.width + px] = Self::blend(self.buffer[py * self.width + px], color, 110);
+                    }
+                }
+                cur_x += adv;
+            }
+        } else {
+            // Built-in sharp fallback rasterizer
+            let mut cur_x = x;
+            for c in text.chars() {
+                if c == '\n' || c == '\r' { continue; }
+                let glyph = get_builtin_glyph(c);
+                for gy in 0..16 {
+                    let byte = glyph[gy];
+                    for gx in 0..8 {
+                        if (byte & (1 << (7 - gx))) != 0 {
+                            for dy in 0..scale_mul {
+                                for dx in 0..scale_mul {
+                                    let px = cur_x + gx * scale_mul + dx;
+                                    let py = y + gy * scale_mul + dy;
+                                    if px >= clip.x && px < clip.x + clip.w && px < self.width
+                                        && py >= clip.y && py < clip.y + clip.h && py < self.height {
+                                        self.buffer[py * self.width + px] = color | 0xFF000000;
+                                    }
+                                }
                             }
                         }
                     }
                 }
+                cur_x += 8 * scale_mul;
             }
-            cur_x += adv;
         }
     }
 }
 
-pub fn get_clean_advance(c: char) -> usize {
-    match c {
-        ' ' => 5,
-        'i' | 'l' | '!' | '|' | ':' | ';' | '.' | '\'' | '`' => 4,
-        'j' | 'r' | 't' | '(' | ')' | '[' | ']' | '{' | '}' => 6,
-        'm' | 'w' | 'M' | 'W' | '@' | '%' => 10,
-        '📁' | '📄' | '⚙' | '🖼' | '💾' | '⚡' => 12,
-        _ => 8,
-    }
-}
-
-pub fn get_clean_glyph(c: char) -> [u8; 16] {
+pub fn get_builtin_glyph(c: char) -> [u8; 16] {
     match c {
         ' ' => [0x00; 16],
         '' => [0x00, 0x08, 0x14, 0x08, 0x3E, 0x7F, 0x7F, 0x7F, 0x7F, 0x7F, 0x3E, 0x1C, 0x00, 0x00, 0x00, 0x00],
@@ -276,12 +302,6 @@ pub fn get_clean_glyph(c: char) -> [u8; 16] {
         'X' => [0x00, 0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'Y' => [0x00, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'Z' => [0x00, 0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '[' => [0x00, 0x3C, 0x30, 0x30, 0x30, 0x30, 0x30, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '\\' => [0x00, 0x40, 0x60, 0x30, 0x18, 0x0C, 0x06, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        ']' => [0x00, 0x3C, 0x0C, 0x0C, 0x0C, 0x0C, 0x0C, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '^' => [0x00, 0x18, 0x3C, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '_' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
-        '`' => [0x00, 0x18, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'a' => [0x00, 0x00, 0x00, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'b' => [0x00, 0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         'c' => [0x00, 0x00, 0x00, 0x3C, 0x66, 0x60, 0x66, 0x3C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],

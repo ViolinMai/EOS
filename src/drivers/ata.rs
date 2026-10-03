@@ -46,6 +46,15 @@ pub struct FatLayout {
     pub root_cluster: u32,
 }
 
+#[inline(always)]
+pub fn is_fat_eof(fat_type: FatType, cluster: u32) -> bool {
+    match fat_type {
+        FatType::Fat12 => cluster >= 0x0FF8,
+        FatType::Fat16 => cluster >= 0xFFF8,
+        FatType::Fat32 => cluster >= 0x0FFF_FFF8,
+    }
+}
+
 #[inline]
 fn get_drive_io_base_and_head(drive: u8) -> (u16, u8) {
     match drive { 
@@ -217,7 +226,7 @@ pub fn scan_dir_cluster(drive: u8, cluster: u32) -> Result<Vec<DiskFileInfo>, &'
             if first_byte == 0xE5 { lfn_parts.clear(); continue; }
 
             let attr = sector[offset + 11];
-            if attr == 0x08 { lfn_parts.clear(); continue; } // Skip vol labels properly
+            if attr == 0x08 { lfn_parts.clear(); continue; }
             if attr == 0x0F {
                 let seq = first_byte & 0x1F;
                 let mut chars = Vec::new();
@@ -248,8 +257,13 @@ pub fn scan_dir_cluster(drive: u8, cluster: u32) -> Result<Vec<DiskFileInfo>, &'
 
             if name == "." || name == ".." { continue; }
 
-            let first_cluster = ((u16::from_le_bytes([sector[offset + 20], sector[offset + 21]]) as u32) << 16)
-                | (u16::from_le_bytes([sector[offset + 26], sector[offset + 27]]) as u32);
+            let first_cluster = if let FatType::Fat32 = layout.fat_type {
+                ((u16::from_le_bytes([sector[offset + 20], sector[offset + 21]]) as u32) << 16)
+                    | (u16::from_le_bytes([sector[offset + 26], sector[offset + 27]]) as u32)
+            } else {
+                u16::from_le_bytes([sector[offset + 26], sector[offset + 27]]) as u32
+            };
+
             let size = u32::from_le_bytes([sector[offset + 28], sector[offset + 29], sector[offset + 30], sector[offset + 31]]);
 
             let mtype = if is_dir { MediaType::Directory } else {
@@ -268,14 +282,14 @@ pub fn scan_dir_cluster(drive: u8, cluster: u32) -> Result<Vec<DiskFileInfo>, &'
         Ok(true)
     };
 
-    if cluster == 0 { // FAT16 root directory behavior
+    if cluster == 0 {
         let start_lba = layout.root_dir_lba;
         for s in 0..layout.root_dir_sectors {
             if !read_dir_sector(start_lba, s)? { break; }
         }
     } else {
         let mut current_cluster = cluster;
-        while current_cluster >= 2 && current_cluster < 0x0FFF_FFF8 {
+        while current_cluster >= 2 && !is_fat_eof(layout.fat_type, current_cluster) {
             let start_lba = layout.data_start_lba + (current_cluster - 2) * layout.spc;
             for s in 0..layout.spc {
                 if !read_dir_sector(start_lba, s)? { return Ok(files); }
@@ -300,7 +314,7 @@ pub fn read_entire_file(drive: u8, file_info: &DiskFileInfo) -> Result<Vec<u8>, 
     let cluster_bytes = (layout.spc as usize) * 512;
     let mut cluster_buf = alloc::vec![0u8; cluster_bytes];
     
-    while current_cluster >= 2 && current_cluster < 0x0FFF_FFF8 && remaining > 0 {
+    while current_cluster >= 2 && !is_fat_eof(layout.fat_type, current_cluster) && remaining > 0 {
         let cluster_offset = (current_cluster - 2) * layout.spc;
         read_sectors_drive(drive, layout.data_start_lba + cluster_offset, layout.spc as u8, &mut cluster_buf)?;
         let to_copy = core::cmp::min(remaining, cluster_bytes);
@@ -321,7 +335,7 @@ pub fn write_file_content(drive: u8, filename: &str, content: &[u8]) -> Result<(
     let mut current_cluster = target.first_cluster;
     let mut sector_buf = [0u8; 512];
 
-    while current_cluster >= 2 && current_cluster < 0x0FFF_FFF8 && remaining > 0 {
+    while current_cluster >= 2 && !is_fat_eof(layout.fat_type, current_cluster) && remaining > 0 {
         let cluster_lba = layout.data_start_lba + (current_cluster - 2) * layout.spc;
         for sec in 0..layout.spc {
             let sec_write = core::cmp::min(remaining, 512);

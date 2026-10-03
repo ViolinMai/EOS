@@ -26,12 +26,28 @@ pub struct FrameworkApp<'a> {
     pub menubar: MenuBar,
     pub active_app_title: String,
     pub needs_redraw: bool,
-    pub damage_rects: Vec<[u32; 4]>,
 }
 
 impl<'a> FrameworkApp<'a> {
     pub fn new(font_bytes: &'a [u8], width: usize, height: usize) -> Self {
-        let font = if !font_bytes.is_empty() { Font::try_from_bytes(font_bytes) } else { None };
+        let font = if !font_bytes.is_empty() {
+            if let Some(f) = Font::try_from_bytes(font_bytes) {
+                let is_valid = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    f.v_metrics(rusttype::Scale::uniform(16.0))
+                }));
+                if is_valid.is_ok() {
+                    Some(f)
+                } else {
+                    println!("[FONT] Warning: Font lacks units_per_em (CFF/OTF not supported by rusttype), using built-in glyph engine.");
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let mut buffer = Vec::new();
         buffer.resize(width * height, 0xFF0F172A);
 
@@ -56,7 +72,6 @@ impl<'a> FrameworkApp<'a> {
             menubar,
             active_app_title: "Finder".into(),
             needs_redraw: true,
-            damage_rects: Vec::new(),
         }
     }
 
@@ -68,7 +83,7 @@ impl<'a> FrameworkApp<'a> {
         for w in &mut self.root_widgets {
             if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
                 if frame.title == name {
-                    frame.is_closed = !frame.is_closed;
+                    frame.is_closed = false;
                     self.active_app_title = name.to_string();
                     self.needs_redraw = true;
                     return;
@@ -79,10 +94,10 @@ impl<'a> FrameworkApp<'a> {
         let theme = get_theme();
         let new_win: Box<dyn Widget> = match name {
             "Finder" => Box::new(WindowFrame::new("Finder", theme.pt(80.0), theme.pt(50.0), theme.pt(780.0), theme.pt(480.0), Box::new(FinderApp::new()))),
-            "Terminal" => Box::new(WindowFrame::new("Terminal", theme.pt(120.0), theme.pt(80.0), theme.pt(640.0), theme.pt(420.0), Box::new(TerminalApp::new()))),
-            "Activity Monitor" => Box::new(WindowFrame::new("Activity Monitor", theme.pt(140.0), theme.pt(70.0), theme.pt(680.0), theme.pt(440.0), Box::new(ActivityMonitorApp::new()))),
-            "TextEdit" => Box::new(WindowFrame::new("TextEdit", theme.pt(160.0), theme.pt(100.0), theme.pt(620.0), theme.pt(440.0), Box::new(TextEditApp::new()))),
-            "Settings" => Box::new(WindowFrame::new("Settings", theme.pt(200.0), theme.pt(70.0), theme.pt(600.0), theme.pt(400.0), Box::new(SettingsApp::new()))),
+            "Terminal" => Box::new(WindowFrame::new("Terminal", theme.pt(140.0), theme.pt(100.0), theme.pt(640.0), theme.pt(420.0), Box::new(TerminalApp::new()))),
+            "Activity Monitor" => Box::new(WindowFrame::new("Activity Monitor", theme.pt(160.0), theme.pt(90.0), theme.pt(680.0), theme.pt(440.0), Box::new(ActivityMonitorApp::new()))),
+            "TextEdit" => Box::new(WindowFrame::new("TextEdit", theme.pt(180.0), theme.pt(110.0), theme.pt(620.0), theme.pt(440.0), Box::new(TextEditApp::new()))),
+            "Settings" => Box::new(WindowFrame::new("Settings", theme.pt(200.0), theme.pt(80.0), theme.pt(600.0), theme.pt(400.0), Box::new(SettingsApp::new()))),
             _ => return,
         };
 
@@ -102,6 +117,7 @@ impl<'a> FrameworkApp<'a> {
         let theme = get_theme();
         self.buffer.fill(theme.bg_desktop);
 
+        // 1. Draw Windows
         {
             let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
             for w in &self.root_widgets {
@@ -109,18 +125,20 @@ impl<'a> FrameworkApp<'a> {
             }
         }
 
+        // 2. Top MenuBar
         {
             let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
             self.menubar.paint(&mut canvas, &self.active_app_title);
         }
 
+        // 3. Dock
         {
             let item_count = self.dock_items.len();
             let base_item_w = theme.pt(52.0);
             let gap = theme.pt(14.0);
             let total_dock_w = (item_count * base_item_w) + ((item_count + 1) * gap);
             let dock_h = theme.pt(68.0);
-            let dock_x = (self.width - total_dock_w) / 2;
+            let dock_x = (self.width.saturating_sub(total_dock_w)) / 2;
             let dock_y = self.height.saturating_sub(dock_h + theme.pt(14.0));
 
             let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
@@ -159,6 +177,7 @@ impl<'a> FrameworkApp<'a> {
             }
         }
 
+        // 4. Cursor
         {
             let cursor_col = if self.mouse_clicked { theme.accent_hover } else { 0xFFFFFFFF };
             let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
@@ -166,9 +185,8 @@ impl<'a> FrameworkApp<'a> {
             canvas.draw_rect(self.mouse_x.saturating_sub(2), self.mouse_y.saturating_sub(2), cur_sz, cur_sz, cursor_col, cur_sz / 2);
         }
 
-        self.damage_rects.push([0, 0, self.width as u32, self.height as u32]);
-        sdk::window::present_rects(self.buffer.as_ptr(), self.width, self.height, &self.damage_rects);
-        self.damage_rects.clear();
+        // Direct Full Frame Present
+        sdk::window::present(self.buffer.as_ptr(), self.width, self.height);
     }
 
     pub fn run_loop(&mut self) -> ! {
@@ -241,7 +259,7 @@ impl<'a> FrameworkApp<'a> {
             let gap = theme.pt(14.0);
             let total_dock_w = (item_count * base_item_w) + ((item_count + 1) * gap);
             let dock_h = theme.pt(68.0);
-            let dock_x = (self.width - total_dock_w) / 2;
+            let dock_x = (self.width.saturating_sub(total_dock_w)) / 2;
             let dock_y = self.height.saturating_sub(dock_h + theme.pt(14.0));
 
             let old_dock_hover = self.dock_hovered;
@@ -305,7 +323,7 @@ impl<'a> FrameworkApp<'a> {
                 self.render_frame();
                 self.needs_redraw = false;
             } else {
-                thread::sleep(Duration::from_millis(16));
+                thread::sleep(Duration::from_millis(8));
             }
         }
     }

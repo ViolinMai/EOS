@@ -2,7 +2,7 @@ use std::any::Any;
 use super::canvas::Canvas;
 use super::theme::get_theme;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
 pub struct Rect {
     pub x: usize,
     pub y: usize,
@@ -11,7 +11,7 @@ pub struct Rect {
 }
 
 impl Rect {
-    pub const fn new(x: usize, y: usize, w: usize, h: usize) -> Self {
+    pub fn new(x: usize, y: usize, w: usize, h: usize) -> Self {
         Self { x, y, w, h }
     }
 
@@ -20,12 +20,12 @@ impl Rect {
     }
 
     pub fn intersect(&self, other: &Rect) -> Rect {
-        let sx = self.x.max(other.x);
-        let sy = self.y.max(other.y);
-        let ex = (self.x + self.w).min(other.x + other.w);
-        let ey = (self.y + self.h).min(other.y + other.h);
-        if sx < ex && sy < ey {
-            Rect::new(sx, sy, ex - sx, ey - sy)
+        let x1 = self.x.max(other.x);
+        let y1 = self.y.max(other.y);
+        let x2 = (self.x + self.w).min(other.x + other.w);
+        let y2 = (self.y + self.h).min(other.y + other.h);
+        if x2 > x1 && y2 > y1 {
+            Rect::new(x1, y1, x2 - x1, y2 - y1)
         } else {
             Rect::new(0, 0, 0, 0)
         }
@@ -45,31 +45,24 @@ pub struct WindowFrame {
     pub title: String,
     pub bounds: Rect,
     pub content: Box<dyn Widget>,
-    pub is_dragging: bool,
-    pub drag_offset_x: usize,
-    pub drag_offset_y: usize,
     pub is_closed: bool,
-    pub is_maximized: bool,
-    pub is_fullscreen: bool,
-    pub saved_bounds: Rect,
-    pub last_title_click: u64,
+    pub is_minimized: bool,
+    pub is_dragging: bool,
+    pub drag_off_x: usize,
+    pub drag_off_y: usize,
 }
 
 impl WindowFrame {
     pub fn new(title: impl Into<String>, x: usize, y: usize, w: usize, h: usize, content: Box<dyn Widget>) -> Self {
-        let bounds = Rect::new(x, y, w, h);
         Self {
             title: title.into(),
-            bounds,
+            bounds: Rect::new(x, y, w, h),
             content,
-            is_dragging: false,
-            drag_offset_x: 0,
-            drag_offset_y: 0,
             is_closed: false,
-            is_maximized: false,
-            is_fullscreen: false,
-            saved_bounds: bounds,
-            last_title_click: 0,
+            is_minimized: false,
+            is_dragging: false,
+            drag_off_x: 0,
+            drag_off_y: 0,
         }
     }
 }
@@ -79,131 +72,89 @@ impl Widget for WindowFrame {
     fn as_any_mut(&mut self) -> &mut dyn Any { self }
 
     fn layout(&mut self, _x: usize, _y: usize, _w: usize, _h: usize) -> Rect {
-        if !self.is_closed {
-            let theme = get_theme();
-            let tb_h = if self.is_fullscreen { 0 } else { theme.pt(32.0) };
-            self.content.layout(
-                self.bounds.x,
-                self.bounds.y + tb_h,
-                self.bounds.w,
-                self.bounds.h.saturating_sub(tb_h),
-            );
-        }
+        let theme = get_theme();
+        let tb_h = theme.pt(32.0);
+        self.content.layout(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, self.bounds.h.saturating_sub(tb_h));
         self.bounds
     }
 
     fn paint(&self, canvas: &mut Canvas) {
-        if self.is_closed { return; }
+        if self.is_closed || self.is_minimized { return; }
         let theme = get_theme();
-        let tb_h = if self.is_fullscreen { 0 } else { theme.pt(32.0) };
-        let radius = if self.is_maximized || self.is_fullscreen { 0 } else { theme.pt(10.0) };
+        let tb_h = theme.pt(32.0);
+        let rad = theme.pt(10.0);
 
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, radius);
+        // 1. خلفية النافذة مع الزوايا المنحنية
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, rad);
 
-        if !self.is_fullscreen {
-            canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, radius);
-            if radius > 0 {
-                canvas.draw_rect(self.bounds.x, self.bounds.y + tb_h - radius, self.bounds.w, radius, theme.bg_titlebar, 0);
-            }
-            canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
-
-            let btn_y = self.bounds.y + theme.pt(9.0);
-            let btn_r = theme.pt(14.0);
-            canvas.draw_rect(self.bounds.x + theme.pt(16.0), btn_y, btn_r, btn_r, theme.btn_close, btn_r / 2);
-            canvas.draw_rect(self.bounds.x + theme.pt(38.0), btn_y, btn_r, btn_r, theme.btn_min, btn_r / 2);
-            canvas.draw_rect(self.bounds.x + theme.pt(60.0), btn_y, btn_r, btn_r, theme.btn_max, btn_r / 2);
-
-            let (tw, _) = canvas.measure_text(&self.title, theme.font_title());
-            let tx = self.bounds.x + (self.bounds.w.saturating_sub(tw) / 2);
-            canvas.draw_text(tx, self.bounds.y + theme.pt(7.0), &self.title, theme.text_primary, theme.font_title());
+        // 2. خلفية شريط العنوان
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, rad);
+        if rad > 0 && tb_h >= rad {
+            canvas.draw_rect(self.bounds.x, self.bounds.y + tb_h - rad, self.bounds.w, rad, theme.bg_titlebar, 0);
         }
+        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
 
-        if !self.is_maximized && !self.is_fullscreen {
-            canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.border_window, radius);
-        }
+        // 3. أزرار إشارات المرور (Traffic Lights)
+        let btn_sz = theme.pt(12.0);
+        let btn_y = self.bounds.y + (tb_h.saturating_sub(btn_sz) / 2);
+        canvas.draw_rect(self.bounds.x + theme.pt(14.0), btn_y, btn_sz, btn_sz, 0xFFFF5F56, btn_sz / 2);
+        canvas.draw_rect(self.bounds.x + theme.pt(32.0), btn_y, btn_sz, btn_sz, 0xFFFFBD2E, btn_sz / 2);
+        canvas.draw_rect(self.bounds.x + theme.pt(50.0), btn_y, btn_sz, btn_sz, 0xFF27C93F, btn_sz / 2);
 
-        canvas.push_clip(Rect::new(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, self.bounds.h.saturating_sub(tb_h)));
+        // 4. عنوان النافذة
+        let (tw, _) = canvas.measure_text(&self.title, theme.font_body());
+        let tx = self.bounds.x + (self.bounds.w.saturating_sub(tw) / 2);
+        canvas.draw_text(tx, self.bounds.y + theme.pt(6.0), &self.title, theme.text_primary, theme.font_body());
+
+        // 5. محتوى النافذة الداخلي
+        canvas.push_clip(Rect::new(self.bounds.x, self.bounds.y + tb_h + 1, self.bounds.w, self.bounds.h.saturating_sub(tb_h + 1)));
         self.content.paint(canvas);
         canvas.pop_clip();
+
+        // 6. الإطار الأسود الرفيع يتبع نفس انحناء الزاوية الخارجي بدقة
+        canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF000000, rad);
     }
 
     fn handle_mouse(&mut self, mx: usize, my: usize, pressed: bool) -> bool {
-        if self.is_closed { return false; }
+        if self.is_closed || self.is_minimized { return false; }
         let theme = get_theme();
-        let tb_h = if self.is_fullscreen { 0 } else { theme.pt(32.0) };
+        let tb_h = theme.pt(32.0);
 
-        if pressed {
-            if !self.is_dragging && my >= self.bounds.y && my <= self.bounds.y + tb_h && mx >= self.bounds.x && mx <= self.bounds.x + self.bounds.w {
-                let btn_y = self.bounds.y + theme.pt(9.0);
-                let btn_r = theme.pt(14.0);
+        if !pressed {
+            self.is_dragging = false;
+        }
 
-                if mx >= self.bounds.x + theme.pt(16.0) && mx <= self.bounds.x + theme.pt(16.0) + btn_r && my >= btn_y && my <= btn_y + btn_r {
-                    self.is_closed = true;
-                    return true;
-                }
-                if mx >= self.bounds.x + theme.pt(38.0) && mx <= self.bounds.x + theme.pt(38.0) + btn_r && my >= btn_y && my <= btn_y + btn_r {
-                    self.is_closed = true;
-                    return true;
-                }
-                if mx >= self.bounds.x + theme.pt(60.0) && mx <= self.bounds.x + theme.pt(60.0) + btn_r && my >= btn_y && my <= btn_y + btn_r {
-                    if self.is_maximized || self.is_fullscreen {
-                        self.bounds = self.saved_bounds;
-                        self.is_maximized = false;
-                        self.is_fullscreen = false;
-                    } else {
-                        self.saved_bounds = self.bounds;
-                        self.bounds = Rect::new(0, theme.pt(32.0), 1920, 1080 - theme.pt(32.0) - theme.pt(78.0));
-                        self.is_maximized = true;
-                    }
-                    return true;
-                }
+        if self.is_dragging && pressed {
+            self.bounds.x = mx.saturating_sub(self.drag_off_x).clamp(0, 1920usize.saturating_sub(self.bounds.w));
+            self.bounds.y = my.saturating_sub(self.drag_off_y).clamp(theme.pt(32.0), 1080usize.saturating_sub(self.bounds.h));
+            self.content.layout(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, self.bounds.h.saturating_sub(tb_h));
+            return true;
+        }
 
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-                if now.saturating_sub(self.last_title_click) < 350 {
-                    if self.is_maximized {
-                        self.bounds = self.saved_bounds;
-                        self.is_maximized = false;
-                    } else {
-                        self.saved_bounds = self.bounds;
-                        self.bounds = Rect::new(0, theme.pt(32.0), 1920, 1080 - theme.pt(32.0) - theme.pt(78.0));
-                        self.is_maximized = true;
-                    }
-                    self.last_title_click = 0;
-                    return true;
-                }
-                self.last_title_click = now;
+        if !self.bounds.contains(mx, my) { return false; }
 
-                if !self.is_maximized && !self.is_fullscreen {
-                    self.is_dragging = true;
-                    self.drag_offset_x = mx.saturating_sub(self.bounds.x);
-                    self.drag_offset_y = my.saturating_sub(self.bounds.y);
-                }
+        if my < self.bounds.y + tb_h {
+            let btn_sz = theme.pt(12.0);
+            let btn_y = self.bounds.y + (tb_h.saturating_sub(btn_sz) / 2);
+            let close_rect = Rect::new(self.bounds.x + theme.pt(14.0), btn_y, btn_sz, btn_sz);
+            if close_rect.contains(mx, my) && pressed {
+                self.is_closed = true;
                 return true;
             }
 
-            if self.is_dragging {
-                self.bounds.x = mx.saturating_sub(self.drag_offset_x);
-                self.bounds.y = my.saturating_sub(self.drag_offset_y).max(theme.pt(32.0));
+            if pressed {
+                self.is_dragging = true;
+                self.drag_off_x = mx - self.bounds.x;
+                self.drag_off_y = my - self.bounds.y;
                 return true;
-            }
-
-            if self.bounds.contains(mx, my) {
-                return self.content.handle_mouse(mx, my, pressed);
-            }
-        } else {
-            if self.is_dragging {
-                self.is_dragging = false;
-                return true;
-            }
-            if self.bounds.contains(mx, my) {
-                return self.content.handle_mouse(mx, my, pressed);
             }
         }
-        false
+
+        self.content.handle_mouse(mx, my, pressed)
     }
 
     fn handle_char(&mut self, c: char) -> bool {
-        if self.is_closed { return false; }
+        if self.is_closed || self.is_minimized { return false; }
         self.content.handle_char(c)
     }
 }
