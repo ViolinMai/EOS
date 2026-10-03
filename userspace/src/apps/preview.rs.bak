@@ -1,0 +1,118 @@
+use crate::framework::*;
+
+pub struct PreviewApp {
+    bounds: Rect,
+    pub title: String,
+    pub image_data: Vec<u8>,
+    pub width: usize,
+    pub height: usize,
+    pub raw_pixels: Vec<u32>,
+}
+
+impl PreviewApp {
+    pub fn new(title: String, data: Vec<u8>) -> Self {
+        let mut app = Self {
+            bounds: Rect::default(),
+            title,
+            image_data: data,
+            width: 0,
+            height: 0,
+            raw_pixels: Vec::new(),
+        };
+        app.decode();
+        app
+    }
+
+    fn decode(&mut self) {
+        if self.image_data.is_empty() { return; }
+
+        if self.image_data.len() >= 2 && self.image_data[0] == 0xFF && self.image_data[1] == 0xD8 {
+            let mut decoder = zune_jpeg::JpegDecoder::new(&self.image_data);
+            if let Ok(px) = decoder.decode() {
+                if let Some(info) = decoder.info() {
+                    self.width = info.width as usize;
+                    self.height = info.height as usize;
+                    let total_pixels = self.width * self.height;
+                    self.raw_pixels = vec![0u32; total_pixels];
+
+                    let channels = if px.len() >= total_pixels * 4 {
+                        4
+                    } else if px.len() >= total_pixels * 3 {
+                        3
+                    } else {
+                        1
+                    };
+
+                    for i in 0..total_pixels {
+                        let o = i * channels;
+                        if o + channels <= px.len() {
+                            if channels == 4 {
+                                self.raw_pixels[i] = ((px[o + 3] as u32) << 24)
+                                    | ((px[o] as u32) << 16)
+                                    | ((px[o + 1] as u32) << 8)
+                                    | (px[o + 2] as u32);
+                            } else if channels == 3 {
+                                self.raw_pixels[i] = (0xFF << 24)
+                                    | ((px[o] as u32) << 16)
+                                    | ((px[o + 1] as u32) << 8)
+                                    | (px[o + 2] as u32);
+                            } else {
+                                let v = px[o] as u32;
+                                self.raw_pixels[i] = (0xFF << 24) | (v << 16) | (v << 8) | v;
+                            }
+                        }
+                    }
+                }
+            }
+        } else if self.image_data.starts_with(b"\x89PNG\r\n\x1a\n") {
+            if let Ok((px, w, h)) = crate::png::decode_png(&self.image_data) {
+                self.width = w;
+                self.height = h;
+                self.raw_pixels = px;
+            }
+        }
+    }
+}
+
+impl Widget for PreviewApp {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+    fn layout(&mut self, x: usize, y: usize, w: usize, h: usize) -> Rect {
+        self.bounds = Rect { x, y, w, h };
+        self.bounds
+    }
+
+    fn paint(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF050811, 0);
+
+        if self.width == 0 || self.height == 0 || self.raw_pixels.is_empty() {
+            let msg = format!("Image Loaded: {} ({} bytes)", self.title, self.image_data.len());
+            canvas.draw_text(self.bounds.x + theme.pt(20.0), self.bounds.y + theme.pt(40.0), &msg, theme.text_primary, theme.font_title());
+            canvas.draw_text(self.bounds.x + theme.pt(20.0), self.bounds.y + theme.pt(80.0), "Ready for render inspection", theme.text_secondary, theme.font_body());
+            return;
+        }
+
+        let step_x = (self.width + self.bounds.w - 1) / self.bounds.w;
+        let step_y = (self.height + self.bounds.h - 1) / self.bounds.h;
+        let step = step_x.max(step_y).max(1);
+
+        let disp_w = (self.width / step).min(self.bounds.w);
+        let disp_h = (self.height / step).min(self.bounds.h);
+        let off_x = self.bounds.x + (self.bounds.w.saturating_sub(disp_w) / 2);
+        let off_y = self.bounds.y + (self.bounds.h.saturating_sub(disp_h) / 2);
+
+        for dy in 0..disp_h {
+            let src_y = dy * step;
+            let dst_y = off_y + dy;
+            if dst_y >= canvas.height { break; }
+            for dx in 0..disp_w {
+                let src_x = dx * step;
+                let dst_x = off_x + dx;
+                if dst_x >= canvas.width { break; }
+                let col = self.raw_pixels[src_y * self.width + src_x];
+                canvas.buffer[dst_y * canvas.width + dst_x] = col;
+            }
+        }
+    }
+}

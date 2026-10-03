@@ -257,8 +257,13 @@ pub fn scan_dir_cluster(drive: u8, cluster: u32) -> Result<Vec<DiskFileInfo>, &'
 
             if name == "." || name == ".." { continue; }
 
-            let first_cluster = ((u16::from_le_bytes([sector[offset + 20], sector[offset + 21]]) as u32) << 16)
-                | (u16::from_le_bytes([sector[offset + 26], sector[offset + 27]]) as u32);
+            let first_cluster = if let FatType::Fat32 = layout.fat_type {
+                ((u16::from_le_bytes([sector[offset + 20], sector[offset + 21]]) as u32) << 16)
+                    | (u16::from_le_bytes([sector[offset + 26], sector[offset + 27]]) as u32)
+            } else {
+                u16::from_le_bytes([sector[offset + 26], sector[offset + 27]]) as u32
+            };
+
             let size = u32::from_le_bytes([sector[offset + 28], sector[offset + 29], sector[offset + 30], sector[offset + 31]]);
 
             let mtype = if is_dir { MediaType::Directory } else {

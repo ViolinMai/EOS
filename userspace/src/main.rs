@@ -2,7 +2,8 @@ mod syscall;
 mod sdk;
 mod framework;
 pub mod png;
-mod apps;
+#[path = "apps/mod.rs"]
+pub mod apps;
 
 use std::fs;
 use framework::*;
@@ -13,7 +14,6 @@ const SCREEN_H: usize = 1080;
 pub fn is_valid_truetype_font(data: &[u8]) -> bool {
     if data.len() < 12 { return false; }
     let magic = &data[0..4];
-    // استبعاد خطوط CFF/PostScript التي لا تدعمها مكتبة rusttype 0.9
     if magic == b"OTTO" {
         return false;
     }

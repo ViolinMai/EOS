@@ -1,4 +1,5 @@
-#[derive(Clone, Copy, Debug)]
+use std::sync::atomic::{AtomicU32, Ordering};
+
 pub struct Theme {
     pub scale: f32,
     pub bg_desktop: u32,
@@ -7,8 +8,9 @@ pub struct Theme {
     pub bg_dock: u32,
     pub border_dock: u32,
     pub bg_window: u32,
-    pub bg_titlebar: u32,
     pub border_window: u32,
+    pub bg_titlebar: u32,
+    pub border_titlebar: u32,
     pub separator: u32,
     pub text_primary: u32,
     pub text_secondary: u32,
@@ -18,31 +20,8 @@ pub struct Theme {
     pub btn_close: u32,
     pub btn_min: u32,
     pub btn_max: u32,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Self {
-            scale: 1.5,
-            bg_desktop: 0xFF0F172A,
-            bg_menubar: 0xFF18181B,
-            border_menubar: 0xFF27272A,
-            bg_dock: 0xFF1E293B,
-            border_dock: 0xFF334155,
-            bg_window: 0xFF0F172A,
-            bg_titlebar: 0xFF1E293B,
-            border_window: 0xFF334155,
-            separator: 0xFF27272A,
-            text_primary: 0xFFF8FAFC,
-            text_secondary: 0xFFCBD5E1,
-            text_muted: 0xFF64748B,
-            accent: 0xFF0284C7,
-            accent_hover: 0xFF38BDF8,
-            btn_close: 0xFFFF5F56,
-            btn_min: 0xFFFFBD2E,
-            btn_max: 0xFF27C93F,
-        }
-    }
+    pub radius_window: usize,
+    pub radius_dock: usize,
 }
 
 impl Theme {
@@ -50,37 +29,43 @@ impl Theme {
         (val * self.scale).round() as usize
     }
 
-    pub fn font_title(&self) -> usize { self.pt(16.0) }  // 24px on 1.5x
-    pub fn font_body(&self) -> usize { self.pt(13.0) }   // ~20px on 1.5x
-    pub fn font_caption(&self) -> usize { self.pt(11.0) } // ~17px on 1.5x
-    pub fn font_large(&self) -> usize { self.pt(20.0) }   // 30px on 1.5x
+    pub fn font_caption(&self) -> usize { self.pt(11.0) }
+    pub fn font_body(&self) -> usize { self.pt(13.0) }
+    pub fn font_title(&self) -> usize { self.pt(15.0) }
+    pub fn font_large(&self) -> usize { self.pt(18.0) }
 }
 
-pub static mut CURRENT_THEME: Theme = Theme {
-    scale: 1.5,
-    bg_desktop: 0xFF0F172A,
-    bg_menubar: 0xFF18181B,
-    border_menubar: 0xFF27272A,
-    bg_dock: 0xFF1E293B,
-    border_dock: 0xFF334155,
-    bg_window: 0xFF0F172A,
-    bg_titlebar: 0xFF1E293B,
-    border_window: 0xFF334155,
-    separator: 0xFF27272A,
-    text_primary: 0xFFF8FAFC,
-    text_secondary: 0xFFCBD5E1,
-    text_muted: 0xFF64748B,
-    accent: 0xFF0284C7,
-    accent_hover: 0xFF38BDF8,
-    btn_close: 0xFFFF5F56,
-    btn_min: 0xFFFFBD2E,
-    btn_max: 0xFF27C93F,
-};
-
-pub fn get_theme() -> Theme {
-    unsafe { CURRENT_THEME }
-}
+static CURRENT_SCALE_BITS: AtomicU32 = AtomicU32::new(0x3FC00000); // 1.5f32
 
 pub fn set_theme_scale(scale: f32) {
-    unsafe { CURRENT_THEME.scale = scale.clamp(1.0, 3.0); }
+    CURRENT_SCALE_BITS.store(scale.to_bits(), Ordering::Relaxed);
+}
+
+pub fn get_theme() -> Theme {
+    let scale = f32::from_bits(CURRENT_SCALE_BITS.load(Ordering::Relaxed));
+    let s_pt = |v: f32| (v * scale).round() as usize;
+
+    Theme {
+        scale,
+        bg_desktop: 0xFF0F172A,
+        bg_menubar: 0xEE18181B,
+        border_menubar: 0x33FFFFFF,
+        bg_dock: 0xDD1E293B,
+        border_dock: 0x33FFFFFF,
+        bg_window: 0xFF18181B,
+        border_window: 0xFF27272A,
+        bg_titlebar: 0xFF27272A,
+        border_titlebar: 0xFF3F3F46,
+        separator: 0xFF3F3F46,
+        text_primary: 0xFFF8FAFC,
+        text_secondary: 0xFFCBD5E1,
+        text_muted: 0xFF64748B,
+        accent: 0xFF0284C7,
+        accent_hover: 0xFF38BDF8,
+        btn_close: 0xFFFF5F56,
+        btn_min: 0xFFFFBD2E,
+        btn_max: 0xFF27C93F,
+        radius_window: s_pt(10.0),
+        radius_dock: s_pt(18.0),
+    }
 }

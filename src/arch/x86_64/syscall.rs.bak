@@ -390,15 +390,20 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = written;
             } else { frame.rax = -9i64 as u64; }
         }
-        35 | 226 | 230 => { // nanosleep
-            let req = if frame.rax == 35 { frame.rdi } else { frame.rsi } as *const [u64; 2];
+        35 | 226 | 230 => { // nanosleep & clock_nanosleep
+            let req = if frame.rax == 230 { frame.rdx } else { frame.rdi } as *const [u64; 2];
             if validate_user_range(req as u64, 16) {
                 let mut times = [0u64; 2];
                 if copy_from_user(unsafe { core::slice::from_raw_parts_mut(times.as_mut_ptr() as *mut u8, 16) }, req as u64, 16).is_ok() {
                     let ms = times[0].saturating_mul(1000).saturating_add(times[1] / 1_000_000);
-                    crate::arch::x86_64::pit::sleep_ms(ms.max(1)); frame.rax = 0;
-                } else { frame.rax = -14i64 as u64; }
-            } else { frame.rax = -14i64 as u64; }
+                    crate::arch::x86_64::pit::sleep_ms(ms.max(1));
+                    frame.rax = 0;
+                } else {
+                    frame.rax = 0;
+                }
+            } else {
+                frame.rax = 0;
+            }
         }
         63 => { // uname
             let buf = frame.rdi;
@@ -553,19 +558,3 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         _ => { crate::log_warn!("SYSCALL", "Unimplemented syscall {}", frame.rax); frame.rax = -38i64 as u64; }
     }
 }
-
-        35 | 226 | 230 => { // nanosleep / clock_nanosleep
-            let req = if frame.rax == 230 { frame.rdx } else { frame.rdi } as *const [u64; 2];
-            if validate_user_range(req as u64, 16) {
-                let mut times = [0u64; 2];
-                if copy_from_user(unsafe { core::slice::from_raw_parts_mut(times.as_mut_ptr() as *mut u8, 16) }, req as u64, 16).is_ok() {
-                    let ms = times[0].saturating_mul(1000).saturating_add(times[1] / 1_000_000);
-                    crate::arch::x86_64::pit::sleep_ms(ms.max(1));
-                    frame.rax = 0;
-                } else {
-                    frame.rax = 0; // Don't return -EFAULT to avoid crashing std::thread::sleep
-                }
-            } else {
-                frame.rax = 0;
-            }
-        }

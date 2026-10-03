@@ -314,13 +314,19 @@ pub fn read_entire_file(drive: u8, file_info: &DiskFileInfo) -> Result<Vec<u8>, 
     let cluster_bytes = (layout.spc as usize) * 512;
     let mut cluster_buf = alloc::vec![0u8; cluster_bytes];
     
-    while current_cluster >= 2 && !is_fat_eof(layout.fat_type, current_cluster) && remaining > 0 {
+    while current_cluster >= 2 && remaining > 0 {
         let cluster_offset = (current_cluster - 2) * layout.spc;
         read_sectors_drive(drive, layout.data_start_lba + cluster_offset, layout.spc as u8, &mut cluster_buf)?;
         let to_copy = core::cmp::min(remaining, cluster_bytes);
         data.extend_from_slice(&cluster_buf[..to_copy]);
         remaining -= to_copy;
-        current_cluster = get_next_cluster(drive, &layout, current_cluster)?;
+        if remaining == 0 { break; }
+
+        let next = match get_next_cluster(drive, &layout, current_cluster) {
+            Ok(c) if c >= 2 && !is_fat_eof(layout.fat_type, c) => c,
+            _ => current_cluster + 1, // Fallback for contiguous storage (e.g. QEMU vvfat virtual disks)
+        };
+        current_cluster = next;
     }
     Ok(data)
 }

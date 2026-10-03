@@ -390,6 +390,39 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = written;
             } else { frame.rax = -9i64 as u64; }
         }
+        25 => { // mremap
+            let old_addr = frame.rdi;
+            let old_len = frame.rsi as usize;
+            let new_len = frame.rdx as usize;
+            let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
+            if new_len > old_len {
+                let additional = new_len - old_len;
+                let add_pages = (additional + 0xFFF) / 4096;
+                let extend_addr = old_addr + ((old_len as u64 + 0xFFF) & !0xFFF);
+                if crate::mm::paging::map_user_pages(cur_pml4, extend_addr, add_pages).is_ok() {
+                    frame.rax = old_addr;
+                } else {
+                    // allocate completely new region
+                    let new_pages = (new_len + 0xFFF) / 4096;
+                    let vaddr = unsafe {
+                        let proc = &mut *addr_of_mut!(CORE2_PROCESS);
+                        let addr = proc.mmap_bump;
+                        proc.mmap_bump += (new_pages * 4096) as u64;
+                        addr
+                    };
+                    if crate::mm::paging::map_user_pages(cur_pml4, vaddr, new_pages).is_ok() {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(old_addr as *const u8, vaddr as *mut u8, old_len);
+                        }
+                        frame.rax = vaddr;
+                    } else {
+                        frame.rax = -12i64 as u64; // ENOMEM
+                    }
+                }
+            } else {
+                frame.rax = old_addr;
+            }
+        }
         35 | 226 | 230 => { // nanosleep & clock_nanosleep
             let req = if frame.rax == 230 { frame.rdx } else { frame.rdi } as *const [u64; 2];
             if validate_user_range(req as u64, 16) {

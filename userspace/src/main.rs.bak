@@ -2,7 +2,7 @@ mod syscall;
 mod sdk;
 mod framework;
 pub mod png;
-mod apps;
+pub mod apps;
 
 use std::fs;
 use framework::*;
@@ -10,12 +10,43 @@ use framework::*;
 const SCREEN_W: usize = 1920;
 const SCREEN_H: usize = 1080;
 
+pub fn is_valid_truetype_font(data: &[u8]) -> bool {
+    if data.len() < 12 { return false; }
+    let magic = &data[0..4];
+    if magic == b"OTTO" {
+        return false;
+    }
+    if magic != &[0x00, 0x01, 0x00, 0x00] && magic != b"true" {
+        return false;
+    }
+    let num_tables = u16::from_be_bytes([data[4], data[5]]) as usize;
+    let mut off = 12;
+    for _ in 0..num_tables {
+        if off + 16 > data.len() { return false; }
+        let tag = &data[off..off + 4];
+        let table_off = u32::from_be_bytes([data[off + 8], data[off + 9], data[off + 10], data[off + 11]]) as usize;
+        let table_len = u32::from_be_bytes([data[off + 12], data[off + 13], data[off + 14], data[off + 15]]) as usize;
+        if tag == b"head" {
+            if table_off + 20 <= data.len() && table_len >= 54 {
+                let upem = u16::from_be_bytes([data[table_off + 18], data[table_off + 19]]);
+                return upem >= 16 && upem <= 16384;
+            }
+        }
+        off += 16;
+    }
+    false
+}
+
 fn try_read_font(paths: &[&str]) -> Vec<u8> {
     for p in paths {
         if let Ok(data) = fs::read(p) {
             if !data.is_empty() {
-                println!("[FONT] Loaded font successfully from: {}", p);
-                return data;
+                if is_valid_truetype_font(&data) {
+                    println!("[FONT] Loaded valid TrueType font from: {}", p);
+                    return data;
+                } else {
+                    println!("[FONT] Skipped incompatible OTF/CFF font: {}", p);
+                }
             }
         }
     }
@@ -26,16 +57,11 @@ fn main() {
     println!("🚀 Launching EOS macOS Desktop (Ring 3 Userspace)...");
 
     let font_paths = [
+        "/EOS SHARE/fonts/SFPRODISPLAYREGULAR.TTF",
         "/EOS SHARE/fonts/SFPRODISPLAYREGULAR.OTF",
-        "/EOS SHARE/fonts/SFPRODISPLAYMEDIUM.OTF",
-        "/EOS SHARE/fonts/SFPRODISPLAYBOLD.OTF",
-        "/EOS SHARE/fonts/SFPRODISPLAYSEMIBOLDITALIC.OTF",
-        "/EOS SHARE/fonts/SFPRODISPLAYLIGHTITALIC.OTF",
-        "/EOS SHARE/fonts/SFPRODISPLAYHEAVYITALIC.OTF",
-        "/EOS SHARE/fonts/SFPRODISPLAYBLACKITALIC.OTF",
-        "/EOS SHARE/fonts/SFPRODISPLAYTHINITALIC.OTF",
-        "/EOS SHARE/fonts/SFPRODISPLAYULTRALIGHTITALIC.OTF",
+        "/RootFS/fonts/SFPRODISPLAYREGULAR.TTF",
         "/RootFS/fonts/SFPRODISPLAYREGULAR.OTF",
+        "SFPRODISPLAYREGULAR.TTF",
         "SFPRODISPLAYREGULAR.OTF",
     ];
 
