@@ -150,23 +150,21 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         0 => { // read
             let fd = frame.rdi as usize;
             if fd < 64 {
-                unsafe {
-                    let proc = get_current_process();
-                    if let Some(file) = &mut proc.fd_table[fd] {
-                        match &file.source {
-                            crate::task::FileSource::Memory(bytes) => {
-                                let remain = bytes.len().saturating_sub(file.offset);
-                                let to_copy = remain.min(frame.rdx as usize);
-                                if to_copy > 0 {
-                                    if copy_to_user(frame.rsi, &bytes[file.offset..file.offset+to_copy]).is_ok() {
-                                        file.offset += to_copy; frame.rax = to_copy as u64;
-                                    } else { frame.rax = -14i64 as u64; }
-                                } else { frame.rax = 0; }
-                            },
-                            _ => { frame.rax = -38i64 as u64; }
-                        }
-                    } else { frame.rax = -9i64 as u64; }
-                }
+                let proc = get_current_process();
+                if let Some(file) = &mut proc.fd_table[fd] {
+                    match &file.source {
+                        crate::task::FileSource::Memory(bytes) => {
+                            let remain = bytes.len().saturating_sub(file.offset);
+                            let to_copy = remain.min(frame.rdx as usize);
+                            if to_copy > 0 {
+                                if copy_to_user(frame.rsi, &bytes[file.offset..file.offset+to_copy]).is_ok() {
+                                    file.offset += to_copy; frame.rax = to_copy as u64;
+                                } else { frame.rax = -14i64 as u64; }
+                            } else { frame.rax = 0; }
+                        },
+                        _ => { frame.rax = -38i64 as u64; }
+                    }
+                } else { frame.rax = -9i64 as u64; }
             } else { frame.rax = -9i64 as u64; }
         }
         1 => { // write
@@ -178,20 +176,18 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     frame.rax = frame.rdx;
                 } else { frame.rax = -14i64 as u64; }
             } else if fd < 64 {
-                unsafe {
-                    let proc = get_current_process();
-                    if let Some(file) = &mut proc.fd_table[fd] {
-                        if let crate::task::FileSource::Memory(ref mut bytes) = file.source {
-                            let mut buf = alloc::vec![0u8; frame.rdx as usize];
-                            if copy_from_user(&mut buf, frame.rsi, frame.rdx as usize).is_ok() {
-                                if file.offset + buf.len() > bytes.len() { bytes.resize(file.offset + buf.len(), 0); }
-                                bytes[file.offset..file.offset+buf.len()].copy_from_slice(&buf);
-                                file.offset += buf.len();
-                                frame.rax = buf.len() as u64;
-                            } else { frame.rax = -14i64 as u64; }
-                        } else { frame.rax = -9i64 as u64; }
+                let proc = get_current_process();
+                if let Some(file) = &mut proc.fd_table[fd] {
+                    if let crate::task::FileSource::Memory(ref mut bytes) = file.source {
+                        let mut buf = alloc::vec![0u8; frame.rdx as usize];
+                        if copy_from_user(&mut buf, frame.rsi, frame.rdx as usize).is_ok() {
+                            if file.offset + buf.len() > bytes.len() { bytes.resize(file.offset + buf.len(), 0); }
+                            bytes[file.offset..file.offset+buf.len()].copy_from_slice(&buf);
+                            file.offset += buf.len();
+                            frame.rax = buf.len() as u64;
+                        } else { frame.rax = -14i64 as u64; }
                     } else { frame.rax = -9i64 as u64; }
-                }
+                } else { frame.rax = -9i64 as u64; }
             } else { frame.rax = -9i64 as u64; }
         }
         2 | 257 => { // open, openat
@@ -204,6 +200,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 buf[len as usize] = b[0]; len += 1;
             }
             let path = core::str::from_utf8(&buf[..len as usize]).unwrap_or("").trim();
+            crate::log_info!("SYSCALL", "sys_open (flags={:#o}): '{}'", flags, path);
 
             let mut opened = false;
             let mut src = crate::task::FileSource::Memory(alloc::vec![]);
@@ -211,14 +208,19 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             let is_dir_req = (flags & 65536) != 0;
             if is_dir_req {
                 if let Ok(items) = crate::fs::vfs_list_dir(path) {
+                    crate::log_info!("SYSCALL", "sys_open: Directory '{}' opened with {} entries", path, items.len());
                     src = crate::task::FileSource::Directory(items, 0);
                     opened = true;
+                } else {
+                    crate::log_warn!("SYSCALL", "sys_open: Directory '{}' failed to open via vfs_list_dir", path);
                 }
             } else {
                 if let Ok(bytes) = crate::fs::vfs_read_bytes(path) {
+                    crate::log_info!("SYSCALL", "sys_open: File '{}' opened as file ({} bytes)", path, bytes.len());
                     src = crate::task::FileSource::Memory(bytes);
                     opened = true;
                 } else if let Ok(items) = crate::fs::vfs_list_dir(path) {
+                    crate::log_info!("SYSCALL", "sys_open: Path '{}' fell back to Directory ({} items)", path, items.len());
                     src = crate::task::FileSource::Directory(items, 0);
                     opened = true;
                 }
@@ -234,31 +236,31 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             }
 
             if opened {
-                unsafe {
-                    let proc = get_current_process();
-                    let mut fd_allocated = false;
-                    for (i, f) in proc.fd_table.iter_mut().enumerate().skip(3) {
-                        if f.is_none() {
-                            *f = Some(crate::task::FileDescriptor { path: alloc::string::String::from(path), source: src, offset: 0 });
-                            frame.rax = i as u64;
-                            fd_allocated = true;
-                            break;
-                        }
+                let proc = get_current_process();
+                let mut fd_allocated = false;
+                for (i, f) in proc.fd_table.iter_mut().enumerate().skip(3) {
+                    if f.is_none() {
+                        *f = Some(crate::task::FileDescriptor { path: alloc::string::String::from(path), source: src, offset: 0 });
+                        frame.rax = i as u64;
+                        fd_allocated = true;
+                        break;
                     }
-                    if !fd_allocated { frame.rax = -24i64 as u64; }
+                }
+                if !fd_allocated {
+                    crate::log_error!("SYSCALL", "sys_open: Process FD table full");
+                    frame.rax = -24i64 as u64;
                 }
             } else {
+                crate::log_warn!("SYSCALL", "sys_open: Path not found: '{}'", path);
                 frame.rax = -2i64 as u64;
             }
         }
         3 | 6 => { // close
             let fd = frame.rdi as usize;
             if fd < 64 {
-                unsafe {
-                    let proc = get_current_process();
-                    let _ = proc.fd_table[fd].take();
-                    frame.rax = 0;
-                }
+                let proc = get_current_process();
+                let _ = proc.fd_table[fd].take();
+                frame.rax = 0;
             } else { frame.rax = -9i64 as u64; }
         }
         4 => { // stat
@@ -303,14 +305,12 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     is_ok = true;
                 }
             } else if fd < 64 {
-                unsafe {
-                    let proc = get_current_process();
-                    if let Some(file) = &proc.fd_table[fd] {
-                        match &file.source {
-                            crate::task::FileSource::Memory(b) => { size = b.len() as u64; mode = 0o100644; is_ok = true; },
-                            crate::task::FileSource::Directory(_,_) => { size = 0; mode = 0o040755; is_ok = true; },
-                            _ => {}
-                        }
+                let proc = get_current_process();
+                if let Some(file) = &proc.fd_table[fd] {
+                    match &file.source {
+                        crate::task::FileSource::Memory(b) => { size = b.len() as u64; mode = 0o100644; is_ok = true; },
+                        crate::task::FileSource::Directory(_,_) => { size = 0; mode = 0o040755; is_ok = true; },
+                        _ => {}
                     }
                 }
             }
@@ -328,42 +328,40 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         8 => { // lseek
             let fd = frame.rdi as usize;
             if fd < 64 {
-                unsafe {
-                    let proc = get_current_process();
-                    if let Some(file) = &mut proc.fd_table[fd] {
-                        let offset = frame.rsi as i64; let whence = frame.rdx;
-                        let size = match &file.source { crate::task::FileSource::Memory(b) => b.len(), _ => 0 };
-                        let new_off = match whence { 0 => offset, 1 => file.offset as i64 + offset, 2 => size as i64 + offset, _ => -1 };
-                        if new_off >= 0 { file.offset = new_off as usize; frame.rax = new_off as u64; } else { frame.rax = -22i64 as u64; }
-                    } else { frame.rax = -9i64 as u64; }
-                }
+                let proc = get_current_process();
+                if let Some(file) = &mut proc.fd_table[fd] {
+                    let offset = frame.rsi as i64; let whence = frame.rdx;
+                    let size = match &file.source { crate::task::FileSource::Memory(b) => b.len(), _ => 0 };
+                    let new_off = match whence { 0 => offset, 1 => file.offset as i64 + offset, 2 => size as i64 + offset, _ => -1 };
+                    if new_off >= 0 { file.offset = new_off as usize; frame.rax = new_off as u64; } else { frame.rax = -22i64 as u64; }
+                } else { frame.rax = -9i64 as u64; }
             } else { frame.rax = -9i64 as u64; }
         }
         9 => { // mmap
             let len = frame.rsi as usize; let flags = frame.r10;
             if (flags & 0x20) != 0 {
                 let pages = (len + 0xFFF) / 4096;
-                let vaddr = unsafe { let proc = get_current_process(); let addr = proc.mmap_bump; proc.mmap_bump += (pages * 4096) as u64; addr };
+                let proc = get_current_process();
+                let vaddr = proc.mmap_bump;
+                proc.mmap_bump += (pages * 4096) as u64;
                 let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
                 if crate::mm::paging::map_user_pages(cur_pml4, vaddr, pages).is_err() { frame.rax = -12i64 as u64; } else { frame.rax = vaddr; }
             } else { frame.rax = -38i64 as u64; }
         }
         12 => { // brk
             let addr = frame.rdi;
-            unsafe {
-                let proc = get_current_process();
-                if addr == 0 { frame.rax = proc.mmap_bump; } else {
-                    let current = proc.mmap_bump;
-                    if addr > current {
-                        let pages = ((addr - current) as usize + 0xFFF) / 4096;
-                        let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
-                        if crate::mm::paging::map_user_pages(cur_pml4, current, pages).is_err() {
-                            frame.rax = current; return;
-                        }
-                        proc.mmap_bump = (addr + 0xFFF) & !0xFFF;
+            let proc = get_current_process();
+            if addr == 0 { frame.rax = proc.mmap_bump; } else {
+                let current = proc.mmap_bump;
+                if addr > current {
+                    let pages = ((addr - current) as usize + 0xFFF) / 4096;
+                    let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
+                    if crate::mm::paging::map_user_pages(cur_pml4, current, pages).is_err() {
+                        frame.rax = current; return;
                     }
-                    frame.rax = addr;
+                    proc.mmap_bump = (addr + 0xFFF) & !0xFFF;
                 }
+                frame.rax = addr;
             }
         }
         16 => { frame.rax = 0; }
@@ -397,12 +395,9 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     frame.rax = old_addr;
                 } else {
                     let new_pages = (new_len + 0xFFF) / 4096;
-                    let vaddr = unsafe {
-                        let proc = get_current_process();
-                        let addr = proc.mmap_bump;
-                        proc.mmap_bump += (new_pages * 4096) as u64;
-                        addr
-                    };
+                    let proc = get_current_process();
+                    let vaddr = proc.mmap_bump;
+                    proc.mmap_bump += (new_pages * 4096) as u64;
                     if crate::mm::paging::map_user_pages(cur_pml4, vaddr, new_pages).is_ok() {
                         unsafe {
                             core::ptr::copy_nonoverlapping(old_addr as *const u8, vaddr as *mut u8, old_len);
@@ -478,20 +473,20 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         217 => { // getdents64
             let fd = frame.rdi as usize; let dirp = frame.rsi; let count = frame.rdx as usize;
             if fd < 64 {
-                unsafe {
-                    let proc = get_current_process();
-                    if let Some(file) = &mut proc.fd_table[fd] {
-                        match &mut file.source {
-                            crate::task::FileSource::Directory(items, off) => {
-                                let mut written = 0;
-                                let mut out_buf = alloc::vec![0u8; count];
-                                while *off < items.len() {
-                                    let item = &items[*off];
-                                    let name = match item { crate::fs::FsItem::Directory(n,_) => n, crate::fs::FsItem::File(n,_,_) => n };
-                                    let d_type = match item { crate::fs::FsItem::Directory(_,_) => 4, _ => 8 };
-                                    let name_bytes = name.as_bytes();
-                                    let rec_len = (19 + name_bytes.len() + 8) & !7;
-                                    if written + rec_len > count { break; }
+                let proc = get_current_process();
+                if let Some(file) = &mut proc.fd_table[fd] {
+                    match &mut file.source {
+                        crate::task::FileSource::Directory(items, off) => {
+                            let mut written = 0;
+                            let mut out_buf = alloc::vec![0u8; count];
+                            while *off < items.len() {
+                                let item = &items[*off];
+                                let name = match item { crate::fs::FsItem::Directory(n,_) => n, crate::fs::FsItem::File(n,_,_) => n };
+                                let d_type = match item { crate::fs::FsItem::Directory(_,_) => 4, _ => 8 };
+                                let name_bytes = name.as_bytes();
+                                let rec_len = (19 + name_bytes.len() + 8) & !7;
+                                if written + rec_len > count { break; }
+                                unsafe {
                                     let out_ptr = out_buf.as_mut_ptr().add(written);
                                     core::ptr::write_unaligned(out_ptr as *mut u64, *off as u64 + 1);
                                     core::ptr::write_unaligned(out_ptr.add(8) as *mut i64, *off as i64 + 1);
@@ -499,15 +494,15 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                                     core::ptr::write_unaligned(out_ptr.add(18) as *mut u8, d_type);
                                     core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), out_ptr.add(19), name_bytes.len());
                                     core::ptr::write_unaligned(out_ptr.add(19 + name_bytes.len()), 0);
-                                    written += rec_len;
-                                    *off += 1;
                                 }
-                                if copy_to_user(dirp, &out_buf[..written]).is_ok() { frame.rax = written as u64; } else { frame.rax = -14i64 as u64; }
+                                written += rec_len;
+                                *off += 1;
                             }
-                            _ => frame.rax = -20i64 as u64,
+                            if copy_to_user(dirp, &out_buf[..written]).is_ok() { frame.rax = written as u64; } else { frame.rax = -14i64 as u64; }
                         }
-                    } else { frame.rax = -9i64 as u64; }
-                }
+                        _ => frame.rax = -20i64 as u64,
+                    }
+                } else { frame.rax = -9i64 as u64; }
             } else { frame.rax = -9i64 as u64; }
         }
         228 => { // clock_gettime

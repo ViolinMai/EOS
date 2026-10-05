@@ -23,20 +23,43 @@ pub fn resolve_path(path: &str) -> String {
 
 pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
     let p = resolve_path(path);
-    if p.is_empty() {
+    crate::log_info!("VFS", "vfs_list_dir requested for path: '{}'", p);
+
+    if p.is_empty() || p == "/" || p == "." {
+        crate::log_info!("VFS", "Listing Root Virtual Mounts (EOS SHARE, RootFS, Initrd)");
         return Ok(alloc::vec![
             FsItem::Directory(String::from("EOS SHARE"), 0),
             FsItem::Directory(String::from("RootFS"), 0),
             FsItem::Directory(String::from("Initrd"), 0)
         ]);
     }
-    if p.starts_with("EOS SHARE") {
-        let sub = p.strip_prefix("EOS SHARE").unwrap().trim_matches('/');
-        return FAT_FS.list_dir(sub);
+
+    if p == "EOS SHARE" {
+        crate::log_info!("VFS", "Scanning FAT root on Drive 1...");
+        let res = FAT_FS.list_dir("");
+        if let Ok(ref items) = res {
+            crate::log_info!("VFS", "FAT Root enumeration succeeded: found {} items", items.len());
+        } else if let Err(e) = res {
+            crate::log_error!("VFS", "FAT Root enumeration failed on Drive 1: {}", e);
+        }
+        return res;
+    }
+
+    if p.starts_with("EOS SHARE/") {
+        let sub = p.strip_prefix("EOS SHARE/").unwrap().trim_matches('/');
+        crate::log_info!("VFS", "Scanning FAT subfolder: '{}'", sub);
+        let res = FAT_FS.list_dir(sub);
+        if let Ok(ref items) = res {
+            crate::log_info!("VFS", "FAT Subfolder '{}' found {} items", sub, items.len());
+        } else if let Err(e) = res {
+            crate::log_error!("VFS", "FAT Subfolder '{}' error: {}", sub, e);
+        }
+        return res;
     }
 
     let mut items = Vec::new();
-    if p == "RootFS" {
+    if p == "RootFS" || p.starts_with("RootFS/") {
+        crate::log_info!("VFS", "Scanning EXT2 RootFS on Drive 2...");
         unsafe {
             if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
                 if let Ok(entries) = fs.list_directory(2) {
@@ -50,7 +73,9 @@ pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
                 }
             }
         }
-    } else if p == "Initrd" {
+        return Ok(items);
+    } else if p == "Initrd" || p.starts_with("Initrd/") {
+        crate::log_info!("VFS", "Scanning Initrd ramdisk...");
         unsafe {
             if let Some(archive) = &*core::ptr::addr_of_mut!(crate::fs::tar::INITRD) {
                 for f in &archive.files {
@@ -58,23 +83,30 @@ pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
                 }
             }
         }
-    } else { return Err("Directory not found"); }
-    Ok(items)
+        return Ok(items);
+    }
+
+    crate::log_warn!("VFS", "Falling back to direct FAT search for: '{}'", p);
+    FAT_FS.list_dir(&p)
 }
 
 pub fn vfs_stat(path: &str) -> Result<(u64, u32), &'static str> {
     let p = resolve_path(path);
-    if p.is_empty() || p == "EOS SHARE" || p == "RootFS" || p == "Initrd" {
+    if p.is_empty() || p == "EOS SHARE" || p == "RootFS" || p == "Initrd" || p == "/" || p == "." {
         return Ok((0, 0o040755));
     }
-    if p.starts_with("EOS SHARE") || !p.starts_with('/') {
+    if p.starts_with("EOS SHARE/") || p.starts_with("EOS SHARE") {
         let clean = p.strip_prefix("EOS SHARE").unwrap_or(&p).trim_matches('/');
         if let Ok(res) = FAT_FS.stat(clean) {
             return Ok(res);
         }
     }
-    if let Ok(b) = vfs_read_bytes(&p) { return Ok((b.len() as u64, 0o100644)); }
-    if vfs_list_dir(&p).is_ok() { return Ok((0, 0o040755)); }
+    if let Ok(b) = vfs_read_bytes(&p) {
+        return Ok((b.len() as u64, 0o100644));
+    }
+    if vfs_list_dir(&p).is_ok() {
+        return Ok((0, 0o040755));
+    }
     Err("Not found")
 }
 

@@ -105,8 +105,11 @@ pub fn execute_command(cmd: &str) {
     if trimmed.is_empty() { return; }
     match trimmed {
         "gui" | "desktop" => {
-            log_info!("DESKTOP", "Spawning Userspace Desktop ('user_app.elf')...");
-            let _ = crate::task::request_elf_execution("user_app.elf", "");
+            log_info!("DESKTOP", "Starting Compositor Core...");
+            GUI_ACTIVE.store(true, Ordering::SeqCst);
+            if let Err(_) = crate::task::dispatch_job(1, crate::compositor::compositor_core_entry) {
+                crate::compositor::compositor_core_entry();
+            }
         }
         "ipconfig" | "net" => crate::net::cmd_ipconfig(),
         "ping" => log_info!("NET", "Pinging QEMU Gateway (10.0.2.2)... [OK]"),

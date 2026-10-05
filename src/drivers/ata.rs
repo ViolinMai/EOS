@@ -359,7 +359,7 @@ pub fn write_file_content(drive: u8, filename: &str, content: &[u8]) -> Result<(
     let mut content_offset = 0;
     let mut current_cluster = target.first_cluster;
     let mut sector_buf = [0u8; 512];
-    let bytes_per_cluster = (layout.spc as usize) * 512;
+    let _bytes_per_cluster = (layout.spc as usize) * 512;
 
     while current_cluster >= 2 && !is_fat_eof(layout.fat_type, current_cluster) {
         let cluster_lba = layout.data_start_lba + (current_cluster - 2) * layout.spc;
@@ -376,7 +376,6 @@ pub fn write_file_content(drive: u8, filename: &str, content: &[u8]) -> Result<(
 
         let next = get_next_cluster(drive, &layout, current_cluster)?;
         if remaining == 0 {
-            // وسم نهاية الملف بـ EOF صريح لإرضاء فاحص QEMU vvfat
             let eof_val = match layout.fat_type {
                 FatType::Fat32 => 0x0FFF_FFFF,
                 FatType::Fat16 => 0xFFFF,

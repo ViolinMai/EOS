@@ -1,3 +1,522 @@
+### ITEM FIX: src/fs/mod.rs
+pub fn vfs_stat(path: &str) -> Result<(u64, u32), &'static str> {
+    let p = resolve_path(path);
+    if p.is_empty() || p == "EOS SHARE" || p == "RootFS" || p == "Initrd" || p == "/" || p == "." {
+        return Ok((0, 0o040755));
+    }
+    if p.starts_with("EOS SHARE/") || p.starts_with("EOS SHARE") {
+        let clean = p.strip_prefix("EOS SHARE").unwrap_or(&p).trim_matches('/');
+        if let Ok(res) = FAT_FS.stat(clean) {
+            return Ok(res);
+        }
+    }
+    if let Ok(b) = vfs_read_bytes(&p) {
+        return Ok((b.len() as u64, 0o100644));
+    }
+    if vfs_list_dir(&p).is_ok() {
+        return Ok((0, 0o040755));
+    }
+    Err("Not found")
+}
+### END
+
+### FILE: userspace/src/apps/preview.rs
+use crate::framework::*;
+use std::fs;
+
+pub struct PreviewApp {
+    bounds: Rect,
+    pub title: String,
+    pub file_path: String,
+    pub pixels: Vec<u32>,
+    pub img_w: usize,
+    pub img_h: usize,
+    pub status: String,
+}
+
+impl PreviewApp {
+    pub fn new(title: String, file_path: String) -> Self {
+        let mut app = Self {
+            bounds: Rect::default(),
+            title: title.clone(),
+            file_path: file_path.clone(),
+            pixels: Vec::new(),
+            img_w: 0,
+            img_h: 0,
+            status: String::from("Loading image..."),
+        };
+        app.load_image();
+        app
+    }
+
+    pub fn load_image(&mut self) {
+        let attempts = [
+            format!("/{}", self.file_path.trim_start_matches('/')),
+            self.file_path.clone(),
+        ];
+
+        let mut data = Vec::new();
+        for p in &attempts {
+            if let Ok(bytes) = fs::read(p) {
+                if !bytes.is_empty() {
+                    data = bytes;
+                    break;
+                }
+            }
+        }
+
+        if data.len() == 0 {
+            self.status = format!("Failed to read file: {}", self.file_path);
+            return;
+        }
+
+        let total_bytes = data.len();
+
+        if data.len() >= 8 && &data[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+            match crate::png::decode_png(&data) {
+                Ok((px, w, h)) => {
+                    self.pixels = px;
+                    self.img_w = w;
+                    self.img_h = h;
+                    self.status = format!("PNG ({}x{} px | {} KB)", w, h, total_bytes / 1024);
+                    return;
+                }
+                Err(e) => {
+                    self.status = format!("PNG Decode Error: {}", e);
+                    return;
+                }
+            }
+        }
+
+        if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
+            let mut decoder = zune_jpeg::JpegDecoder::new(&data);
+            match decoder.decode() {
+                Ok(raw) => {
+                    if let Some(info) = decoder.info() {
+                        let w = info.width as usize;
+                        let h = info.height as usize;
+                        let mut px = vec![0u32; w * h];
+                        for i in 0..(w * h) {
+                            let o = i * 3;
+                            if o + 2 < raw.len() {
+                                px[i] = (0xFF << 24) | ((raw[o] as u32) << 16) | ((raw[o+1] as u32) << 8) | (raw[o+2] as u32);
+                            }
+                        }
+                        self.pixels = px;
+                        self.img_w = w;
+                        self.img_h = h;
+                        self.status = format!("JPEG ({}x{} px | {} KB)", w, h, total_bytes / 1024);
+                        return;
+                    }
+                }
+                Err(e) => {
+                    self.status = format!("JPEG Decode Error: {:?}", e);
+                    return;
+                }
+            }
+        }
+
+        self.status = format!("Unsupported image format ({} bytes)", total_bytes);
+    }
+}
+
+impl Widget for PreviewApp {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect::new(x, y, w, h);
+        self.bounds
+    }
+
+    fn paint(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF0F172A, 0);
+
+        let sb_h = theme.pt(28.0);
+        let content_h = (self.bounds.h - sb_h).max(0);
+
+        if self.img_w > 0 && self.img_h > 0 && !self.pixels.is_empty() {
+            let avail_w = self.bounds.w.max(1) as usize;
+            let avail_h = content_h.max(1) as usize;
+
+            let step_w = (self.img_w + avail_w - 1) / avail_w;
+            let step_h = (self.img_h + avail_h - 1) / avail_h;
+            let step = step_w.max(step_h).max(1);
+
+            let disp_w = (self.img_w / step).min(avail_w);
+            let disp_h = (self.img_h / step).min(avail_h);
+
+            let off_x = self.bounds.x + ((self.bounds.w - disp_w as i32) / 2);
+            let off_y = self.bounds.y + ((content_h - disp_h as i32) / 2);
+
+            for dy in 0..disp_h {
+                let src_y = dy * step;
+                let dst_y = off_y + dy as i32;
+                if dst_y < self.bounds.y || dst_y >= self.bounds.y + content_h { continue; }
+
+                for dx in 0..disp_w {
+                    let src_x = dx * step;
+                    let dst_x = off_x + dx as i32;
+                    if dst_x < self.bounds.x || dst_x >= self.bounds.x + self.bounds.w { continue; }
+
+                    let color = self.pixels[src_y * self.img_w + src_x];
+                    let idx = (dst_y as usize) * canvas.width + (dst_x as usize);
+                    if idx < canvas.buffer.len() {
+                        canvas.buffer[idx] = color;
+                    }
+                }
+            }
+        } else {
+            let (tw, th) = canvas.measure_text(&self.status, theme.font_body());
+            let tx = self.bounds.x + ((self.bounds.w - tw as i32) / 2);
+            let ty = self.bounds.y + ((content_h - th as i32) / 2);
+            canvas.draw_text(tx, ty, &self.status, 0xFF94A3B8, theme.font_body());
+        }
+
+        let sb_y = self.bounds.y + self.bounds.h - sb_h;
+        canvas.draw_rect(self.bounds.x, sb_y, self.bounds.w, sb_h, 0xFF1E293B, 0);
+        canvas.draw_line_h(self.bounds.x, sb_y, self.bounds.w, 0xFF334155);
+        canvas.draw_text_clipped(self.bounds.x + theme.pt(12.0), sb_y + theme.pt(6.0), self.bounds.w - theme.pt(24.0), &self.status, 0xFFF8FAFC, theme.font_caption());
+    }
+
+    fn handle_mouse(&mut self, mx: i32, my: i32, _pressed: bool) -> bool {
+        self.bounds.contains(mx, my)
+    }
+}
+### END
+
+### FILE: userspace/src/apps/finder.rs
+use crate::framework::*;
+use std::fs;
+
+#[derive(Clone, Debug)]
+pub struct FinderEntry {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: usize,
+}
+
+pub struct FinderApp {
+    pub bounds: Rect,
+    pub current_path: String,
+    pub entries: Vec<FinderEntry>,
+    pub selected_idx: Option<usize>,
+    pub scroll_y: i32,
+    pub status_label: String,
+    pub pending_open_image: Option<(String, String)>,
+}
+
+impl FinderApp {
+    pub fn new() -> Self {
+        let mut app = Self {
+            bounds: Rect::default(),
+            current_path: String::from("EOS SHARE"),
+            entries: Vec::new(),
+            selected_idx: None,
+            scroll_y: 0,
+            status_label: String::from("Ready"),
+            pending_open_image: None,
+        };
+        app.load_directory("EOS SHARE");
+        app
+    }
+
+    pub fn load_directory(&mut self, path: &str) {
+        let clean = path.trim().trim_matches('/');
+        let target_path = if clean.is_empty() {
+            String::from("EOS SHARE")
+        } else {
+            clean.to_string()
+        };
+
+        crate::f_info!("FINDER", "load_directory requested for: '{}'", target_path);
+
+        self.entries.clear();
+        self.selected_idx = None;
+        self.scroll_y = 0;
+
+        let mut read_success = false;
+
+        let candidates = [
+            format!("/{}", target_path),
+            target_path.clone(),
+        ];
+
+        for p in &candidates {
+            if let Ok(read_dir) = fs::read_dir(p) {
+                let mut count = 0;
+                for entry in read_dir.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name == "." || name == ".." { continue; }
+                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+
+                    let size = if is_dir {
+                        0
+                    } else {
+                        let full_file_path = format!("{}/{}", p.trim_end_matches('/'), name);
+                        fs::metadata(&full_file_path)
+                            .map(|m| m.len() as usize)
+                            .unwrap_or_else(|_| {
+                                fs::read(&full_file_path).map(|b| b.len()).unwrap_or(0)
+                            })
+                    };
+
+                    self.entries.push(FinderEntry { name, is_dir, size });
+                    count += 1;
+                }
+                crate::f_info!("FINDER", "fs::read_dir('{}') successful: read {} entries", p, count);
+                read_success = true;
+                break;
+            }
+        }
+
+        self.current_path = target_path;
+
+        if self.current_path.contains('/') || (self.current_path != "EOS SHARE" && self.current_path != "RootFS" && self.current_path != "Initrd") {
+            self.entries.insert(0, FinderEntry {
+                name: String::from(".."),
+                is_dir: true,
+                size: 0,
+            });
+        }
+
+        self.entries.sort_by(|a, b| {
+            if a.name == ".." {
+                std::cmp::Ordering::Less
+            } else if b.name == ".." {
+                std::cmp::Ordering::Greater
+            } else {
+                b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }
+        });
+
+        self.status_label = if read_success {
+            format!("{} items in /{}", self.entries.len(), self.current_path)
+        } else {
+            format!("Empty or unavailable folder (/{}).", self.current_path)
+        };
+    }
+
+    fn open_entry(&mut self, idx: usize) {
+        if idx >= self.entries.len() { return; }
+        let entry = self.entries[idx].clone();
+        crate::f_info!("FINDER", "User activated entry: '{}' (is_dir: {})", entry.name, entry.is_dir);
+
+        if entry.is_dir {
+            if entry.name == ".." {
+                if let Some(pos) = self.current_path.rfind('/') {
+                    let parent = self.current_path[..pos].to_string();
+                    self.load_directory(&parent);
+                } else {
+                    self.load_directory("EOS SHARE");
+                }
+            } else {
+                let next_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
+                self.load_directory(&next_path);
+            }
+        } else {
+            let lower = entry.name.to_lowercase();
+            if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+                let full_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
+                self.pending_open_image = Some((entry.name.clone(), full_path));
+            }
+        }
+    }
+}
+
+impl Widget for FinderApp {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect::new(x, y, w, h);
+        self.bounds
+    }
+
+    fn paint(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, 0);
+
+        let tb_h = theme.pt(40.0);
+        let sb_h = theme.pt(26.0);
+
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, 0);
+        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
+
+        let favorites = [("Root", "EOS SHARE"), ("RootFS", "RootFS"), ("Initrd", "Initrd")];
+        let mut fav_x = self.bounds.x + theme.pt(12.0);
+        for &(label, target) in &favorites {
+            let btn_w = theme.pt(54.0);
+            let is_cur = self.current_path == target || (target == "EOS SHARE" && self.current_path.starts_with("EOS SHARE/"));
+            let bg_c = if is_cur { theme.accent } else { 0xFF243044 };
+            canvas.draw_rect(fav_x, self.bounds.y + theme.pt(7.0), btn_w, theme.pt(26.0), bg_c, theme.pt(5.0) as usize);
+            let (tw, th) = canvas.measure_text(label, theme.font_caption());
+            canvas.draw_text(fav_x + (btn_w - tw as i32) / 2, self.bounds.y + theme.pt(7.0) + (theme.pt(26.0) - th as i32) / 2, label, 0xFFFFFFFF, theme.font_caption());
+            fav_x += btn_w + theme.pt(8.0);
+        }
+
+        let path_text = format!("Location: /{}", self.current_path);
+        canvas.draw_text_clipped(fav_x + theme.pt(8.0), self.bounds.y + theme.pt(11.0), self.bounds.w - (fav_x - self.bounds.x) - theme.pt(16.0), &path_text, theme.text_primary, theme.font_body());
+
+        let list_y = self.bounds.y + tb_h + 1;
+        let list_h = (self.bounds.h - tb_h - sb_h - 1).max(0);
+        canvas.push_clip(Rect::new(self.bounds.x, list_y, self.bounds.w, list_h));
+
+        let row_h = theme.pt(34.0);
+        let mut cur_y = list_y + theme.pt(4.0) - self.scroll_y;
+
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if cur_y + row_h >= list_y && cur_y <= list_y + list_h {
+                let is_sel = self.selected_idx == Some(idx);
+                let bg = if is_sel {
+                    theme.accent
+                } else if idx % 2 == 0 {
+                    theme.bg_window
+                } else {
+                    0xFF141E2E
+                };
+
+                canvas.draw_rect(self.bounds.x + theme.pt(4.0), cur_y, self.bounds.w - theme.pt(8.0), row_h, bg, theme.pt(4.0) as usize);
+
+                let icon = if entry.name == ".." {
+                    "⤴️"
+                } else if entry.is_dir {
+                    "📁"
+                } else if entry.name.ends_with(".elf") {
+                    "⚙️"
+                } else if entry.name.ends_with(".png") || entry.name.ends_with(".jpg") || entry.name.ends_with(".jpeg") {
+                    "🖼️"
+                } else {
+                    "📄"
+                };
+
+                let label = if entry.is_dir {
+                    format!("{}  {}", icon, entry.name)
+                } else {
+                    let sz_str = if entry.size >= 1024 * 1024 {
+                        format!("{:.2} MB", (entry.size as f64) / (1024.0 * 1024.0))
+                    } else if entry.size >= 1024 {
+                        format!("{} KB", entry.size / 1024)
+                    } else {
+                        format!("{} B", entry.size)
+                    };
+                    format!("{}  {} ({})", icon, entry.name, sz_str)
+                };
+
+                let txt_c = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
+                canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), cur_y + theme.pt(8.0), self.bounds.w - theme.pt(28.0), &label, txt_c, theme.font_body());
+            }
+            cur_y += row_h;
+        }
+
+        canvas.pop_clip();
+
+        let sb_y = self.bounds.y + self.bounds.h - sb_h;
+        canvas.draw_rect(self.bounds.x, sb_y, self.bounds.w, sb_h, theme.bg_titlebar, 0);
+        canvas.draw_line_h(self.bounds.x, sb_y, self.bounds.w, theme.border_window);
+        canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), sb_y + theme.pt(5.0), self.bounds.w - theme.pt(28.0), &self.status_label, theme.text_muted, theme.font_caption());
+    }
+
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        let theme = get_theme();
+        let tb_h = theme.pt(40.0);
+        let sb_h = theme.pt(26.0);
+
+        if pressed {
+            if my >= self.bounds.y && my <= self.bounds.y + tb_h {
+                let favorites = ["EOS SHARE", "RootFS", "Initrd"];
+                let mut fav_x = self.bounds.x + theme.pt(12.0);
+                for target in favorites {
+                    let btn_w = theme.pt(54.0);
+                    if mx >= fav_x && mx <= fav_x + btn_w {
+                        self.load_directory(target);
+                        return true;
+                    }
+                    fav_x += btn_w + theme.pt(8.0);
+                }
+                return true;
+            }
+
+            let list_y = self.bounds.y + tb_h + 1;
+            let list_h = self.bounds.h - tb_h - sb_h;
+            if my >= list_y && my <= list_y + list_h {
+                let row_h = theme.pt(34.0);
+                let rel_y = (my - (list_y + theme.pt(4.0))) + self.scroll_y;
+                if rel_y >= 0 {
+                    let clicked_idx = (rel_y / row_h) as usize;
+                    if clicked_idx < self.entries.len() {
+                        if self.selected_idx == Some(clicked_idx) {
+                            self.open_entry(clicked_idx);
+                        } else {
+                            self.selected_idx = Some(clicked_idx);
+                        }
+                        return true;
+                    }
+                }
+            }
+        }
+        true
+    }
+
+    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        let theme = get_theme();
+        let row_h = theme.pt(34.0);
+        let total_h = (self.entries.len() as i32) * row_h;
+        let view_h = self.bounds.h - theme.pt(66.0);
+        let max_scroll = (total_h - view_h).max(0);
+
+        if dy < 0 {
+            self.scroll_y = (self.scroll_y + theme.pt(28.0)).min(max_scroll);
+        } else {
+            self.scroll_y = (self.scroll_y - theme.pt(28.0)).max(0);
+        }
+        true
+    }
+
+    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
+        match keycode {
+            0x1C => {
+                if let Some(idx) = self.selected_idx {
+                    self.open_entry(idx);
+                    return true;
+                }
+            }
+            0x48 => {
+                if let Some(idx) = self.selected_idx {
+                    if idx > 0 { self.selected_idx = Some(idx - 1); return true; }
+                } else if !self.entries.is_empty() {
+                    self.selected_idx = Some(0);
+                    return true;
+                }
+            }
+            0x50 => {
+                if let Some(idx) = self.selected_idx {
+                    if idx + 1 < self.entries.len() { self.selected_idx = Some(idx + 1); return true; }
+                } else if !self.entries.is_empty() {
+                    self.selected_idx = Some(0);
+                    return true;
+                }
+            }
+            0x0E => {
+                let back_entry = FinderEntry { name: String::from(".."), is_dir: true, size: 0 };
+                if let Some(pos) = self.current_path.rfind('/') {
+                    let parent = self.current_path[..pos].to_string();
+                    self.load_directory(&parent);
+                } else {
+                    self.load_directory("EOS SHARE");
+                }
+                return true;
+            }
+            _ => {}
+        }
+        false
+    }
+}
+### END
+
 ### FILE: userspace/src/framework/app.rs
 use std::collections::BTreeMap;
 use rusttype::Font;
@@ -103,8 +622,6 @@ impl<'a> FrameworkApp<'a> {
         loop {
             let theme = get_theme();
 
-            // 1. استهلاك وتفريغ جميع الأحداث المتراكمة في الطابور دفعة واحدة (Drain Queue)
-            // هذا يمنع تراكم حركة الماوس وتأخر الاستجابة الزمني نهائياً
             let mut first_ev = sys_wait_event(16);
             while let Some(ev) = first_ev {
                 let ev_type = ev[0];
@@ -114,7 +631,7 @@ impl<'a> FrameworkApp<'a> {
                 let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
 
                 match ev_type {
-                    1 => { // MouseMove
+                    1 => {
                         let dx = (ev[1] as u32) as i32;
                         let dy = ((ev[1] >> 32) as u32) as i32;
 
@@ -127,7 +644,7 @@ impl<'a> FrameworkApp<'a> {
                             }
                         }
                     }
-                    2 => { // MouseButton
+                    2 => {
                         let btn = (ev[1] & 0xFF) as u8;
                         let pressed = ((ev[1] >> 8) & 0xFF) != 0;
 
@@ -163,14 +680,14 @@ impl<'a> FrameworkApp<'a> {
                             }
                         }
                     }
-                    3 => { // KeyDown
+                    3 => {
                         let keycode = (ev[1] & 0xFF) as u8;
                         let mods = ((ev[1] >> 8) & 0xFF) as u8;
                         if let Some(active_win) = self.root_widgets.last_mut() {
                             active_win.handle_key(keycode, mods);
                         }
                     }
-                    4 => { // Char
+                    4 => {
                         let c_code = ev[1] as u32;
                         if let Some(c) = char::from_u32(c_code) {
                             if let Some(active_win) = self.root_widgets.last_mut() {
@@ -178,7 +695,7 @@ impl<'a> FrameworkApp<'a> {
                             }
                         }
                     }
-                    5 => { // Scroll
+                    5 => {
                         let dy = (ev[1] as u32) as i32;
                         for w in self.root_widgets.iter_mut().rev() {
                             if w.handle_scroll(self.mouse_x, self.mouse_y, dy) {
@@ -189,11 +706,34 @@ impl<'a> FrameworkApp<'a> {
                     _ => {}
                 }
 
-                // سحب باقي الأحداث في الطابور دون نوم
                 first_ev = sys_poll_event();
             }
 
-            // 2. دورة الرسم المنعشة بعد تفريغ الأحداث
+            let mut image_to_open = None;
+            for w in &mut self.root_widgets {
+                if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                    if let Some(finder) = frame.content.as_any_mut().downcast_mut::<FinderApp>() {
+                        if let Some(req) = finder.pending_open_image.take() {
+                            image_to_open = Some(req);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some((name, path)) = image_to_open {
+                let prev_app = Box::new(PreviewApp::new(name.clone(), path));
+                let win = Box::new(WindowFrame::new(
+                    format!("Preview - {}", name),
+                    theme.pt(120.0),
+                    theme.pt(80.0),
+                    theme.pt(680.0),
+                    theme.pt(480.0),
+                    prev_app,
+                ));
+                self.root_widgets.push(win);
+            }
+
             for p in &mut self.buffer {
                 *p = theme.bg_desktop;
             }
@@ -230,274 +770,6 @@ impl<'a> FrameworkApp<'a> {
 
             sys_present(self.buffer.as_ptr(), self.width, self.height);
         }
-    }
-}
-### END
-
-### FILE: userspace/src/apps/browser.rs
-use crate::framework::*;
-use crate::net_manager::{NET, poll_network, TcpState};
-
-#[derive(Clone, Debug)]
-pub struct SearchResultItem {
-    pub title: String,
-    pub snippet: String,
-    pub url: String,
-}
-
-pub struct BrowserApp {
-    bounds: Rect,
-    url_input: String,
-    input_active: bool,
-    results: Vec<SearchResultItem>,
-    status_text: String,
-    scroll_y: i32,
-    active_sock: Option<u16>,
-    loading: bool,
-}
-
-impl BrowserApp {
-    pub fn new() -> Self {
-        let mut app = Self {
-            bounds: Rect::default(),
-            url_input: "google: rust programming".to_string(),
-            input_active: false,
-            results: Vec::new(),
-            status_text: "Ready. Enter a search query and press Enter.".to_string(),
-            scroll_y: 0,
-            active_sock: None,
-            loading: false,
-        };
-        app.results.push(SearchResultItem {
-            title: "Google Search on EOS".to_string(),
-            snippet: "Experimental lightweight web browser running on Ring 3 Userspace.".to_string(),
-            url: "http://www.google.com".to_string(),
-        });
-        app
-    }
-
-    fn perform_search(&mut self) {
-        let query = self.url_input.trim().to_string();
-        if query.is_empty() { return; }
-
-        self.loading = true;
-        self.scroll_y = 0;
-        self.results.clear();
-        self.status_text = format!("Searching for '{}' via network gateway...", query);
-
-        let clean_q = query.strip_prefix("google:").unwrap_or(&query).trim();
-        let path = format!("/search?q={}", clean_q.replace(' ', "+"));
-
-        let target_ip = [10, 0, 2, 2];
-        let host = "10.0.2.2";
-
-        let sock_port = {
-            let mut lock = NET.lock().unwrap();
-            if let Some(net) = lock.as_mut() {
-                net.http_get(target_ip, host, &path)
-            } else {
-                0
-            }
-        };
-
-        if sock_port != 0 {
-            self.active_sock = Some(sock_port);
-        } else {
-            self.loading = false;
-            self.status_text = "Network subsystem unavailable.".to_string();
-        }
-    }
-
-    fn parse_html_results(&mut self, raw_html: &str) {
-        self.results.clear();
-        let mut in_title = false;
-        let mut cur_title = String::new();
-
-        for line in raw_html.lines() {
-            let trimmed = line.trim();
-            if trimmed.contains("<h3>") || trimmed.contains("<title>") {
-                in_title = true;
-                cur_title = trimmed.replace("<h3>", "").replace("</h3>", "")
-                                   .replace("<title>", "").replace("</title>", "");
-            } else if in_title && (trimmed.contains("<p>") || trimmed.contains("<span>")) {
-                let cur_snippet = trimmed.replace("<p>", "").replace("</p>", "")
-                                         .replace("<span>", "").replace("</span>", "");
-                self.results.push(SearchResultItem {
-                    title: cur_title.clone(),
-                    snippet: cur_snippet,
-                    url: format!("http://google.com/search?q={}", cur_title.replace(' ', "+")),
-                });
-                in_title = false;
-            }
-        }
-
-        if self.results.is_empty() {
-            let non_empty: Vec<&str> = raw_html.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
-            for chunk in non_empty.chunks(2) {
-                let title = chunk[0].to_string();
-                let snippet = if chunk.len() > 1 { chunk[1].to_string() } else { "No description available.".to_string() };
-                self.results.push(SearchResultItem {
-                    title,
-                    snippet,
-                    url: "http://google.com".to_string(),
-                });
-            }
-        }
-
-        if self.results.is_empty() {
-            self.results.push(SearchResultItem {
-                title: "No Results Found".to_string(),
-                snippet: "Check network connection or try a different search keyword.".to_string(),
-                url: "".to_string(),
-            });
-        }
-    }
-
-    fn check_network_response(&mut self) {
-        if !self.loading { return; }
-        if let Some(port) = self.active_sock {
-            poll_network();
-            let mut lock = NET.lock().unwrap();
-            if let Some(net) = lock.as_mut() {
-                if let Some(sock) = net.tcp_sockets.get_mut(&port) {
-                    if !sock.rx_buffer.is_empty() {
-                        let content = String::from_utf8_lossy(&sock.rx_buffer).to_string();
-                        drop(lock);
-                        self.parse_html_results(&content);
-                        self.loading = false;
-                        self.status_text = format!("Search completed. Found {} items.", self.results.len());
-                        return;
-                    }
-                    if sock.state == TcpState::Closed {
-                        self.loading = false;
-                        self.status_text = "Connection closed by peer.".to_string();
-                    }
-                }
-            }
-        }
-    }
-}
-
-impl Widget for BrowserApp {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
-
-    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
-        self.bounds = Rect::new(x, y, w, h);
-        self.bounds
-    }
-
-    fn paint(&self, canvas: &mut Canvas) {
-        let theme = get_theme();
-        let tb_h = theme.pt(46.0);
-        let status_h = theme.pt(26.0);
-
-        unsafe {
-            let app_mut = self as *const Self as *mut Self;
-            (*app_mut).check_network_response();
-        }
-
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFFFFFFFF, 0);
-
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, 0xFFF1F3F4, 0);
-        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, 0xFFDADCE0);
-
-        let bar_x = self.bounds.x + theme.pt(84.0);
-        let bar_y = self.bounds.y + theme.pt(7.0);
-        let bar_w = (self.bounds.w - theme.pt(170.0)).max(100);
-        let bar_h = theme.pt(32.0);
-
-        canvas.draw_rect(bar_x, bar_y, bar_w, bar_h, 0xFFFFFFFF, theme.pt(8.0) as usize);
-        let border_col = if self.input_active { theme.accent } else { 0xFFDADCE0 };
-        canvas.draw_rect_outline(bar_x, bar_y, bar_w, bar_h, border_col, theme.pt(8.0) as usize);
-
-        let text_col = if self.url_input.is_empty() { 0xFF9AA0A6 } else { 0xFF202124 };
-        let display_input = if self.url_input.is_empty() { "Search Google or type a URL" } else { &self.url_input };
-        canvas.draw_text_clipped(bar_x + theme.pt(14.0), bar_y + theme.pt(7.0), bar_w - theme.pt(28.0), display_input, text_col, theme.font_body());
-
-        let btn_x = bar_x + bar_w + theme.pt(10.0);
-        let btn_w = theme.pt(68.0);
-        canvas.draw_rect(btn_x, bar_y, btn_w, bar_h, theme.accent, theme.pt(8.0) as usize);
-        canvas.draw_text(btn_x + theme.pt(12.0), bar_y + theme.pt(7.0), "Search", 0xFFFFFFFF, theme.font_body());
-
-        let content_y = self.bounds.y + tb_h + 1;
-        let content_h = (self.bounds.h - tb_h - status_h - 1).max(0);
-        let mut cur_y = content_y + theme.pt(16.0) - self.scroll_y;
-
-        if self.loading {
-            canvas.draw_text(self.bounds.x + theme.pt(32.0), content_y + theme.pt(30.0), "🔍 Sending HTTP request & querying index...", 0xFF5F6368, theme.font_body());
-        } else {
-            for (idx, res) in self.results.iter().enumerate() {
-                if cur_y + theme.pt(60.0) > content_y && cur_y < content_y + content_h {
-                    canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y, self.bounds.w - theme.pt(64.0), &res.url, 0xFF202124, theme.font_caption());
-                    canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y + theme.pt(16.0), self.bounds.w - theme.pt(64.0), &format!("{}. {}", idx + 1, res.title), 0xFF1A0DAB, theme.font_title());
-                    canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y + theme.pt(40.0), self.bounds.w - theme.pt(64.0), &res.snippet, 0xFF4D5156, theme.font_body());
-                }
-                cur_y += theme.pt(70.0);
-            }
-        }
-
-        let sb_y = self.bounds.y + self.bounds.h - status_h;
-        canvas.draw_rect(self.bounds.x, sb_y, self.bounds.w, status_h, 0xFFF8FAFC, 0);
-        canvas.draw_line_h(self.bounds.x, sb_y, self.bounds.w, 0xFFE2E8F0);
-        canvas.draw_text(self.bounds.x + theme.pt(16.0), sb_y + theme.pt(5.0), &self.status_text, 0xFF64748B, theme.font_caption());
-    }
-
-    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
-        if !self.bounds.contains(mx, my) { return false; }
-        let theme = get_theme();
-        let bar_x = self.bounds.x + theme.pt(84.0);
-        let bar_h = theme.pt(32.0);
-        let bar_w = (self.bounds.w - theme.pt(170.0)).max(100);
-        let bar_y = self.bounds.y + theme.pt(7.0);
-        let btn_x = bar_x + bar_w + theme.pt(10.0);
-        let btn_w = theme.pt(68.0);
-
-        if pressed {
-            if mx >= bar_x && mx <= bar_x + bar_w && my >= bar_y && my <= bar_y + bar_h {
-                self.input_active = true;
-                return true;
-            } else {
-                self.input_active = false;
-            }
-
-            if mx >= btn_x && mx <= btn_x + btn_w && my >= bar_y && my <= bar_y + bar_h {
-                self.perform_search();
-                return true;
-            }
-        }
-        true
-    }
-
-    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
-        if !self.bounds.contains(mx, my) { return false; }
-        if dy < 0 {
-            self.scroll_y = (self.scroll_y + 30).min(2000);
-        } else {
-            self.scroll_y = (self.scroll_y - 30).max(0);
-        }
-        true
-    }
-
-    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
-        if !self.input_active { return false; }
-        if keycode == 0x1C {
-            self.perform_search();
-            return true;
-        }
-        false
-    }
-
-    fn handle_char(&mut self, c: char) -> bool {
-        if !self.input_active { return false; }
-        if c == '\x08' {
-            self.url_input.pop();
-            return true;
-        } else if c >= ' ' && c <= '~' {
-            self.url_input.push(c);
-            return true;
-        }
-        false
     }
 }
 ### END

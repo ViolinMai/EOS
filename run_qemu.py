@@ -290,6 +290,7 @@ def prepare_and_run():
     ] + pflash_vars_args + [
         "-device", "piix3-ide,id=ide",
         "-drive", f"id=disk0,file={img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=0,drive=disk0",
+        "-drive", f"id=disk1,file=fat:rw:{share_dir},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
         "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",
         "-netdev", "user,id=n0,hostfwd=udp::68-:68", "-device", "e1000,netdev=n0",
         "-serial", "stdio", "-d", "cpu_reset,guest_errors", "-no-reboot", "-no-shutdown"

@@ -1,7 +1,7 @@
 use crate::framework::*;
 use std::fs;
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct FinderEntry {
     pub name: String,
     pub is_dir: bool,
@@ -13,87 +13,126 @@ pub struct FinderApp {
     pub current_path: String,
     pub entries: Vec<FinderEntry>,
     pub selected_idx: Option<usize>,
-    pub root_layout: ContainerWidget,
-    pub scroll_view: ScrollViewWidget,
+    pub scroll_y: i32,
     pub status_label: String,
+    pub pending_open_image: Option<(String, String)>,
 }
 
 impl FinderApp {
     pub fn new() -> Self {
         let mut app = Self {
             bounds: Rect::default(),
-            current_path: String::from("/EOS SHARE"),
+            current_path: String::from("EOS SHARE"),
             entries: Vec::new(),
             selected_idx: None,
-            root_layout: ContainerWidget::vbox().with_spacing(4).with_padding(6),
-            scroll_view: ScrollViewWidget::new(Box::new(ContainerWidget::vbox().with_spacing(2).with_padding(4)), 0),
+            scroll_y: 0,
             status_label: String::from("Ready"),
+            pending_open_image: None,
         };
-        app.load_directory("/EOS SHARE");
+        app.load_directory("EOS SHARE");
         app
     }
 
     pub fn load_directory(&mut self, path: &str) {
-        self.current_path = path.to_string();
+        let clean = path.trim().trim_matches('/');
+        let target_path = if clean.is_empty() {
+            String::from("EOS SHARE")
+        } else {
+            clean.to_string()
+        };
+
+        crate::f_info!("FINDER", "load_directory requested for: '{}'", target_path);
+
         self.entries.clear();
         self.selected_idx = None;
-
-        let candidate_paths = [
-            path.to_string(),
-            path.trim_start_matches('/').to_string(),
-            format!("/{}", path.trim_start_matches('/')),
-            String::from("EOS SHARE"),
-            String::from("/EOS SHARE"),
-        ];
+        self.scroll_y = 0;
 
         let mut read_success = false;
-        for cpath in &candidate_paths {
-            if let Ok(read_dir) = fs::read_dir(cpath) {
+
+        let candidates = [
+            format!("/{}", target_path),
+            target_path.clone(),
+        ];
+
+        for p in &candidates {
+            if let Ok(read_dir) = fs::read_dir(p) {
+                let mut count = 0;
                 for entry in read_dir.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
+                    if name == "." || name == ".." { continue; }
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    let size = entry.metadata().map(|m| m.len() as usize).unwrap_or(0);
+
+                    let size = if is_dir {
+                        0
+                    } else {
+                        let full_file_path = format!("{}/{}", p.trim_end_matches('/'), name);
+                        fs::metadata(&full_file_path)
+                            .map(|m| m.len() as usize)
+                            .unwrap_or_else(|_| {
+                                fs::read(&full_file_path).map(|b| b.len()).unwrap_or(0)
+                            })
+                    };
+
                     self.entries.push(FinderEntry { name, is_dir, size });
+                    count += 1;
                 }
+                crate::f_info!("FINDER", "fs::read_dir('{}') successful: read {} entries", p, count);
                 read_success = true;
                 break;
             }
         }
 
-        if !read_success || self.entries.is_empty() {
-            if let Ok(entries) = fs::read_dir(".") {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    let size = entry.metadata().map(|m| m.len() as usize).unwrap_or(0);
-                    self.entries.push(FinderEntry { name, is_dir, size });
-                }
-            }
+        self.current_path = target_path;
+
+        if self.current_path.contains('/') || (self.current_path != "EOS SHARE" && self.current_path != "RootFS" && self.current_path != "Initrd") {
+            self.entries.insert(0, FinderEntry {
+                name: String::from(".."),
+                is_dir: true,
+                size: 0,
+            });
         }
 
-        self.status_label = format!("{} items in {}", self.entries.len(), self.current_path);
-        self.rebuild_ui();
+        self.entries.sort_by(|a, b| {
+            if a.name == ".." {
+                std::cmp::Ordering::Less
+            } else if b.name == ".." {
+                std::cmp::Ordering::Greater
+            } else {
+                b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+            }
+        });
+
+        self.status_label = if read_success {
+            format!("{} items in /{}", self.entries.len(), self.current_path)
+        } else {
+            format!("Empty or unavailable folder (/{}).", self.current_path)
+        };
     }
 
-    fn rebuild_ui(&mut self) {
-        let mut list_box = ContainerWidget::vbox().with_spacing(2).with_padding(2);
+    fn open_entry(&mut self, idx: usize) {
+        if idx >= self.entries.len() { return; }
+        let entry = self.entries[idx].clone();
+        crate::f_info!("FINDER", "User activated entry: '{}' (is_dir: {})", entry.name, entry.is_dir);
 
-        for entry in &self.entries {
-            let is_dir = entry.is_dir;
-            let entry_name = entry.name.clone();
-            let label_text = if is_dir {
-                format!("📁 {}", entry_name)
+        if entry.is_dir {
+            if entry.name == ".." {
+                if let Some(pos) = self.current_path.rfind('/') {
+                    let parent = self.current_path[..pos].to_string();
+                    self.load_directory(&parent);
+                } else {
+                    self.load_directory("EOS SHARE");
+                }
             } else {
-                format!("📄 {} ({} B)", entry_name, entry.size)
-            };
-
-            let mut row = ContainerWidget::hbox().with_spacing(6).with_padding(4);
-            row.add_child(Box::new(LabelWidget::new(label_text)), 1, (160, 24));
-            list_box.add_child(Box::new(row), 0, (200, 32));
+                let next_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
+                self.load_directory(&next_path);
+            }
+        } else {
+            let lower = entry.name.to_lowercase();
+            if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+                let full_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
+                self.pending_open_image = Some((entry.name.clone(), full_path));
+            }
         }
-
-        let content_h = (self.entries.len() as i32) * 34;
-        self.scroll_view = ScrollViewWidget::new(Box::new(list_box), content_h);
     }
 }
 
@@ -103,8 +142,6 @@ impl Widget for FinderApp {
 
     fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
         self.bounds = Rect::new(x, y, w, h);
-        let list_h = (h - 76).max(0);
-        self.scroll_view.layout(x + 8, y + 42, (w - 16).max(0), list_h);
         self.bounds
     }
 
@@ -112,42 +149,180 @@ impl Widget for FinderApp {
         let theme = get_theme();
         canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, 0);
 
-        let tb_h = theme.pt(36.0) as i32;
+        let tb_h = theme.pt(40.0);
+        let sb_h = theme.pt(26.0);
+
         canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, 0);
         canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
 
-        let path_text = format!("Path: {}", self.current_path);
-        canvas.draw_text(self.bounds.x + (theme.pt(14.0) as i32), self.bounds.y + (theme.pt(9.0) as i32), &path_text, theme.text_primary, theme.font_body());
+        let favorites = [("Root", "EOS SHARE"), ("RootFS", "RootFS"), ("Initrd", "Initrd")];
+        let mut fav_x = self.bounds.x + theme.pt(12.0);
+        for &(label, target) in &favorites {
+            let btn_w = theme.pt(54.0);
+            let is_cur = self.current_path == target || (target == "EOS SHARE" && self.current_path.starts_with("EOS SHARE/"));
+            let bg_c = if is_cur { theme.accent } else { 0xFF243044 };
+            canvas.draw_rect(fav_x, self.bounds.y + theme.pt(7.0), btn_w, theme.pt(26.0), bg_c, theme.pt(5.0) as usize);
+            let (tw, th) = canvas.measure_text(label, theme.font_caption());
+            canvas.draw_text(fav_x + (btn_w - tw as i32) / 2, self.bounds.y + theme.pt(7.0) + (theme.pt(26.0) - th as i32) / 2, label, 0xFFFFFFFF, theme.font_caption());
+            fav_x += btn_w + theme.pt(8.0);
+        }
 
-        self.scroll_view.paint(canvas);
+        let path_text = format!("Location: /{}", self.current_path);
+        canvas.draw_text_clipped(fav_x + theme.pt(8.0), self.bounds.y + theme.pt(11.0), self.bounds.w - (fav_x - self.bounds.x) - theme.pt(16.0), &path_text, theme.text_primary, theme.font_body());
 
-        let sb_h = theme.pt(24.0) as i32;
+        let list_y = self.bounds.y + tb_h + 1;
+        let list_h = (self.bounds.h - tb_h - sb_h - 1).max(0);
+        canvas.push_clip(Rect::new(self.bounds.x, list_y, self.bounds.w, list_h));
+
+        let row_h = theme.pt(34.0);
+        let mut cur_y = list_y + theme.pt(4.0) - self.scroll_y;
+
+        for (idx, entry) in self.entries.iter().enumerate() {
+            if cur_y + row_h >= list_y && cur_y <= list_y + list_h {
+                let is_sel = self.selected_idx == Some(idx);
+                let bg = if is_sel {
+                    theme.accent
+                } else if idx % 2 == 0 {
+                    theme.bg_window
+                } else {
+                    0xFF141E2E
+                };
+
+                canvas.draw_rect(self.bounds.x + theme.pt(4.0), cur_y, self.bounds.w - theme.pt(8.0), row_h, bg, theme.pt(4.0) as usize);
+
+                let icon = if entry.name == ".." {
+                    "⤴️"
+                } else if entry.is_dir {
+                    "📁"
+                } else if entry.name.ends_with(".elf") {
+                    "⚙️"
+                } else if entry.name.ends_with(".png") || entry.name.ends_with(".jpg") || entry.name.ends_with(".jpeg") {
+                    "🖼️"
+                } else {
+                    "📄"
+                };
+
+                let label = if entry.is_dir {
+                    format!("{}  {}", icon, entry.name)
+                } else {
+                    let sz_str = if entry.size >= 1024 * 1024 {
+                        format!("{:.2} MB", (entry.size as f64) / (1024.0 * 1024.0))
+                    } else if entry.size >= 1024 {
+                        format!("{} KB", entry.size / 1024)
+                    } else {
+                        format!("{} B", entry.size)
+                    };
+                    format!("{}  {} ({})", icon, entry.name, sz_str)
+                };
+
+                let txt_c = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
+                canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), cur_y + theme.pt(8.0), self.bounds.w - theme.pt(28.0), &label, txt_c, theme.font_body());
+            }
+            cur_y += row_h;
+        }
+
+        canvas.pop_clip();
+
         let sb_y = self.bounds.y + self.bounds.h - sb_h;
         canvas.draw_rect(self.bounds.x, sb_y, self.bounds.w, sb_h, theme.bg_titlebar, 0);
         canvas.draw_line_h(self.bounds.x, sb_y, self.bounds.w, theme.border_window);
-        canvas.draw_text(self.bounds.x + (theme.pt(14.0) as i32), sb_y + (theme.pt(4.0) as i32), &self.status_label, theme.text_muted, theme.font_caption());
+        canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), sb_y + theme.pt(5.0), self.bounds.w - theme.pt(28.0), &self.status_label, theme.text_muted, theme.font_caption());
     }
 
     fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
         if !self.bounds.contains(mx, my) { return false; }
-        if pressed && my >= self.bounds.y + 42 && my <= self.bounds.y + self.bounds.h - 24 {
-            let rel_y = (my - (self.bounds.y + 42)) + self.scroll_view.scroll_y;
-            let clicked_idx = (rel_y / 34) as usize;
-            if clicked_idx < self.entries.len() {
-                self.selected_idx = Some(clicked_idx);
-                let entry = self.entries[clicked_idx].clone();
-                if entry.is_dir {
-                    let next_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
-                    self.load_directory(&next_path);
+        let theme = get_theme();
+        let tb_h = theme.pt(40.0);
+        let sb_h = theme.pt(26.0);
+
+        if pressed {
+            if my >= self.bounds.y && my <= self.bounds.y + tb_h {
+                let favorites = ["EOS SHARE", "RootFS", "Initrd"];
+                let mut fav_x = self.bounds.x + theme.pt(12.0);
+                for target in favorites {
+                    let btn_w = theme.pt(54.0);
+                    if mx >= fav_x && mx <= fav_x + btn_w {
+                        self.load_directory(target);
+                        return true;
+                    }
+                    fav_x += btn_w + theme.pt(8.0);
                 }
                 return true;
             }
+
+            let list_y = self.bounds.y + tb_h + 1;
+            let list_h = self.bounds.h - tb_h - sb_h;
+            if my >= list_y && my <= list_y + list_h {
+                let row_h = theme.pt(34.0);
+                let rel_y = (my - (list_y + theme.pt(4.0))) + self.scroll_y;
+                if rel_y >= 0 {
+                    let clicked_idx = (rel_y / row_h) as usize;
+                    if clicked_idx < self.entries.len() {
+                        if self.selected_idx == Some(clicked_idx) {
+                            self.open_entry(clicked_idx);
+                        } else {
+                            self.selected_idx = Some(clicked_idx);
+                        }
+                        return true;
+                    }
+                }
+            }
         }
-        self.scroll_view.handle_mouse(mx, my, pressed)
+        true
     }
 
     fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
         if !self.bounds.contains(mx, my) { return false; }
-        self.scroll_view.handle_scroll(mx, my, dy)
+        let theme = get_theme();
+        let row_h = theme.pt(34.0);
+        let total_h = (self.entries.len() as i32) * row_h;
+        let view_h = self.bounds.h - theme.pt(66.0);
+        let max_scroll = (total_h - view_h).max(0);
+
+        if dy < 0 {
+            self.scroll_y = (self.scroll_y + theme.pt(28.0)).min(max_scroll);
+        } else {
+            self.scroll_y = (self.scroll_y - theme.pt(28.0)).max(0);
+        }
+        true
+    }
+
+    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
+        match keycode {
+            0x1C => {
+                if let Some(idx) = self.selected_idx {
+                    self.open_entry(idx);
+                    return true;
+                }
+            }
+            0x48 => {
+                if let Some(idx) = self.selected_idx {
+                    if idx > 0 { self.selected_idx = Some(idx - 1); return true; }
+                } else if !self.entries.is_empty() {
+                    self.selected_idx = Some(0);
+                    return true;
+                }
+            }
+            0x50 => {
+                if let Some(idx) = self.selected_idx {
+                    if idx + 1 < self.entries.len() { self.selected_idx = Some(idx + 1); return true; }
+                } else if !self.entries.is_empty() {
+                    self.selected_idx = Some(0);
+                    return true;
+                }
+            }
+            0x0E => {
+                let back_entry = FinderEntry { name: String::from(".."), is_dir: true, size: 0 };
+                if let Some(pos) = self.current_path.rfind('/') {
+                    let parent = self.current_path[..pos].to_string();
+                    self.load_directory(&parent);
+                } else {
+                    self.load_directory("EOS SHARE");
+                }
+                return true;
+            }
+            _ => {}
+        }
+        false
     }
 }

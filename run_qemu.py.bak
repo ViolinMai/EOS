@@ -64,23 +64,22 @@ def create_demo_tar(user_elf_data):
         add_file("readme.txt", b"Welcome to EOS Kernel!\r\nThis file is read from TarFS.\r\n")
         if user_elf_data: add_file("user_app.elf", user_elf_data)
 
-        font_paths = [
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYREGULAR.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYMEDIUM.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYBOLD.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYSEMIBOLDITALIC.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYLIGHTITALIC.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYHEAVYITALIC.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYBLACKITALIC.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYTHINITALIC.OTF",
-            r"C:\EOS_SHARE\fonts\SFPRODISPLAYULTRALIGHTITALIC.OTF",
-        ]
-        for fp in font_paths:
-            if os.path.exists(fp):
-                fname = os.path.basename(fp)
-                with open(fp, "rb") as ff: fb = ff.read()
-                add_file(fname, fb)
-                add_file("fonts/" + fname, fb)
+        # Dynamic font scan in EOS_SHARE directory
+        share_fonts_dir = r"C:\EOS_SHARE\fonts"
+        scan_dirs = [share_fonts_dir, r"C:\EOS_SHARE"]
+        for sdir in scan_dirs:
+            if os.path.exists(sdir):
+                for fname in os.listdir(sdir):
+                    lower = fname.lower()
+                    if lower.endswith(".ttf") or lower.endswith(".otf"):
+                        fpath = os.path.join(sdir, fname)
+                        if os.path.isfile(fpath):
+                            try:
+                                with open(fpath, "rb") as ff: fb = ff.read()
+                                add_file(fname, fb)
+                                add_file("fonts/" + fname, fb)
+                            except Exception:
+                                pass
 
         png_magic = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDAT\x08\x1d\x01\x05\x00\xfa\xff\x89P\x4E\x47\x00\x00\x00\x00IEND\xaeB`\x82"
         add_file("sample.png", png_magic)
@@ -89,7 +88,7 @@ def create_demo_tar(user_elf_data):
 
 def make_uefi_fat32_disk(img_path, files):
     SECTOR_SIZE = 512
-    SECTORS_PER_CLUSTER = 2  # 1024 Bytes/Cluster -> 129,008 clusters (>= 65525 required for FAT32 spec!)
+    SECTORS_PER_CLUSTER = 2
     CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE
     RESERVED_SECTORS = 32
     NUM_FATS = 2
@@ -133,7 +132,6 @@ def make_uefi_fat32_disk(img_path, files):
     disk[vbr_offset : vbr_offset + SECTOR_SIZE] = vbr
     disk[vbr_offset + (6 * SECTOR_SIZE) : vbr_offset + (7 * SECTOR_SIZE)] = vbr
 
-    # FSInfo Sector (Sector 1 & Backup Sector 7)
     fsinfo = bytearray(SECTOR_SIZE)
     struct.pack_into("<I", fsinfo, 0, 0x41615252)
     struct.pack_into("<I", fsinfo, 484, 0x61417272)
@@ -272,13 +270,11 @@ def prepare_and_run():
     if not os.path.exists(qemu_share): qemu_share = r"C:\Program Files\qemu\share"
     code_fd = os.path.join(qemu_share, "edk2-x86_64-code.fd")
 
-    # تنظيف أي vars قديم تالف
     vars_dst = os.path.join(target_dir, "vars.fd")
     if os.path.exists(vars_dst):
         try: os.remove(vars_dst)
         except Exception: pass
 
-    # إذا وجد ملف vars أصلي في qemu ننسخه، وإلا نشغل بدون pflash vars
     orig_vars = os.path.join(qemu_share, "edk2-i386-vars.fd")
     pflash_vars_args = []
     if os.path.exists(orig_vars):

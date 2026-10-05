@@ -75,12 +75,14 @@ static mut E1000_STORAGE: Option<E1000Driver> = None;
 
 #[inline]
 unsafe fn pci_enable_bus_mastering(bus: u8, dev: u8, func: u8) {
-    let addr = (1u32 << 31) | ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8) | 0x04;
-    core::arch::asm!("out dx, eax", in("dx") 0xCF8u16, in("eax") addr);
-    let mut val: u16;
-    core::arch::asm!("in ax, dx", in("dx") 0xCFCu16, out("ax") val);
-    val |= (1 << 2) | (1 << 1) | (1 << 0); // Bus Master + Memory Space + I/O Space
-    core::arch::asm!("out dx, ax", in("dx") 0xCFCu16, in("ax") val);
+    unsafe {
+        let addr = (1u32 << 31) | ((bus as u32) << 16) | ((dev as u32) << 11) | ((func as u32) << 8) | 0x04;
+        core::arch::asm!("out dx, eax", in("dx") 0xCF8u16, in("eax") addr);
+        let mut val: u16;
+        core::arch::asm!("in ax, dx", in("dx") 0xCFCu16, out("ax") val);
+        val |= (1 << 2) | (1 << 1) | (1 << 0); // Bus Master + Memory Space + I/O Space
+        core::arch::asm!("out dx, ax", in("dx") 0xCFCu16, in("ax") val);
+    }
 }
 
 impl E1000Driver {

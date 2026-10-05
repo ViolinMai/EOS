@@ -1,10 +1,8 @@
 #![allow(dead_code)]
-use core::fmt;
 
 pub const FONT_WIDTH: usize = 8;
 pub const FONT_HEIGHT: usize = 16;
 
-// توسيع المخزن المؤقت ليتسع لدقة 2K (2560x1440) و 4K بأمان
 const SAVED_SCREEN_SIZE: usize = 3840 * 2160;
 static mut SCREEN_SAVE_BUFFER: [u32; SAVED_SCREEN_SIZE] = [0; SAVED_SCREEN_SIZE];
 static mut SCREEN_SAVED: bool = false;

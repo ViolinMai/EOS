@@ -12,7 +12,7 @@ use crate::apps::activity_monitor::ActivityMonitorApp;
 use crate::apps::textedit::TextEditApp;
 use crate::apps::browser::BrowserApp;
 use crate::apps::preview::PreviewApp;
-use crate::syscall::{sys_present, sys_wait_event};
+use crate::syscall::{sys_present, sys_wait_event, sys_poll_event};
 
 pub struct FrameworkApp<'a> {
     pub buffer: Vec<u32>,
@@ -101,56 +101,22 @@ impl<'a> FrameworkApp<'a> {
     pub fn run_loop(&mut self) {
         loop {
             let theme = get_theme();
-            for p in &mut self.buffer {
-                *p = theme.bg_desktop;
-            }
 
-            // رسم النوافذ
-            {
-                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-                for w in &self.root_widgets {
-                    w.paint(&mut canvas);
-                }
-            }
-
-            // رسم شريط الـ Dock
-            let dock_h = theme.pt(54.0);
-            let dock_w = (self.dock_items.len() as i32) * theme.pt(52.0) + theme.pt(20.0);
-            let dock_x = ((self.width as i32) - dock_w) / 2;
-            let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
-
-            {
-                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-                canvas.draw_rect(dock_x, dock_y, dock_w, dock_h, theme.bg_dock, theme.pt(16.0) as usize);
-                canvas.draw_rect_outline(dock_x, dock_y, dock_w, dock_h, theme.border_dock, theme.pt(16.0) as usize);
-
-                for (i, item) in self.dock_items.iter().enumerate() {
-                    let ix = dock_x + theme.pt(12.0) + (i as i32 * theme.pt(52.0));
-                    let iy = dock_y + theme.pt(7.0);
-                    canvas.draw_rect(ix, iy, theme.pt(40.0), theme.pt(40.0), theme.accent, theme.pt(8.0) as usize);
-                    let initial = item.chars().next().unwrap_or('A').to_string();
-                    let (tw, th) = canvas.measure_text(&initial, theme.font_title());
-                    canvas.draw_text(ix + ((theme.pt(40.0) - tw as i32) / 2), iy + ((theme.pt(40.0) - th as i32) / 2), &initial, 0xFFFFFFFF, theme.font_title());
-                }
-
-                // رسم شريط القوائم العلوي
-                self.menubar.paint(&mut canvas);
-
-                // رسم مؤشر لينكس
-                canvas.draw_linux_cursor(self.mouse_x, self.mouse_y);
-            }
-
-            sys_present(self.buffer.as_ptr(), self.width, self.height);
-
-            // معالجة الأحداث مع فك تشفير الإزاحة النسبية (dx, dy) الصحيح
-            if let Some(ev) = sys_wait_event(16) {
+            // 1. استهلاك وتفريغ جميع الأحداث المتراكمة في الطابور دفعة واحدة (Drain Queue)
+            // هذا يمنع تراكم حركة الماوس وتأخر الاستجابة الزمني نهائياً
+            let mut first_ev = sys_wait_event(16);
+            while let Some(ev) = first_ev {
                 let ev_type = ev[0];
+                let dock_h = theme.pt(54.0);
+                let dock_w = (self.dock_items.len() as i32) * theme.pt(52.0) + theme.pt(20.0);
+                let dock_x = ((self.width as i32) - dock_w) / 2;
+                let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
+
                 match ev_type {
-                    1 => { // MouseMove: استخراج dx و dy كأعداد صحيحة موقعة ذات إشارة 32-bit صريحة
+                    1 => { // MouseMove
                         let dx = (ev[1] as u32) as i32;
                         let dy = ((ev[1] >> 32) as u32) as i32;
 
-                        // التحديث التراكمي للإحداثيات
                         self.mouse_x = (self.mouse_x + dx).clamp(0, self.width as i32 - 1);
                         self.mouse_y = (self.mouse_y + dy).clamp(0, self.height as i32 - 1);
 
@@ -165,12 +131,12 @@ impl<'a> FrameworkApp<'a> {
                         let pressed = ((ev[1] >> 8) & 0xFF) != 0;
 
                         if btn == 0 && pressed {
-                            // فحص النقر على الـ Dock
                             if self.mouse_y >= dock_y && self.mouse_y <= dock_y + dock_h && self.mouse_x >= dock_x && self.mouse_x <= dock_x + dock_w {
                                 let idx = ((self.mouse_x - dock_x - theme.pt(12.0)) / theme.pt(52.0)) as usize;
                                 if idx < self.dock_items.len() {
                                     let app_name = self.dock_items[idx].clone();
                                     self.spawn_app(&app_name);
+                                    first_ev = sys_poll_event();
                                     continue;
                                 }
                             }
@@ -212,7 +178,7 @@ impl<'a> FrameworkApp<'a> {
                         }
                     }
                     5 => { // Scroll
-                        let dy = ev[1] as i64 as i32;
+                        let dy = (ev[1] as u32) as i32;
                         for w in self.root_widgets.iter_mut().rev() {
                             if w.handle_scroll(self.mouse_x, self.mouse_y, dy) {
                                 break;
@@ -221,7 +187,47 @@ impl<'a> FrameworkApp<'a> {
                     }
                     _ => {}
                 }
+
+                // سحب باقي الأحداث في الطابور دون نوم
+                first_ev = sys_poll_event();
             }
+
+            // 2. دورة الرسم المنعشة بعد تفريغ الأحداث
+            for p in &mut self.buffer {
+                *p = theme.bg_desktop;
+            }
+
+            {
+                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                for w in &self.root_widgets {
+                    w.paint(&mut canvas);
+                }
+            }
+
+            let dock_h = theme.pt(54.0);
+            let dock_w = (self.dock_items.len() as i32) * theme.pt(52.0) + theme.pt(20.0);
+            let dock_x = ((self.width as i32) - dock_w) / 2;
+            let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
+
+            {
+                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                canvas.draw_rect(dock_x, dock_y, dock_w, dock_h, theme.bg_dock, theme.pt(16.0) as usize);
+                canvas.draw_rect_outline(dock_x, dock_y, dock_w, dock_h, theme.border_dock, theme.pt(16.0) as usize);
+
+                for (i, item) in self.dock_items.iter().enumerate() {
+                    let ix = dock_x + theme.pt(12.0) + (i as i32 * theme.pt(52.0));
+                    let iy = dock_y + theme.pt(7.0);
+                    canvas.draw_rect(ix, iy, theme.pt(40.0), theme.pt(40.0), theme.accent, theme.pt(8.0) as usize);
+                    let initial = item.chars().next().unwrap_or('A').to_string();
+                    let (tw, th) = canvas.measure_text(&initial, theme.font_title());
+                    canvas.draw_text(ix + ((theme.pt(40.0) - tw as i32) / 2), iy + ((theme.pt(40.0) - th as i32) / 2), &initial, 0xFFFFFFFF, theme.font_title());
+                }
+
+                self.menubar.paint(&mut canvas);
+                canvas.draw_linux_cursor(self.mouse_x, self.mouse_y);
+            }
+
+            sys_present(self.buffer.as_ptr(), self.width, self.height);
         }
     }
 }

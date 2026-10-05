@@ -102,8 +102,6 @@ impl<'a> FrameworkApp<'a> {
         loop {
             let theme = get_theme();
 
-            // 1. استهلاك وتفريغ جميع الأحداث المتراكمة في الطابور دفعة واحدة (Drain Queue)
-            // هذا يمنع تراكم حركة الماوس وتأخر الاستجابة الزمني نهائياً
             let mut first_ev = sys_wait_event(16);
             while let Some(ev) = first_ev {
                 let ev_type = ev[0];
@@ -113,7 +111,7 @@ impl<'a> FrameworkApp<'a> {
                 let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
 
                 match ev_type {
-                    1 => { // MouseMove
+                    1 => {
                         let dx = (ev[1] as u32) as i32;
                         let dy = ((ev[1] >> 32) as u32) as i32;
 
@@ -126,7 +124,7 @@ impl<'a> FrameworkApp<'a> {
                             }
                         }
                     }
-                    2 => { // MouseButton
+                    2 => {
                         let btn = (ev[1] & 0xFF) as u8;
                         let pressed = ((ev[1] >> 8) & 0xFF) != 0;
 
@@ -162,14 +160,14 @@ impl<'a> FrameworkApp<'a> {
                             }
                         }
                     }
-                    3 => { // KeyDown
+                    3 => {
                         let keycode = (ev[1] & 0xFF) as u8;
                         let mods = ((ev[1] >> 8) & 0xFF) as u8;
                         if let Some(active_win) = self.root_widgets.last_mut() {
                             active_win.handle_key(keycode, mods);
                         }
                     }
-                    4 => { // Char
+                    4 => {
                         let c_code = ev[1] as u32;
                         if let Some(c) = char::from_u32(c_code) {
                             if let Some(active_win) = self.root_widgets.last_mut() {
@@ -177,7 +175,7 @@ impl<'a> FrameworkApp<'a> {
                             }
                         }
                     }
-                    5 => { // Scroll
+                    5 => {
                         let dy = (ev[1] as u32) as i32;
                         for w in self.root_widgets.iter_mut().rev() {
                             if w.handle_scroll(self.mouse_x, self.mouse_y, dy) {
@@ -188,11 +186,34 @@ impl<'a> FrameworkApp<'a> {
                     _ => {}
                 }
 
-                // سحب باقي الأحداث في الطابور دون نوم
                 first_ev = sys_poll_event();
             }
 
-            // 2. دورة الرسم المنعشة بعد تفريغ الأحداث
+            let mut image_to_open = None;
+            for w in &mut self.root_widgets {
+                if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                    if let Some(finder) = frame.content.as_any_mut().downcast_mut::<FinderApp>() {
+                        if let Some(req) = finder.pending_open_image.take() {
+                            image_to_open = Some(req);
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some((name, path)) = image_to_open {
+                let prev_app = Box::new(PreviewApp::new(name.clone(), path));
+                let win = Box::new(WindowFrame::new(
+                    format!("Preview - {}", name),
+                    theme.pt(120.0),
+                    theme.pt(80.0),
+                    theme.pt(680.0),
+                    theme.pt(480.0),
+                    prev_app,
+                ));
+                self.root_widgets.push(win);
+            }
+
             for p in &mut self.buffer {
                 *p = theme.bg_desktop;
             }
