@@ -355,21 +355,29 @@ impl WindowManager {
     }
 
     pub fn draw(&mut self, fb: &mut FrameBuffer, theme: &Theme, damage: &draw::DamageTracker) {
+        let max_len = fb.pixels.len();
         for win in self.windows.iter_mut() {
             if win.is_minimized { continue; }
             if win.is_dirty { win.redraw_surface(theme); }
             let w_rect = Rect { x: win.x, y: win.y, w: win.w, h: win.h };
             for d_rect in damage.get_rects() {
                 if !w_rect.intersects(d_rect) { continue; }
-                let ix = w_rect.x.max(d_rect.x); let iy = w_rect.y.max(d_rect.y);
-                let ex = (w_rect.x + w_rect.w).min(d_rect.x + d_rect.w); let ey = (w_rect.y + w_rect.h).min(d_rect.y + d_rect.h);
+                let ix = w_rect.x.max(d_rect.x);
+                let iy = w_rect.y.max(d_rect.y);
+                let ex = (w_rect.x + w_rect.w).min(d_rect.x + d_rect.w).min(fb.width);
+                let ey = (w_rect.y + w_rect.h).min(d_rect.y + d_rect.h).min(fb.height);
+                if ix >= ex || iy >= ey { continue; }
                 let rw = ex - ix;
                 for cy in iy..ey {
                     let dst_idx = cy * fb.pitch_pixels + ix;
-                    let src_idx = (cy - win.y) * win.w + (ix - win.x);
+                    let src_idx = (cy.saturating_sub(win.y)) * win.w + (ix.saturating_sub(win.x));
                     for offset in 0..rw {
-                        let fg = win.surface[src_idx + offset];
-                        if fg != 0 { fb.pixels[dst_idx + offset] = draw::blend_color(fb.pixels[dst_idx + offset], fg, 255); }
+                        if dst_idx + offset < max_len && src_idx + offset < win.surface.len() {
+                            let fg = win.surface[src_idx + offset];
+                            if fg != 0 {
+                                fb.pixels[dst_idx + offset] = draw::blend_color(fb.pixels[dst_idx + offset], fg, 255);
+                            }
+                        }
                     }
                 }
             }

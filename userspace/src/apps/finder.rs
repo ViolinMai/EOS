@@ -216,19 +216,17 @@ impl Widget for FinderApp {
                         let clean_path = full_path.trim_start_matches('/');
                         if item.kind_str == "Image" {
                             if let Ok(bytes) = fs::read(&full_path).or_else(|_| fs::read(clean_path)) {
-                                f_info!("FINDER", "Double-clicked image '{}' ({} bytes)", item.name, bytes.len());
+                                f_info!("FINDER", "Opening image '{}' ({} bytes)", item.name, bytes.len());
                                 self.pending_open_image = Some((item.name.clone(), bytes));
                             }
                         } else if item.kind_str == "Document" {
                             if let Ok(bytes) = fs::read(&full_path).or_else(|_| fs::read(clean_path)) {
-                                let max_preview = 64 * 1024; // 64 KB limit for text preview
+                                let max_preview = 64 * 1024;
                                 let slice = if bytes.len() > max_preview { &bytes[..max_preview] } else { &bytes[..] };
                                 let text_content = String::from_utf8_lossy(slice).to_string();
-                                f_info!("FINDER", "Double-clicked document '{}' ({} chars)", item.name, text_content.len());
+                                f_info!("FINDER", "Opening document '{}' ({} chars)", item.name, text_content.len());
                                 self.pending_open_text = Some((item.name.clone(), text_content));
                             }
-                        } else {
-                            f_info!("FINDER", "File '{}' is not a text document or image, skipping editor spawn.", item.name);
                         }
                     }
                     return true;

@@ -84,16 +84,13 @@ impl Widget for WindowFrame {
         let tb_h = theme.pt(36.0);
         let r = theme.radius_window;
 
-        // Window Background & Clean Rounded Outline
         canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, r);
         canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.border_window, r);
 
-        // Titlebar Top
         canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, r);
         canvas.draw_rect(self.bounds.x, self.bounds.y + tb_h.saturating_sub(r), self.bounds.w, r, theme.bg_titlebar, 0);
         canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
 
-        // Generous Window Controls
         let btn_sz = theme.pt(15.0);
         let btn_y = self.bounds.y + (tb_h.saturating_sub(btn_sz) / 2);
         let btn_rad = btn_sz / 2;
@@ -106,13 +103,11 @@ impl Widget for WindowFrame {
         canvas.draw_rect(m_x, btn_y, btn_sz, btn_sz, theme.btn_min, btn_rad);
         canvas.draw_rect(x_x, btn_y, btn_sz, btn_sz, theme.btn_max, btn_rad);
 
-        // Title Text with Ellipsis protection
         let (tw, _) = canvas.measure_text(&self.title, theme.font_title());
         let tx = self.bounds.x + (self.bounds.w.saturating_sub(tw) / 2).max(theme.pt(80.0));
         let ty = self.bounds.y + (tb_h.saturating_sub(theme.font_title()) / 2);
         canvas.draw_text_clipped(tx, ty, self.bounds.w.saturating_sub(theme.pt(160.0)), &self.title, theme.text_primary, theme.font_title());
 
-        // STRICT SCISSOR CLIPPING: Content can NEVER escape this window's bounds
         let old_clip = canvas.clip_rect;
         let content_rect = Rect::new(
             self.bounds.x + 1,
@@ -124,7 +119,6 @@ impl Widget for WindowFrame {
         self.content.paint(canvas);
         canvas.set_clip(old_clip);
 
-        // Corner Resize Grip Marker
         let grip_sz = theme.pt(8.0);
         let gx = self.bounds.x + self.bounds.w.saturating_sub(grip_sz + 2);
         let gy = self.bounds.y + self.bounds.h.saturating_sub(grip_sz + 2);
@@ -180,7 +174,6 @@ impl Widget for WindowFrame {
         let tb_h = theme.pt(36.0);
         let resize_margin = theme.pt(12.0);
 
-        // Check if cursor clicked on resize border
         if pressed {
             let on_right = mx >= self.bounds.x + self.bounds.w.saturating_sub(resize_margin);
             let on_bottom = my >= self.bounds.y + self.bounds.h.saturating_sub(resize_margin);
@@ -196,7 +189,6 @@ impl Widget for WindowFrame {
             }
         }
 
-        // Titlebar controls & dragging
         if my < self.bounds.y + tb_h {
             let close_hitbox = Rect::new(self.bounds.x + theme.pt(8.0), self.bounds.y, theme.pt(30.0), tb_h);
             let min_hitbox   = Rect::new(self.bounds.x + theme.pt(38.0), self.bounds.y, theme.pt(28.0), tb_h);

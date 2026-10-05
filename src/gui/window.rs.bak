@@ -1,0 +1,115 @@
+use alloc::vec::Vec;
+use alloc::boxed::Box;
+use super::theme::Theme;
+use super::draw::{self, FrameBuffer, Rect, DamageTracker};
+use super::apps::App;
+use crate::input::InputEvent;
+use crate::gui::metrics::get_metrics;
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum ResizeEdge {
+    None,
+    Top, Bottom, Left, Right,
+    TopLeft, TopRight, BottomLeft, BottomRight,
+}
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub enum InteractionState {
+    Idle, Dragging, Resizing(ResizeEdge), PressedTitlebar, PressedButton(u8),
+}
+
+pub struct Window {
+    pub id: usize, pub x: usize, pub y: usize, pub w: usize, pub h: usize,
+    pub min_w: usize, pub min_h: usize,
+    pub interaction_state: InteractionState,
+    pub drag_off_x: isize, pub drag_off_y: isize,
+    pub is_minimized: bool, pub is_maximized: bool,
+    pub saved_x: usize, pub saved_y: usize, pub saved_w: usize, pub saved_h: usize,
+    pub last_title_click: u64,
+    pub active: bool, pub app: Box<dyn App>, pub surface: Vec<u32>, pub is_dirty: bool,
+}
+
+impl Window {
+    pub fn titlebar_height() -> usize { get_metrics().titlebar_height }
+
+    pub fn redraw_surface(&mut self, theme: &Theme) {
+        if self.surface.len() != self.w * self.h { self.surface.resize(self.w * self.h, 0); }
+        let mut fb = FrameBuffer { pixels: &mut self.surface, width: self.w, height: self.h, pitch_pixels: self.w };
+        fb.pixels.fill(0);
+        
+        let metrics = get_metrics();
+        let tb_h = Self::titlebar_height();
+        let corner_r = if self.is_maximized { 0 } else { metrics.corner_radius };
+        draw::draw_rect_rounded(&mut fb, 0, 0, self.w, self.h, corner_r, theme.window_bg, 255);
+        draw::draw_rect_rounded(&mut fb, 0, 0, self.w, tb_h, corner_r, theme.titlebar_bg, 255);
+        draw::draw_rect(&mut fb, 0, tb_h.saturating_sub(corner_r), self.w, corner_r, theme.titlebar_bg);
+        draw::draw_line_h(&mut fb, 0, tb_h, self.w, theme.titlebar_border);
+
+        let title = self.app.title();
+        let title_w = unsafe { crate::font::get_font_manager().measure_text(title, metrics.font_title) };
+        let title_x = (self.w / 2).saturating_sub(title_w / 2);
+        draw::draw_text(&mut fb, title_x, (tb_h / 2).saturating_sub(metrics.font_title / 2), title, if self.active { theme.text_main } else { theme.text_dim }, 2);
+
+        let btn_y = (tb_h / 2).saturating_sub(7);
+        draw::draw_rect_rounded(&mut fb, 16, btn_y, 14, 14, 7, theme.btn_close, 255);
+        draw::draw_rect_rounded(&mut fb, 38, btn_y, 14, 14, 7, theme.btn_min, 255);
+        draw::draw_rect_rounded(&mut fb, 60, btn_y, 14, 14, 7, theme.btn_max, 255);
+        
+        if !self.is_maximized {
+            draw::draw_rect_outline(&mut fb, 0, 0, self.w, self.h, if self.active { theme.window_border } else { theme.border }, corner_r);
+        }
+
+        self.app.draw(&mut fb, theme, 1, tb_h + 1, self.w.saturating_sub(2), self.h.saturating_sub(tb_h + 2));
+        self.is_dirty = false;
+    }
+}
+
+pub struct DesktopGeometry {
+    pub screen_w: usize, pub screen_h: usize,
+    pub top_bar_height: usize, pub dock_height: usize,
+}
+
+impl DesktopGeometry {
+    pub fn get_work_area(&self) -> Rect {
+        Rect { x: 0, y: self.top_bar_height, w: self.screen_w, h: self.screen_h.saturating_sub(self.top_bar_height + self.dock_height) }
+    }
+}
+
+pub struct WindowManager {
+    pub windows: Vec<Window>,
+    pub geometry: DesktopGeometry,
+    pub next_id: usize,
+    pub active_operation_win: Option<usize>,
+}
+
+impl WindowManager {
+    pub fn draw(&mut self, fb: &mut FrameBuffer, theme: &Theme, damage: &draw::DamageTracker) {
+        let max_len = fb.pixels.len();
+        for win in self.windows.iter_mut() {
+            if win.is_minimized { continue; }
+            if win.is_dirty { win.redraw_surface(theme); }
+            let w_rect = Rect { x: win.x, y: win.y, w: win.w, h: win.h };
+            for d_rect in damage.get_rects() {
+                if !w_rect.intersects(d_rect) { continue; }
+                let ix = w_rect.x.max(d_rect.x);
+                let iy = w_rect.y.max(d_rect.y);
+                let ex = (w_rect.x + w_rect.w).min(d_rect.x + d_rect.w).min(fb.width);
+                let ey = (w_rect.y + w_rect.h).min(d_rect.y + d_rect.h).min(fb.height);
+                if ix >= ex || iy >= ey { continue; }
+                let rw = ex - ix;
+                for cy in iy..ey {
+                    let dst_idx = cy * fb.pitch_pixels + ix;
+                    let src_idx = (cy.saturating_sub(win.y)) * win.w + (ix.saturating_sub(win.x));
+                    for offset in 0..rw {
+                        if dst_idx + offset < max_len && src_idx + offset < win.surface.len() {
+                            let fg = win.surface[src_idx + offset];
+                            if fg != 0 {
+                                fb.pixels[dst_idx + offset] = draw::blend_color(fb.pixels[dst_idx + offset], fg, 255);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

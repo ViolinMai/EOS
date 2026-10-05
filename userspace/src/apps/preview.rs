@@ -1,6 +1,13 @@
 use crate::framework::*;
 use crate::{f_info, f_error};
 
+#[derive(PartialEq, Eq)]
+pub enum DecodeStatus {
+    Pending,
+    Ready,
+    Failed(String),
+}
+
 pub struct PreviewApp {
     bounds: Rect,
     pub title: String,
@@ -8,37 +15,39 @@ pub struct PreviewApp {
     pub width: usize,
     pub height: usize,
     pub raw_pixels: Vec<u32>,
-    pub error_msg: Option<String>,
+    pub status: DecodeStatus,
 }
 
 impl PreviewApp {
     pub fn new(title: String, data: Vec<u8>) -> Self {
-        let mut app = Self {
+        Self {
             bounds: Rect::default(),
             title,
             image_data: data,
             width: 0,
             height: 0,
             raw_pixels: Vec::new(),
-            error_msg: None,
-        };
-        app.decode();
-        app
+            status: DecodeStatus::Pending,
+        }
     }
 
-    fn decode(&mut self) {
+    pub fn process_decode(&mut self) {
         if self.image_data.is_empty() {
-            let err = "Image byte buffer is empty (0 bytes).".to_string();
+            let err = "Image buffer is empty.".to_string();
             f_error!("PREVIEW", "{}", err);
-            self.error_msg = Some(err);
+            self.status = DecodeStatus::Failed(err);
             return;
         }
 
-        f_info!("PREVIEW", "Attempting decode for '{}' ({} bytes, magic: {:02X?})",
-            self.title, self.image_data.len(), &self.image_data[..core::cmp::min(8, self.image_data.len())]
+        f_info!(
+            "PREVIEW",
+            "Decoding '{}' ({:.2} MB)",
+            self.title,
+            (self.image_data.len() as f64) / (1024.0 * 1024.0)
         );
 
-        // 1. JPEG Format
+        let t_start = std::time::Instant::now();
+
         if self.image_data.len() >= 2 && self.image_data[0] == 0xFF && self.image_data[1] == 0xD8 {
             let mut decoder = zune_jpeg::JpegDecoder::new(&self.image_data);
             match decoder.decode() {
@@ -63,37 +72,39 @@ impl PreviewApp {
                                 }
                             }
                         }
-                        f_info!("PREVIEW", "JPEG successfully decoded: {}x{} px", self.width, self.height);
+                        f_info!("PREVIEW", "JPEG decoded: {}x{} px in {:?}", self.width, self.height, t_start.elapsed());
+                        self.status = DecodeStatus::Ready;
                         return;
                     }
                 }
                 Err(e) => {
                     let err = format!("JPEG decoder error: {:?}", e);
                     f_error!("PREVIEW", "{}", err);
-                    self.error_msg = Some(err);
+                    self.status = DecodeStatus::Failed(err);
+                    return;
                 }
             }
         }
 
-        // 2. PNG Format
         if self.image_data.starts_with(b"\x89PNG\r\n\x1a\n") {
             match crate::png::decode_png(&self.image_data) {
                 Ok((px, w, h)) => {
                     self.width = w;
                     self.height = h;
                     self.raw_pixels = px;
-                    f_info!("PREVIEW", "PNG successfully decoded: {}x{} px", self.width, self.height);
+                    f_info!("PREVIEW", "PNG decoded: {}x{} px in {:?}", self.width, self.height, t_start.elapsed());
+                    self.status = DecodeStatus::Ready;
                     return;
                 }
                 Err(e) => {
                     let err = format!("PNG decoder error: {}", e);
                     f_error!("PREVIEW", "{}", err);
-                    self.error_msg = Some(err);
+                    self.status = DecodeStatus::Failed(err);
+                    return;
                 }
             }
         }
 
-        // 3. BMP Format Fallback
         if self.image_data.starts_with(b"BM") && self.image_data.len() > 54 {
             let data_offset = u32::from_le_bytes([self.image_data[10], self.image_data[11], self.image_data[12], self.image_data[13]]) as usize;
             let w = i32::from_le_bytes([self.image_data[18], self.image_data[19], self.image_data[20], self.image_data[21]]).abs() as usize;
@@ -120,16 +131,15 @@ impl PreviewApp {
                 self.width = w;
                 self.height = h;
                 self.raw_pixels = pixels;
-                f_info!("PREVIEW", "BMP successfully decoded: {}x{} px", w, h);
+                f_info!("PREVIEW", "BMP decoded: {}x{} px in {:?}", w, h, t_start.elapsed());
+                self.status = DecodeStatus::Ready;
                 return;
             }
         }
 
-        if self.error_msg.is_none() {
-            let err = format!("Unsupported image format or corrupt header (Magic: {:02X?})", &self.image_data[..core::cmp::min(4, self.image_data.len())]);
-            f_error!("PREVIEW", "{}", err);
-            self.error_msg = Some(err);
-        }
+        let err = format!("Unsupported format (Magic: {:02X?})", &self.image_data[..core::cmp::min(4, self.image_data.len())]);
+        f_error!("PREVIEW", "{}", err);
+        self.status = DecodeStatus::Failed(err);
     }
 }
 
@@ -145,42 +155,46 @@ impl Widget for PreviewApp {
         let theme = get_theme();
         canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF050811, 0);
 
-        if self.width == 0 || self.height == 0 || self.raw_pixels.is_empty() {
-            let msg = format!("Image: {} ({} bytes)", self.title, self.image_data.len());
-            canvas.draw_text(self.bounds.x + theme.pt(20.0), self.bounds.y + theme.pt(30.0), &msg, theme.text_primary, theme.font_title());
-            if let Some(err) = &self.error_msg {
-                canvas.draw_text(self.bounds.x + theme.pt(20.0), self.bounds.y + theme.pt(60.0), &format!("Decode Error: {}", err), 0xFFEF4444, theme.font_body());
-            } else {
-                canvas.draw_text(self.bounds.x + theme.pt(20.0), self.bounds.y + theme.pt(60.0), "Decoding failed or no pixel buffer produced.", 0xFFF59E0B, theme.font_body());
+        match &self.status {
+            DecodeStatus::Pending => {
+                let msg = format!("⏳ Loading & Decoding '{}' ({:.1} MB)...", self.title, (self.image_data.len() as f64) / (1024.0 * 1024.0));
+                canvas.draw_text_clipped(self.bounds.x + theme.pt(20.0), self.bounds.y + theme.pt(40.0), self.bounds.w.saturating_sub(theme.pt(40.0)), &msg, theme.accent_hover, theme.font_title());
+                canvas.draw_text(self.bounds.x + theme.pt(20.0), self.bounds.y + theme.pt(70.0), "Decompressing scanlines into TrueColor buffer...", theme.text_secondary, theme.font_body());
             }
-            return;
-        }
+            DecodeStatus::Failed(err) => {
+                let msg = format!("Image: {} ({:.1} MB)", self.title, (self.image_data.len() as f64) / (1024.0 * 1024.0));
+                canvas.draw_text_clipped(self.bounds.x + theme.pt(20.0), self.bounds.y + theme.pt(30.0), self.bounds.w.saturating_sub(theme.pt(40.0)), &msg, theme.text_primary, theme.font_title());
+                canvas.draw_text_clipped(self.bounds.x + theme.pt(20.0), self.bounds.y + theme.pt(60.0), self.bounds.w.saturating_sub(theme.pt(40.0)), &format!("Decode Error: {}", err), 0xFFEF4444, theme.font_body());
+            }
+            DecodeStatus::Ready => {
+                if self.width == 0 || self.height == 0 || self.raw_pixels.is_empty() { return; }
 
-        let step_x = (self.width + self.bounds.w - 1) / self.bounds.w;
-        let step_y = (self.height + self.bounds.h - 1) / self.bounds.h;
-        let step = step_x.max(step_y).max(1);
+                let scale_x = self.width as f32 / self.bounds.w.max(1) as f32;
+                let scale_y = self.height as f32 / self.bounds.h.max(1) as f32;
+                let scale = scale_x.max(scale_y).max(1.0);
 
-        let disp_w = (self.width / step).min(self.bounds.w);
-        let disp_h = (self.height / step).min(self.bounds.h);
-        let off_x = self.bounds.x + (self.bounds.w.saturating_sub(disp_w) / 2);
-        let off_y = self.bounds.y + (self.bounds.h.saturating_sub(disp_h) / 2);
+                let disp_w = ((self.width as f32 / scale).round() as usize).min(self.bounds.w);
+                let disp_h = ((self.height as f32 / scale).round() as usize).min(self.bounds.h);
+                let off_x = self.bounds.x + (self.bounds.w.saturating_sub(disp_w) / 2);
+                let off_y = self.bounds.y + (self.bounds.h.saturating_sub(disp_h) / 2);
 
-        for dy in 0..disp_h {
-            let src_y = dy * step;
-            let dst_y = off_y + dy;
-            if dst_y >= canvas.height { break; }
-            for dx in 0..disp_w {
-                let src_x = dx * step;
-                let dst_x = off_x + dx;
-                if dst_x >= canvas.width { break; }
-                let col = self.raw_pixels[src_y * self.width + src_x];
-                canvas.buffer[dst_y * canvas.width + dst_x] = col;
+                for dy in 0..disp_h {
+                    let src_y = ((dy as f32 * scale) as usize).min(self.height - 1);
+                    let dst_y = off_y + dy;
+                    if dst_y >= canvas.height { break; }
+                    for dx in 0..disp_w {
+                        let src_x = ((dx as f32 * scale) as usize).min(self.width - 1);
+                        let dst_x = off_x + dx;
+                        if dst_x >= canvas.width { break; }
+                        let col = self.raw_pixels[src_y * self.width + src_x];
+                        canvas.buffer[dst_y * canvas.width + dst_x] = col;
+                    }
+                }
             }
         }
     }
 
     fn handle_mouse(&mut self, mx: usize, my: usize, _pressed: bool) -> bool {
-        // Return true if mouse is inside bounds so clicks never fall through
         self.bounds.contains(mx, my)
     }
 }

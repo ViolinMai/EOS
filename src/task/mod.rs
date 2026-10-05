@@ -5,7 +5,7 @@ use alloc::string::String;
 use alloc::vec::Vec;
 use crate::arch::x86_64::interrupts::IS_RUNNING_PROGRAM;
 use core::ptr::addr_of_mut;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicUsize, Ordering};
 
 pub const TASK_STACK_SIZE: usize = 16 * 1024;
 
@@ -55,6 +55,66 @@ pub static mut ELF_TARGET_ARG: [u8; 128] = [0; 128];
 pub static ELF_ACTIVE_RUNNING: AtomicBool = AtomicBool::new(false);
 pub static CORE_ELF_SPAWN_REQ: [AtomicBool; 8] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
 pub static CORE_IS_BUSY: [AtomicBool; 8] = [AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false), AtomicBool::new(false)];
+
+// تفويض فك تشفير الصور للنواة 3 والنواة 4 في الخلفية
+static DECODE_STATUS: AtomicI32 = AtomicI32::new(0); // 0=idle, 1=running, 2=ready, -1=error
+static DECODE_W: AtomicUsize = AtomicUsize::new(0);
+static DECODE_H: AtomicUsize = AtomicUsize::new(0);
+static mut DECODE_INPUT: Option<Vec<u8>> = None;
+static mut DECODE_OUTPUT: Option<Vec<u32>> = None;
+
+pub fn start_multicore_decode(data: Vec<u8>) {
+    unsafe {
+        *addr_of_mut!(DECODE_INPUT) = Some(data);
+        *addr_of_mut!(DECODE_OUTPUT) = None;
+    }
+    DECODE_STATUS.store(1, Ordering::SeqCst);
+
+    let _ = dispatch_job(3, core3_decode_worker);
+    let _ = dispatch_job(4, core4_decode_assist);
+}
+
+pub fn poll_multicore_decode() -> (i32, usize, usize, Option<Vec<u32>>) {
+    let status = DECODE_STATUS.load(Ordering::Acquire);
+    if status == 2 {
+        let w = DECODE_W.load(Ordering::Acquire);
+        let h = DECODE_H.load(Ordering::Acquire);
+        let px = unsafe { (*addr_of_mut!(DECODE_OUTPUT)).take() };
+        DECODE_STATUS.store(0, Ordering::Release);
+        (1, w, h, px)
+    } else if status == -1 {
+        DECODE_STATUS.store(0, Ordering::Release);
+        (-1, 0, 0, None)
+    } else {
+        (0, 0, 0, None)
+    }
+}
+
+fn core3_decode_worker() {
+    let input = unsafe { (*addr_of_mut!(DECODE_INPUT)).take() };
+    if let Some(bytes) = input {
+        crate::log_info!("SMP_DECODE", "Core 3 & 4 -> Parallel decoding started ({} bytes)...", bytes.len());
+        match crate::fs::image::decode_image_to_raw(&bytes) {
+            Ok((pixels, w, h)) => {
+                crate::log_info!("SMP_DECODE", "Core 3 -> Successfully decoded image: {}x{} px", w, h);
+                DECODE_W.store(w, Ordering::Release);
+                DECODE_H.store(h, Ordering::Release);
+                unsafe { *addr_of_mut!(DECODE_OUTPUT) = Some(pixels); }
+                DECODE_STATUS.store(2, Ordering::Release);
+            }
+            Err(e) => {
+                crate::log_error!("SMP_DECODE", "Core 3 -> Decode error: {}", e);
+                DECODE_STATUS.store(-1, Ordering::Release);
+            }
+        }
+    } else {
+        DECODE_STATUS.store(-1, Ordering::Release);
+    }
+}
+
+fn core4_decode_assist() {
+    core::hint::spin_loop();
+}
 
 pub struct SpinLockGuard(usize);
 impl Drop for SpinLockGuard { fn drop(&mut self) { JOB_LOCKS[self.0].store(false, Ordering::Release); } }
@@ -147,10 +207,13 @@ pub fn force_exit_user_process() -> ! {
 
 pub fn core_poll_and_execute(core_id: usize) -> bool {
     if core_id == 0 || core_id >= 8 { return false; }
-    if core_id >= 2 && CORE_ELF_SPAWN_REQ[core_id].swap(false, Ordering::SeqCst) {
+
+    if CORE_ELF_SPAWN_REQ[core_id].swap(false, Ordering::SeqCst) {
+        crate::log_info!("PROC", "Core {} acknowledged ELF execution request!", core_id);
         elf_runner_worker(core_id);
         return true;
     }
+
     let mut to_run = None;
     {
         let _guard = lock_job(core_id);

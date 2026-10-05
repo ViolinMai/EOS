@@ -138,7 +138,7 @@ impl Widget for FinderApp {
                 if is_sel {
                     canvas.draw_rect(cur_x + theme.pt(6.0), ry, col_w - theme.pt(12.0), row_h.saturating_sub(4), theme.accent, theme.pt(6.0));
                 }
-                let icon = if f.is_dir { "📁" } else if f.kind_str == "Image" { "🖼" } else if f.kind_str == "Executable" { "⚙" } else { "📄" };
+                let icon = if f.is_dir { "📁" } else if f.kind_str == "Image" { "🖼" } else if f.kind_str == "Executable" { "⚙" } else if f.kind_str == "Font" { "🔤" } else { "📄" };
                 let txt_color = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
                 canvas.draw_text_clipped(cur_x + theme.pt(10.0), ry + theme.pt(6.0), col_w - theme.pt(32.0), &format!("{} {}", icon, f.name), txt_color, theme.font_body());
                 if f.is_dir {
@@ -157,7 +157,7 @@ impl Widget for FinderApp {
                     let icon_sz = theme.pt(72.0);
                     canvas.draw_rect(cur_x + theme.pt(24.0), content_y + theme.pt(24.0), icon_sz, icon_sz, theme.bg_titlebar, theme.pt(14.0));
                     canvas.draw_rect_outline(cur_x + theme.pt(24.0), content_y + theme.pt(24.0), icon_sz, icon_sz, theme.border_window, theme.pt(14.0));
-                    let tag = if target.is_dir { "DIR" } else if target.kind_str == "Image" { "IMG" } else { "DOC" };
+                    let tag = if target.is_dir { "DIR" } else if target.kind_str == "Image" { "IMG" } else if target.kind_str == "Font" { "FNT" } else { "DOC" };
                     canvas.draw_text(cur_x + theme.pt(40.0), content_y + theme.pt(48.0), tag, theme.accent_hover, theme.font_title());
                     canvas.draw_text_clipped(cur_x + theme.pt(24.0), content_y + theme.pt(110.0), insp_w.saturating_sub(theme.pt(32.0)), &target.name, theme.text_primary, theme.font_title());
                     canvas.draw_text(cur_x + theme.pt(24.0), content_y + theme.pt(140.0), &format!("Size: {} Bytes", target.size), theme.text_secondary, theme.font_body());
@@ -219,12 +219,16 @@ impl Widget for FinderApp {
                                 f_info!("FINDER", "Double-clicked image '{}' ({} bytes)", item.name, bytes.len());
                                 self.pending_open_image = Some((item.name.clone(), bytes));
                             }
-                        } else {
+                        } else if item.kind_str == "Document" {
                             if let Ok(bytes) = fs::read(&full_path).or_else(|_| fs::read(clean_path)) {
-                                let text_content = String::from_utf8_lossy(&bytes).to_string();
+                                let max_preview = 64 * 1024; // 64 KB limit for text preview
+                                let slice = if bytes.len() > max_preview { &bytes[..max_preview] } else { &bytes[..] };
+                                let text_content = String::from_utf8_lossy(slice).to_string();
                                 f_info!("FINDER", "Double-clicked document '{}' ({} chars)", item.name, text_content.len());
                                 self.pending_open_text = Some((item.name.clone(), text_content));
                             }
+                        } else {
+                            f_info!("FINDER", "File '{}' is not a text document or image, skipping editor spawn.", item.name);
                         }
                     }
                     return true;

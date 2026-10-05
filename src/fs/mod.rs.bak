@@ -5,9 +5,7 @@ pub mod tar;
 
 use alloc::string::String;
 use alloc::vec::Vec;
-use crate::drivers::ata::{read_entire_file, scan_shared_disk, scan_dir_cluster, write_file_content, MediaType};
-use crate::fs::ext2::EXT2_FS;
-use crate::fs::tar::INITRD;
+use crate::drivers::ata::{read_entire_file, write_file_content, MediaType};
 use core::ptr::addr_of_mut;
 
 #[derive(Clone, Debug)]

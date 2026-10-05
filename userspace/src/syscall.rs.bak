@@ -14,3 +14,9 @@ pub fn sys_poll_event() -> Option<[u64; 2]> {
     }
     if type_val == 0 { None } else { Some([type_val, data_val]) }
 }
+
+pub fn sys_present_rects(pixels: *const u32, width: usize, height: usize, rects: &[[u32; 4]]) {
+    unsafe {
+        core::arch::asm!("syscall", in("rax") 504, in("rdi") pixels as u64, in("rsi") rects.as_ptr() as u64, in("rdx") rects.len() as u64, in("r10") width as u64, in("r8") height as u64, out("rcx") _, out("r11") _);
+    }
+}

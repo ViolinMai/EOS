@@ -68,7 +68,7 @@ pub extern "C" fn _start() -> ! {
     let hhdm_resp = HHDM_REQUEST.response().expect("HHDM failed");
     let hhdm_offset = hhdm_resp.offset;
     let mmap_resp = MEMORY_MAP_REQUEST.response().expect("MemMap failed");
-    
+
     unsafe {
         mm::frame::BitmapFrameAllocator::init(mmap_resp.entries(), hhdm_offset);
         mm::paging::VirtualMemoryManager::init(hhdm_offset);
@@ -83,6 +83,8 @@ pub extern "C" fn _start() -> ! {
                     fb.height as usize,
                     fb.pitch as usize,
                 );
+                let slice = core::slice::from_raw_parts_mut(fb.address() as *mut u32, (fb.pitch as usize / 4) * fb.height as usize);
+                slice.fill(0xFF0F172A);
                 *core::ptr::addr_of_mut!(writer::WRITER) = Some(w);
             }
             crate::log_info!("FRAMEBUFFER", "Initialized: {}x{} (Pitch: {})", fb.width, fb.height, fb.pitch);
@@ -91,7 +93,7 @@ pub extern "C" fn _start() -> ! {
 
     unsafe {
         mm::heap::HEAP_ALLOCATOR.init(
-            (0x10000000 + hhdm_offset) as *mut u8, 
+            (0x10000000 + hhdm_offset) as *mut u8,
             config::CONFIG.default_heap_size_mb * 1024 * 1024
         );
     }
@@ -132,38 +134,31 @@ pub extern "C" fn _start() -> ! {
         AP_BOOT_LATCH.store(true, Ordering::SeqCst);
     }
 
-    // الانتظار حتى تستقر الأنوية الثانوية
-    for _ in 0..100_000 {
+    for _ in 0..200_000 {
         core::hint::spin_loop();
     }
 
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-    crate::log_info!("DESKTOP", "Requesting execution of 'user_app.elf'...");
+    crate::log_info!("DESKTOP", "Delegating Desktop & GUI to Userspace process 'user_app.elf' on Core 2...");
     match task::request_elf_execution("user_app.elf", "") {
-        Ok(core_id) => crate::log_info!("DESKTOP", "ELF task successfully assigned to Core {}", core_id),
+        Ok(core_id) => crate::log_info!("DESKTOP", "ELF task assigned to Core {}", core_id),
         Err(e) => crate::log_error!("DESKTOP", "FATAL: Could not dispatch user_app.elf: {}", e),
     }
 
     loop {
-        let mut active = false;
-
         net::poll();
 
         while let Some(ev) = input::poll_event() {
-            active = true;
             arch::x86_64::syscall::push_user_event(ev);
         }
 
         if let Some(cmd) = arch::x86_64::interrupts::take_pending_command() {
-            active = true;
             arch::x86_64::interrupts::execute_command(&cmd);
             arch::x86_64::interrupts::print_prompt();
         }
 
-        if !active {
-            unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
-        }
+        crate::arch::x86_64::pit::sleep_ms(2);
     }
 }
 
@@ -189,8 +184,10 @@ extern "C" fn ap_startup_entry(info: &limine::mp::MpInfo) -> ! {
 
     loop {
         if core_id < 8 { CORE_HEARTBEAT[core_id].fetch_add(1, Ordering::Relaxed); }
-        task::core_poll_and_execute(core_id);
-        core::hint::spin_loop();
+        let did_work = task::core_poll_and_execute(core_id);
+        if !did_work {
+            core::hint::spin_loop();
+        }
     }
 }
 

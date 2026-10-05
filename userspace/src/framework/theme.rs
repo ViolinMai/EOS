@@ -36,7 +36,6 @@ impl Theme {
     pub fn font_large(&self) -> usize { self.pt(20.0) }
 }
 
-// 1.75x Scale Factor for sharp 1080p display
 static CURRENT_SCALE_BITS: AtomicU32 = AtomicU32::new(0x3FE00000); // 1.75f32
 
 pub fn set_theme_scale(scale: f32) {

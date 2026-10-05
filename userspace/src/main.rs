@@ -2,6 +2,7 @@ mod syscall;
 mod sdk;
 mod framework;
 pub mod png;
+pub mod net_manager;
 #[path = "apps/mod.rs"]
 pub mod apps;
 
@@ -57,6 +58,8 @@ fn try_read_font(paths: &[&str]) -> Vec<u8> {
 fn main() {
     println!("🚀 Launching EOS macOS Desktop (Ring 3 Userspace)...");
 
+    net_manager::init_net([10, 0, 2, 15], [10, 0, 2, 2]);
+
     let font_paths = [
         "/EOS SHARE/fonts/SFPRODISPLAYREGULAR.TTF",
         "/EOS SHARE/fonts/SFPRODISPLAYREGULAR.OTF",
@@ -71,6 +74,7 @@ fn main() {
 
     app.spawn_app("Finder");
     app.spawn_app("Terminal");
+    app.spawn_app("Browser");
 
     app.set_dock_handler(|_idx| {});
     app.run_loop();

@@ -25,17 +25,19 @@ pub struct Theme {
 }
 
 impl Theme {
+    #[inline(always)]
     pub fn pt(&self, val: f32) -> usize {
         (val * self.scale).round() as usize
     }
 
-    pub fn font_caption(&self) -> usize { self.pt(11.0) }
-    pub fn font_body(&self) -> usize { self.pt(13.0) }
-    pub fn font_title(&self) -> usize { self.pt(15.0) }
-    pub fn font_large(&self) -> usize { self.pt(18.0) }
+    pub fn font_caption(&self) -> usize { self.pt(12.0) }
+    pub fn font_body(&self) -> usize { self.pt(14.0) }
+    pub fn font_title(&self) -> usize { self.pt(16.0) }
+    pub fn font_large(&self) -> usize { self.pt(20.0) }
 }
 
-static CURRENT_SCALE_BITS: AtomicU32 = AtomicU32::new(0x3FC00000); // 1.5f32
+// 1.75x Scale Factor for sharp 1080p display
+static CURRENT_SCALE_BITS: AtomicU32 = AtomicU32::new(0x3FE00000); // 1.75f32
 
 pub fn set_theme_scale(scale: f32) {
     CURRENT_SCALE_BITS.store(scale.to_bits(), Ordering::Relaxed);
@@ -48,24 +50,24 @@ pub fn get_theme() -> Theme {
     Theme {
         scale,
         bg_desktop: 0xFF0F172A,
-        bg_menubar: 0xEE18181B,
-        border_menubar: 0x33FFFFFF,
-        bg_dock: 0xDD1E293B,
-        border_dock: 0x33FFFFFF,
+        bg_menubar: 0xF018181B,
+        border_menubar: 0x25FFFFFF,
+        bg_dock: 0xE01E293B,
+        border_dock: 0x30FFFFFF,
         bg_window: 0xFF18181B,
-        border_window: 0xFF27272A,
+        border_window: 0xFF334155,
         bg_titlebar: 0xFF27272A,
         border_titlebar: 0xFF3F3F46,
         separator: 0xFF3F3F46,
         text_primary: 0xFFF8FAFC,
         text_secondary: 0xFFCBD5E1,
-        text_muted: 0xFF64748B,
+        text_muted: 0xFF94A3B8,
         accent: 0xFF0284C7,
         accent_hover: 0xFF38BDF8,
         btn_close: 0xFFFF5F56,
         btn_min: 0xFFFFBD2E,
         btn_max: 0xFF27C93F,
-        radius_window: s_pt(10.0),
-        radius_dock: s_pt(18.0),
+        radius_window: s_pt(12.0),
+        radius_dock: s_pt(20.0),
     }
 }

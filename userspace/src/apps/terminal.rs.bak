@@ -1,5 +1,5 @@
 use crate::framework::*;
-use crate::net_manager::{NET, poll_network, TcpState};
+use crate::net_manager::{NET, poll_network};
 
 pub struct TerminalApp {
     bounds: Rect,
@@ -15,7 +15,7 @@ impl TerminalApp {
             bounds: Rect::default(),
             history: vec![
                 ("EOS Terminal v2.0 (x86_64-unknown-linux-musl)".into(), 0xFF94A3B8),
-                ("Type 'help' for commands. Try 'ping 10.0.2.2' or 'curl 10.0.2.2'".into(), 0xFF64748B),
+                ("Type 'help' for commands. Try 'ping 10.0.2.2' or 'ping google.com'".into(), 0xFF64748B),
             ],
             input: String::new(),
             cwd: "/EOS SHARE".into(),
@@ -34,6 +34,7 @@ impl TerminalApp {
     }
 
     fn resolve_host(&mut self, host: &str) -> Result<[u8; 4], String> {
+        // إذا كان المدخل هو IP رقمي صريح
         if let Some(ip) = Self::parse_ipv4(host) {
             return Ok(ip);
         }
@@ -78,9 +79,9 @@ impl TerminalApp {
         match parts[0] {
             "help" => {
                 self.history.push(("Available commands:".into(), 0xFFF8FAFC));
-                self.history.push(("  ping <host/ip> - Real ICMP packets with DNS resolution".into(), 0xFFCBD5E1));
+                self.history.push(("  ping <host/ip> - Send ICMP packets with real DNS resolution".into(), 0xFFCBD5E1));
                 self.history.push(("  ipconfig       - Display IP, MAC, Gateway, and ARP table".into(), 0xFFCBD5E1));
-                self.history.push(("  curl <host/ip> - Real HTTP/1.1 client with TCP handshake".into(), 0xFFCBD5E1));
+                self.history.push(("  curl <host/ip> - Connect to HTTP server".into(), 0xFFCBD5E1));
                 self.history.push(("  ls [path]      - List directory entries".into(), 0xFFCBD5E1));
                 self.history.push(("  cat <file>     - Display file contents".into(), 0xFFCBD5E1));
                 self.history.push(("  clear          - Clear console screen".into(), 0xFFCBD5E1));
@@ -146,11 +147,10 @@ impl TerminalApp {
             }
             "curl" => {
                 if parts.len() < 2 {
-                    self.history.push(("usage: curl <hostname or IP address> [path]".into(), 0xFFEF4444));
+                    self.history.push(("usage: curl <hostname or IP address>".into(), 0xFFEF4444));
                     return;
                 }
                 let target_host = parts[1];
-                let req_path = if parts.len() > 2 { parts[2] } else { "/" };
                 let target_ip = match self.resolve_host(target_host) {
                     Ok(ip) => ip,
                     Err(e) => {
@@ -159,42 +159,11 @@ impl TerminalApp {
                     }
                 };
 
-                self.history.push((format!("Connecting to http://{}{} ({}.{}.{}.{}):80 ...", target_host, req_path, target_ip[0], target_ip[1], target_ip[2], target_ip[3]), 0xFF38BDF8));
-                let sock_port = {
-                    let mut lock = NET.lock().unwrap();
-                    let net = lock.as_mut().unwrap();
-                    net.http_get(target_ip, target_host, req_path)
-                };
-
-                let t_start = std::time::Instant::now();
-                let mut received = false;
-                while t_start.elapsed().as_millis() < 3000 {
-                    poll_network();
-                    {
-                        let mut lock = NET.lock().unwrap();
-                        if let Some(net) = lock.as_mut() {
-                            if let Some(sock) = net.tcp_sockets.get_mut(&sock_port) {
-                                if !sock.rx_buffer.is_empty() {
-                                    let content = String::from_utf8_lossy(&sock.rx_buffer).to_string();
-                                    for line in content.lines().take(15) {
-                                        self.history.push((line.to_string(), 0xFF22C55E));
-                                    }
-                                    if content.lines().count() > 15 {
-                                        self.history.push(("... [truncated response]".into(), 0xFF94A3B8));
-                                    }
-                                    received = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    std::thread::yield_now();
-                }
-
-                if !received {
-                    let lock = NET.lock().unwrap();
-                    let state = lock.as_ref().and_then(|n| n.tcp_sockets.get(&sock_port)).map(|s| s.state);
-                    self.history.push((format!("curl: Connection timed out (TCP state: {:?})", state.unwrap_or(TcpState::Closed)), 0xFFEF4444));
+                self.history.push((format!("Connecting to http://{} ({}.{}.{}.{}):80 ...", target_host, target_ip[0], target_ip[1], target_ip[2], target_ip[3]), 0xFF38BDF8));
+                let mut lock = NET.lock().unwrap();
+                if let Some(net) = lock.as_mut() {
+                    let port = net.http_get(target_ip, target_host, "/");
+                    self.history.push((format!("HTTP socket #{} opened (SYN Sent to {}:80)", port, target_host), 0xFF22C55E));
                 }
             }
             "clear" => self.history.clear(),

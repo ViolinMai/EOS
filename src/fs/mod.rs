@@ -32,25 +32,7 @@ pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
     }
     if p.starts_with("EOS SHARE") {
         let sub = p.strip_prefix("EOS SHARE").unwrap().trim_matches('/');
-        let mut curr_cluster = if let Ok(layout) = crate::drivers::ata::get_fat_layout(1) {
-            if let crate::drivers::ata::FatType::Fat32 = layout.fat_type { layout.root_cluster } else { 0 }
-        } else { 0 };
-
-        if sub.is_empty() {
-            return Ok(crate::drivers::ata::scan_dir_cluster(1, curr_cluster).unwrap_or_default().into_iter()
-                .map(|f| if f.is_dir { FsItem::Directory(f.name, f.first_cluster) } else { FsItem::File(f.name, f.size as usize, f.media_type) }).collect());
-        }
-
-        for part in sub.split('/') {
-            let files = crate::drivers::ata::scan_dir_cluster(1, curr_cluster)?;
-            if let Some(dir) = files.iter().find(|x| x.is_dir && x.name.eq_ignore_ascii_case(part)) {
-                curr_cluster = dir.first_cluster;
-            } else {
-                return Err("Directory not found in path");
-            }
-        }
-        return Ok(crate::drivers::ata::scan_dir_cluster(1, curr_cluster).unwrap_or_default().into_iter()
-            .map(|f| if f.is_dir { FsItem::Directory(f.name, f.first_cluster) } else { FsItem::File(f.name, f.size as usize, f.media_type) }).collect());
+        return FAT_FS.list_dir(sub);
     }
 
     let mut items = Vec::new();
@@ -85,31 +67,12 @@ pub fn vfs_stat(path: &str) -> Result<(u64, u32), &'static str> {
     if p.is_empty() || p == "EOS SHARE" || p == "RootFS" || p == "Initrd" {
         return Ok((0, 0o040755));
     }
-
     if p.starts_with("EOS SHARE") || !p.starts_with('/') {
         let clean = p.strip_prefix("EOS SHARE").unwrap_or(&p).trim_matches('/');
-        let mut curr_cluster = if let Ok(layout) = crate::drivers::ata::get_fat_layout(1) {
-            if let crate::drivers::ata::FatType::Fat32 = layout.fat_type { layout.root_cluster } else { 0 }
-        } else { 0 };
-
-        let parts: Vec<&str> = clean.split('/').collect();
-        if !parts.is_empty() {
-            for i in 0..parts.len().saturating_sub(1) {
-                if let Ok(files) = crate::drivers::ata::scan_dir_cluster(1, curr_cluster) {
-                    if let Some(dir) = files.iter().find(|x| x.is_dir && x.name.eq_ignore_ascii_case(parts[i])) {
-                        curr_cluster = dir.first_cluster;
-                    }
-                }
-            }
-            if let Ok(files) = crate::drivers::ata::scan_dir_cluster(1, curr_cluster) {
-                if let Some(target) = files.iter().find(|x| x.name.eq_ignore_ascii_case(parts.last().unwrap())) {
-                    let mode = if target.is_dir { 0o040755 } else { 0o100644 };
-                    return Ok((target.size as u64, mode));
-                }
-            }
+        if let Ok(res) = FAT_FS.stat(clean) {
+            return Ok(res);
         }
     }
-
     if let Ok(b) = vfs_read_bytes(&p) { return Ok((b.len() as u64, 0o100644)); }
     if vfs_list_dir(&p).is_ok() { return Ok((0, 0o040755)); }
     Err("Not found")
@@ -128,23 +91,8 @@ pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
     }
     if p.starts_with("EOS SHARE") || !p.starts_with('/') {
         let clean = p.strip_prefix("EOS SHARE").unwrap_or(&p).trim_matches('/');
-        let mut curr_cluster = if let Ok(layout) = crate::drivers::ata::get_fat_layout(1) {
-            if let crate::drivers::ata::FatType::Fat32 = layout.fat_type { layout.root_cluster } else { 0 }
-        } else { 0 };
-        let parts: Vec<&str> = clean.split('/').collect();
-        if !parts.is_empty() {
-            for i in 0..parts.len().saturating_sub(1) {
-                let files = crate::drivers::ata::scan_dir_cluster(1, curr_cluster)?;
-                if let Some(dir) = files.iter().find(|x| x.is_dir && x.name.eq_ignore_ascii_case(parts[i])) {
-                    curr_cluster = dir.first_cluster;
-                } else {
-                    return Err("Path not found");
-                }
-            }
-            let files = crate::drivers::ata::scan_dir_cluster(1, curr_cluster)?;
-            if let Some(f) = files.iter().find(|x| !x.is_dir && x.name.eq_ignore_ascii_case(parts.last().unwrap())) {
-                return read_entire_file(1, f);
-            }
+        if let Ok(bytes) = FAT_FS.read_bytes(clean) {
+            return Ok(bytes);
         }
     }
     unsafe {
@@ -164,3 +112,78 @@ pub fn vfs_save_text_file(filename: &str, content: &[u8]) -> Result<(), &'static
 pub fn list_directory_contents(folder: &str, _dir_cluster: u32) -> Vec<FsItem> {
     vfs_list_dir(folder).unwrap_or_default()
 }
+
+pub trait FileSystem: Send + Sync {
+    fn read_bytes(&self, path: &str) -> Result<Vec<u8>, &'static str>;
+    fn list_dir(&self, path: &str) -> Result<Vec<FsItem>, &'static str>;
+    fn stat(&self, path: &str) -> Result<(u64, u32), &'static str>;
+}
+
+pub struct FatFileSystem {
+    pub drive: u8,
+}
+
+impl FileSystem for FatFileSystem {
+    fn read_bytes(&self, path: &str) -> Result<Vec<u8>, &'static str> {
+        let clean = path.trim_matches('/');
+        let layout = crate::drivers::ata::get_fat_layout(self.drive)?;
+        let mut curr_cluster = if let crate::drivers::ata::FatType::Fat32 = layout.fat_type { layout.root_cluster } else { 0 };
+        let parts: Vec<&str> = clean.split('/').filter(|s| !s.is_empty()).collect();
+        if parts.is_empty() { return Err("Invalid path"); }
+        for i in 0..parts.len().saturating_sub(1) {
+            let files = crate::drivers::ata::scan_dir_cluster(self.drive, curr_cluster)?;
+            if let Some(dir) = files.iter().find(|x| x.is_dir && x.name.eq_ignore_ascii_case(parts[i])) {
+                curr_cluster = dir.first_cluster;
+            } else {
+                return Err("Path segment not found");
+            }
+        }
+        let files = crate::drivers::ata::scan_dir_cluster(self.drive, curr_cluster)?;
+        if let Some(f) = files.iter().find(|x| !x.is_dir && x.name.eq_ignore_ascii_case(parts.last().unwrap())) {
+            read_entire_file(self.drive, f)
+        } else {
+            Err("File not found on FAT disk")
+        }
+    }
+
+    fn list_dir(&self, path: &str) -> Result<Vec<FsItem>, &'static str> {
+        let clean = path.trim_matches('/');
+        let layout = crate::drivers::ata::get_fat_layout(self.drive)?;
+        let mut curr_cluster = if let crate::drivers::ata::FatType::Fat32 = layout.fat_type { layout.root_cluster } else { 0 };
+        if !clean.is_empty() {
+            for part in clean.split('/').filter(|s| !s.is_empty()) {
+                let files = crate::drivers::ata::scan_dir_cluster(self.drive, curr_cluster)?;
+                if let Some(dir) = files.iter().find(|x| x.is_dir && x.name.eq_ignore_ascii_case(part)) {
+                    curr_cluster = dir.first_cluster;
+                } else {
+                    return Err("Directory not found in FAT");
+                }
+            }
+        }
+        Ok(crate::drivers::ata::scan_dir_cluster(self.drive, curr_cluster).unwrap_or_default().into_iter()
+            .map(|f| if f.is_dir { FsItem::Directory(f.name, f.first_cluster) } else { FsItem::File(f.name, f.size as usize, f.media_type) }).collect())
+    }
+
+    fn stat(&self, path: &str) -> Result<(u64, u32), &'static str> {
+        let clean = path.trim_matches('/');
+        if clean.is_empty() { return Ok((0, 0o040755)); }
+        let layout = crate::drivers::ata::get_fat_layout(self.drive)?;
+        let mut curr_cluster = if let crate::drivers::ata::FatType::Fat32 = layout.fat_type { layout.root_cluster } else { 0 };
+        let parts: Vec<&str> = clean.split('/').filter(|s| !s.is_empty()).collect();
+        for i in 0..parts.len().saturating_sub(1) {
+            let files = crate::drivers::ata::scan_dir_cluster(self.drive, curr_cluster)?;
+            if let Some(dir) = files.iter().find(|x| x.is_dir && x.name.eq_ignore_ascii_case(parts[i])) {
+                curr_cluster = dir.first_cluster;
+            }
+        }
+        let files = crate::drivers::ata::scan_dir_cluster(self.drive, curr_cluster)?;
+        if let Some(target) = files.iter().find(|x| x.name.eq_ignore_ascii_case(parts.last().unwrap())) {
+            let mode = if target.is_dir { 0o040755 } else { 0o100644 };
+            Ok((target.size as u64, mode))
+        } else {
+            Err("Not found on FAT disk")
+        }
+    }
+}
+
+pub static FAT_FS: FatFileSystem = FatFileSystem { drive: 1 };

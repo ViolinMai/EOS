@@ -1,4 +1,3 @@
-use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -31,8 +30,8 @@ static mut NET_MGR_STORAGE: NetworkManager = NetworkManager {
 };
 
 static NET_LOCK: AtomicBool = AtomicBool::new(false);
-static mut RAW_RX_QUEUE: VecDeque<Vec<u8>> = VecDeque::new();
-static mut RAW_TX_QUEUE: VecDeque<Vec<u8>> = VecDeque::new();
+static mut RAW_RX_QUEUE: Vec<Vec<u8>> = Vec::new();
+static mut RAW_TX_QUEUE: Vec<Vec<u8>> = Vec::new();
 
 #[inline(always)]
 fn lock_net() {
@@ -50,8 +49,8 @@ pub fn enqueue_rx(packet: Vec<u8>) {
     lock_net();
     unsafe {
         let q = &mut *addr_of_mut!(RAW_RX_QUEUE);
-        if q.len() < 512 {
-            q.push_back(packet);
+        if q.len() < 256 {
+            q.push(packet);
         }
     }
     unlock_net();
@@ -61,7 +60,11 @@ pub fn dequeue_rx() -> Option<Vec<u8>> {
     lock_net();
     let res = unsafe {
         let q = &mut *addr_of_mut!(RAW_RX_QUEUE);
-        q.pop_front()
+        if !q.is_empty() {
+            Some(q.remove(0))
+        } else {
+            None
+        }
     };
     unlock_net();
     res
@@ -71,8 +74,8 @@ pub fn enqueue_tx(packet: Vec<u8>) {
     lock_net();
     unsafe {
         let q = &mut *addr_of_mut!(RAW_TX_QUEUE);
-        if q.len() < 512 {
-            q.push_back(packet);
+        if q.len() < 256 {
+            q.push(packet);
         }
     }
     unlock_net();
@@ -82,11 +85,11 @@ pub fn drain_tx() -> Vec<Vec<u8>> {
     lock_net();
     let res = unsafe {
         let q = &mut *addr_of_mut!(RAW_TX_QUEUE);
-        let mut list = Vec::new();
-        while let Some(pkt) = q.pop_front() {
-            list.push(pkt);
+        if !q.is_empty() {
+            core::mem::take(q)
+        } else {
+            Vec::new()
         }
-        list
     };
     unlock_net();
     res

@@ -2,6 +2,8 @@ mod syscall;
 mod sdk;
 mod framework;
 pub mod png;
+pub mod net_manager;
+#[path = "apps/mod.rs"]
 pub mod apps;
 
 use std::fs;
@@ -55,6 +57,8 @@ fn try_read_font(paths: &[&str]) -> Vec<u8> {
 
 fn main() {
     println!("🚀 Launching EOS macOS Desktop (Ring 3 Userspace)...");
+
+    net_manager::init_net([10, 0, 2, 15], [10, 0, 2, 2]);
 
     let font_paths = [
         "/EOS SHARE/fonts/SFPRODISPLAYREGULAR.TTF",

@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use rusttype::{Font, Scale, point};
+use super::widget::Rect;
 
 pub struct Canvas<'a> {
     pub buffer: &'a mut [u32],
@@ -7,6 +8,7 @@ pub struct Canvas<'a> {
     pub height: usize,
     font: Option<&'a Font<'a>>,
     cache: &'a mut BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>,
+    pub clip_rect: Option<Rect>,
 }
 
 impl<'a> Canvas<'a> {
@@ -17,7 +19,28 @@ impl<'a> Canvas<'a> {
         font: Option<&'a Font<'a>>,
         cache: &'a mut BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>,
     ) -> Self {
-        Self { buffer, width, height, font, cache }
+        Self { buffer, width, height, font, cache, clip_rect: None }
+    }
+
+    #[inline(always)]
+    pub fn set_clip(&mut self, clip: Option<Rect>) {
+        self.clip_rect = clip;
+    }
+
+    pub fn intersect_clip(&mut self, rect: Rect) {
+        if let Some(c) = self.clip_rect {
+            let x1 = c.x.max(rect.x);
+            let y1 = c.y.max(rect.y);
+            let x2 = (c.x + c.w).min(rect.x + rect.w);
+            let y2 = (c.y + c.h).min(rect.y + rect.h);
+            if x2 > x1 && y2 > y1 {
+                self.clip_rect = Some(Rect::new(x1, y1, x2 - x1, y2 - y1));
+            } else {
+                self.clip_rect = Some(Rect::new(0, 0, 0, 0));
+            }
+        } else {
+            self.clip_rect = Some(rect);
+        }
     }
 
     #[inline(always)]
@@ -31,37 +54,49 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn draw_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32, radius: usize) {
-        let ex = (x + w).min(self.width);
-        let ey = (y + h).min(self.height);
-        if x >= ex || y >= ey { return; }
+        let mut sx = x;
+        let mut sy = y;
+        let mut ex = (x + w).min(self.width);
+        let mut ey = (y + h).min(self.height);
+
+        if let Some(clip) = self.clip_rect {
+            sx = sx.max(clip.x);
+            sy = sy.max(clip.y);
+            ex = ex.min(clip.x + clip.w);
+            ey = ey.min(clip.y + clip.h);
+        }
+
+        if sx >= ex || sy >= ey { return; }
 
         if radius == 0 {
-            for cy in y..ey {
-                let start = cy * self.width + x;
-                self.buffer[start..start + (ex - x)].fill(color);
+            for cy in sy..ey {
+                let start = cy * self.width + sx;
+                self.buffer[start..start + (ex - sx)].fill(color);
             }
         } else {
             let r_sq = (radius * radius) as isize;
-            for cy in y..ey {
+            let orig_ex = x + w;
+            let orig_ey = y + h;
+            for cy in sy..ey {
                 let is_top = cy < y + radius;
-                let is_bottom = cy >= ey - radius;
+                let is_bottom = cy >= orig_ey - radius;
                 let dy = if is_top {
                     (y + radius - 1) as isize - cy as isize
                 } else if is_bottom {
-                    cy as isize - (ey - radius) as isize
+                    cy as isize - (orig_ey - radius) as isize
                 } else {
                     0
                 };
 
                 let row = cy * self.width;
-                for cx in x..ex {
+                for cx in sx..ex {
                     let is_left = cx < x + radius;
-                    let is_right = cx >= ex - radius;
+                    let is_right = cx >= orig_ex - radius;
                     if (is_top || is_bottom) && (is_left || is_right) {
                         let dx = if is_left {
                             (x + radius - 1) as isize - cx as isize
                         } else {
-                            cx as isize - (ex - radius) as isize
+                            cx as isize - (orig_ex - radius) as isize
                         };
                         if dx * dx + dy * dy >= r_sq { continue; }
                     }
@@ -88,7 +123,18 @@ impl<'a> Canvas<'a> {
         let inner_r = radius.saturating_sub(1);
         let inner_r_sq = (inner_r * inner_r) as isize;
 
-        for cy in y..ey {
+        let mut sx = x;
+        let mut sy = y;
+        let mut clip_ex = ex;
+        let mut clip_ey = ey;
+        if let Some(clip) = self.clip_rect {
+            sx = sx.max(clip.x);
+            sy = sy.max(clip.y);
+            clip_ex = clip_ex.min(clip.x + clip.w);
+            clip_ey = clip_ey.min(clip.y + clip.h);
+        }
+
+        for cy in sy..clip_ey {
             let is_top = cy < y + radius;
             let is_bottom = cy >= ey - radius;
             let dy = if is_top {
@@ -100,7 +146,7 @@ impl<'a> Canvas<'a> {
             };
 
             let row = cy * self.width;
-            for cx in x..ex {
+            for cx in sx..clip_ex {
                 let is_left = cx < x + radius;
                 let is_right = cx >= ex - radius;
 
@@ -122,19 +168,35 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn draw_line_h(&mut self, x: usize, y: usize, w: usize, color: u32) {
-        if y >= self.height { return; }
-        let ex = (x + w).min(self.width);
-        if x < ex {
-            let start = y * self.width + x;
-            self.buffer[start..start + (ex - x)].fill(color);
+        if let Some(clip) = self.clip_rect {
+            if y < clip.y || y >= clip.y + clip.h { return; }
+        }
+        let mut sx = x;
+        let mut ex = (x + w).min(self.width);
+        if let Some(clip) = self.clip_rect {
+            sx = sx.max(clip.x);
+            ex = ex.min(clip.x + clip.w);
+        }
+        if sx < ex && y < self.height {
+            let start = y * self.width + sx;
+            self.buffer[start..start + (ex - sx)].fill(color);
         }
     }
 
     pub fn draw_line_v(&mut self, x: usize, y: usize, h: usize, color: u32) {
-        if x >= self.width { return; }
-        let ey = (y + h).min(self.height);
-        for cy in y..ey {
-            self.buffer[cy * self.width + x] = color;
+        if let Some(clip) = self.clip_rect {
+            if x < clip.x || x >= clip.x + clip.w { return; }
+        }
+        let mut sy = y;
+        let mut ey = (y + h).min(self.height);
+        if let Some(clip) = self.clip_rect {
+            sy = sy.max(clip.y);
+            ey = ey.min(clip.y + clip.h);
+        }
+        if x < self.width {
+            for cy in sy..ey {
+                self.buffer[cy * self.width + x] = color;
+            }
         }
     }
 
@@ -169,6 +231,12 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn draw_text(&mut self, x: usize, y: usize, text: &str, color: u32, size: usize) {
+        let (clip_min_x, clip_min_y, clip_max_x, clip_max_y) = if let Some(c) = self.clip_rect {
+            (c.x, c.y, c.x + c.w, c.y + c.h)
+        } else {
+            (0, 0, self.width, self.height)
+        };
+
         if let Some(font) = self.font {
             let scale = Scale::uniform(size as f32);
             let v_metrics = font.v_metrics(scale);
@@ -194,11 +262,13 @@ impl<'a> Canvas<'a> {
 
                 for row in 0..*gh {
                     let py = gy + row;
-                    if py >= self.height { break; }
+                    if py >= clip_max_y { break; }
+                    if py < clip_min_y || py >= self.height { continue; }
                     let fb_row = py * self.width;
                     for col in 0..*gw {
                         let px = gx + col;
-                        if px >= self.width { break; }
+                        if px >= clip_max_x { break; }
+                        if px < clip_min_x || px >= self.width { continue; }
                         let alpha = cov[row * gw + col] as u32;
                         if alpha > 0 {
                             let idx = fb_row + px;
@@ -209,7 +279,6 @@ impl<'a> Canvas<'a> {
                 cur_x += adv;
             }
         } else {
-            // High-Quality Scaled Bitmap Font Fallback
             let scale = (size.max(8)) / 8;
             let mut cur_x = x;
 
@@ -222,10 +291,10 @@ impl<'a> Canvas<'a> {
                         if (byte & (1 << (7 - gx))) != 0 {
                             for sy in 0..scale {
                                 let py = y + gy * scale + sy;
-                                if py >= self.height { break; }
+                                if py < clip_min_y || py >= clip_max_y || py >= self.height { continue; }
                                 for sx in 0..scale {
                                     let px = cur_x + gx * scale + sx;
-                                    if px >= self.width { break; }
+                                    if px < clip_min_x || px >= clip_max_x || px >= self.width { continue; }
                                     self.buffer[py * self.width + px] = color;
                                 }
                             }
@@ -235,6 +304,66 @@ impl<'a> Canvas<'a> {
                 cur_x += 8 * scale;
             }
         }
+    }
+
+    pub fn draw_text_clipped(&mut self, x: usize, y: usize, max_w: usize, text: &str, color: u32, size: usize) {
+        let (full_w, _) = self.measure_text(text, size);
+        if full_w <= max_w {
+            self.draw_text(x, y, text, color, size);
+            return;
+        }
+
+        let (dots_w, _) = self.measure_text("...", size);
+        if max_w <= dots_w {
+            self.draw_text(x, y, ".", color, size);
+            return;
+        }
+
+        let avail_w = max_w - dots_w;
+        let mut cur_w = 0;
+        let mut end_idx = 0;
+
+        for (i, c) in text.char_indices() {
+            let (cw, _) = self.measure_text(&c.to_string(), size);
+            if cur_w + cw > avail_w { break; }
+            cur_w += cw;
+            end_idx = i + c.len_utf8();
+        }
+
+        let truncated = format!("{}...", &text[..end_idx]);
+        self.draw_text(x, y, &truncated, color, size);
+    }
+
+    pub fn draw_text_wrapped(&mut self, x: usize, y: usize, max_w: usize, line_height: usize, text: &str, color: u32, size: usize) -> usize {
+        let mut cur_y = y;
+        let mut line_buf = String::new();
+        let mut line_w = 0;
+
+        for word in text.split_whitespace() {
+            let (word_w, _) = self.measure_text(word, size);
+            let (space_w, _) = self.measure_text(" ", size);
+
+            if line_w + word_w + space_w > max_w && !line_buf.is_empty() {
+                self.draw_text(x, cur_y, &line_buf, color, size);
+                cur_y += line_height;
+                line_buf.clear();
+                line_w = 0;
+            }
+
+            if !line_buf.is_empty() {
+                line_buf.push(' ');
+                line_w += space_w;
+            }
+            line_buf.push_str(word);
+            line_w += word_w;
+        }
+
+        if !line_buf.is_empty() {
+            self.draw_text(x, cur_y, &line_buf, color, size);
+            cur_y += line_height;
+        }
+
+        cur_y.saturating_sub(y)
     }
 }
 
@@ -330,5 +459,20 @@ pub fn get_fallback_glyph(c: char) -> [u8; 16] {
         '}' => [0, 0x70, 0x18, 0x18, 0x0E, 0x18, 0x18, 0x70, 0, 0, 0, 0, 0, 0, 0, 0],
         '~' => [0, 0x3B, 0x6E, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         _   => [0, 0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0],
+    }
+}
+
+pub fn draw_cursor(&mut self, mx: usize, my: usize) {
+    for cy in 0..22 {
+        let py = my + cy;
+        if py >= self.height { break; }
+        for cx in 0..15 {
+            let px = mx + cx;
+            if px >= self.width { break; }
+            if cx <= (cy * 2) / 3 && (cx + cy) < 24 {
+                let is_border = cx == 0 || cx == (cy * 2) / 3 || (cx + cy) >= 22;
+                self.buffer[py * self.width + px] = if is_border { 0xFF000000 } else { 0xFFFFFFFF };
+            }
+        }
     }
 }
