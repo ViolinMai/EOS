@@ -207,10 +207,13 @@ pub fn force_exit_user_process() -> ! {
 
 pub fn core_poll_and_execute(core_id: usize) -> bool {
     if core_id == 0 || core_id >= 8 { return false; }
-    if core_id >= 2 && CORE_ELF_SPAWN_REQ[core_id].swap(false, Ordering::SeqCst) {
+
+    if CORE_ELF_SPAWN_REQ[core_id].swap(false, Ordering::SeqCst) {
+        crate::log_info!("PROC", "Core {} acknowledged ELF execution request!", core_id);
         elf_runner_worker(core_id);
         return true;
     }
+
     let mut to_run = None;
     {
         let _guard = lock_job(core_id);

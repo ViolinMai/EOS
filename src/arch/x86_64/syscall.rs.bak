@@ -486,13 +486,15 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                                 let name_bytes = name.as_bytes();
                                 let rec_len = (19 + name_bytes.len() + 8) & !7;
                                 if written + rec_len > count { break; }
-                                let out_ptr = out_buf.as_mut_ptr().add(written);
-                                core::ptr::write_unaligned(out_ptr as *mut u64, *off as u64 + 1);
-                                core::ptr::write_unaligned(out_ptr.add(8) as *mut i64, *off as i64 + 1);
-                                core::ptr::write_unaligned(out_ptr.add(16) as *mut u16, rec_len as u16);
-                                core::ptr::write_unaligned(out_ptr.add(18) as *mut u8, d_type);
-                                core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), out_ptr.add(19), name_bytes.len());
-                                core::ptr::write_unaligned(out_ptr.add(19 + name_bytes.len()), 0);
+                                unsafe {
+                                    let out_ptr = out_buf.as_mut_ptr().add(written);
+                                    core::ptr::write_unaligned(out_ptr as *mut u64, *off as u64 + 1);
+                                    core::ptr::write_unaligned(out_ptr.add(8) as *mut i64, *off as i64 + 1);
+                                    core::ptr::write_unaligned(out_ptr.add(16) as *mut u16, rec_len as u16);
+                                    core::ptr::write_unaligned(out_ptr.add(18) as *mut u8, d_type);
+                                    core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), out_ptr.add(19), name_bytes.len());
+                                    core::ptr::write_unaligned(out_ptr.add(19 + name_bytes.len()), 0);
+                                }
                                 written += rec_len;
                                 *off += 1;
                             }

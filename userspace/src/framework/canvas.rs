@@ -53,21 +53,6 @@ impl<'a> Canvas<'a> {
         self.clip_stack.pop();
     }
 
-    pub fn intersect_clip(&mut self, rect: Rect) {
-        self.push_clip(rect);
-    }
-
-    pub fn set_clip(&mut self, rect: Option<Rect>) {
-        self.clip_stack.clear();
-        if let Some(r) = rect {
-            self.clip_stack.push(r);
-        }
-    }
-
-    pub fn current_clip(&self) -> Option<Rect> {
-        self.clip_stack.last().copied()
-    }
-
     #[inline(always)]
     fn is_clipped(&self, x: i32, y: i32) -> bool {
         if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
@@ -81,13 +66,85 @@ impl<'a> Canvas<'a> {
     }
 
     #[inline(always)]
-    fn blend(bg: u32, fg: u32, alpha: u32) -> u32 {
+    pub fn blend(bg: u32, fg: u32, alpha: u32) -> u32 {
         if alpha >= 255 { return fg | 0xFF000000; }
         if alpha == 0 { return bg | 0xFF000000; }
         let inv = 255 - alpha;
         let rb = (((fg & 0x00FF00FF) * alpha + (bg & 0x00FF00FF) * inv) >> 8) & 0x00FF00FF;
         let g = (((fg & 0x0000FF00) * alpha + (bg & 0x0000FF00) * inv) >> 8) & 0x0000FF00;
         0xFF000000 | rb | g
+    }
+
+    /// تطبيق تأثير Blur ضبابي شفاف (Frosted Glass Blur) على مساحة محددة
+    pub fn apply_blur_rect(&mut self, x: i32, y: i32, w: i32, h: i32, radius: usize) {
+        let sx = x.max(0) as usize;
+        let sy = y.max(0) as usize;
+        let ex = ((x + w).min(self.width as i32)).max(0) as usize;
+        let ey = ((y + h).min(self.height as i32)).max(0) as usize;
+        if sx >= ex || sy >= ey || radius == 0 { return; }
+
+        let r = radius.min(12);
+        let rw = ex - sx;
+        let rh = ey - sy;
+        let mut temp = vec![0u32; rw * rh];
+
+        // تمرير أفقي (Horizontal Pass)
+        for cy in 0..rh {
+            let row_idx = (sy + cy) * self.width;
+            for cx in 0..rw {
+                let px_start = cx.saturating_sub(r);
+                let px_end = (cx + r).min(rw - 1);
+                let count = (px_end - px_start + 1) as u32;
+
+                let mut sum_r = 0u32;
+                let mut sum_g = 0u32;
+                let mut sum_b = 0u32;
+
+                for kx in px_start..=px_end {
+                    let pixel = self.buffer[row_idx + (sx + kx)];
+                    sum_r += (pixel >> 16) & 0xFF;
+                    sum_g += (pixel >> 8) & 0xFF;
+                    sum_b += pixel & 0xFF;
+                }
+
+                temp[cy * rw + cx] = (0xFF << 24)
+                    | ((sum_r / count) << 16)
+                    | ((sum_g / count) << 8)
+                    | (sum_b / count);
+            }
+        }
+
+        // تمرير رأسي (Vertical Pass) وتطبيق النتيجة مباشرة على الـ Buffer
+        for cx in 0..rw {
+            for cy in 0..rh {
+                let py_start = cy.saturating_sub(r);
+                let py_end = (cy + r).min(rh - 1);
+                let count = (py_end - py_start + 1) as u32;
+
+                let mut sum_r = 0u32;
+                let mut sum_g = 0u32;
+                let mut sum_b = 0u32;
+
+                for ky in py_start..=py_end {
+                    let pixel = temp[ky * rw + cx];
+                    sum_r += (pixel >> 16) & 0xFF;
+                    sum_g += (pixel >> 8) & 0xFF;
+                    sum_b += pixel & 0xFF;
+                }
+
+                let idx = (sy + cy) * self.width + (sx + cx);
+                self.buffer[idx] = (0xFF << 24)
+                    | ((sum_r / count) << 16)
+                    | ((sum_g / count) << 8)
+                    | (sum_b / count);
+            }
+        }
+    }
+
+    /// رسم مستطيل شفاف مع تأثير Blur زجاجي مدمج
+    pub fn draw_frosted_glass_rect(&mut self, x: i32, y: i32, w: i32, h: i32, tint: u32, corner_r: usize) {
+        self.apply_blur_rect(x, y, w, h, 6);
+        self.draw_rect(x, y, w, h, tint, corner_r);
     }
 
     pub fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, radius: usize) {
@@ -250,9 +307,7 @@ impl<'a> Canvas<'a> {
         self.pop_clip();
     }
 
-    /// مؤشر ماوس لينكس الكلاسيكي (X11 / Breeze / DMZ-White)
     pub fn draw_linux_cursor(&mut self, mx: i32, my: i32) {
-        // 0: شفاف, 1: حد أسود كلاسيكي, 2: جسم أبيض ناصع
         #[rustfmt::skip]
         const LINUX_CURSOR_BITMAP: [[u8; 11]; 16] = [
             [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -280,8 +335,8 @@ impl<'a> Canvas<'a> {
                 let px = mx + c as i32;
                 if px < 0 || px >= self.width as i32 { continue; }
                 let color = match val {
-                    1 => 0xFF000000, // حد أسود حاد ومحدد
-                    2 => 0xFFFFFFFF, // أبيض ناصع
+                    1 => 0xFF000000,
+                    2 => 0xFFFFFFFF,
                     _ => continue,
                 };
                 let idx = (py as usize) * self.width + (px as usize);

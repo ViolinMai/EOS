@@ -312,7 +312,6 @@ impl Widget for FinderApp {
                 }
             }
             0x0E => {
-                let back_entry = FinderEntry { name: String::from(".."), is_dir: true, size: 0 };
                 if let Some(pos) = self.current_path.rfind('/') {
                     let parent = self.current_path[..pos].to_string();
                     self.load_directory(&parent);

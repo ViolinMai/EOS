@@ -15,6 +15,7 @@ pub struct FinderApp {
     pub selected_idx: Option<usize>,
     pub scroll_y: i32,
     pub status_label: String,
+    pub pending_open_image: Option<(String, String)>,
 }
 
 impl FinderApp {
@@ -26,6 +27,7 @@ impl FinderApp {
             selected_idx: None,
             scroll_y: 0,
             status_label: String::from("Ready"),
+            pending_open_image: None,
         };
         app.load_directory("EOS SHARE");
         app
@@ -39,13 +41,14 @@ impl FinderApp {
             clean.to_string()
         };
 
+        crate::f_info!("FINDER", "load_directory requested for: '{}'", target_path);
+
         self.entries.clear();
         self.selected_idx = None;
         self.scroll_y = 0;
 
         let mut read_success = false;
 
-        // نحاول قراءة المسار المطلوب حصراً (بدون fallback يعيدنا إلى الجذر)
         let candidates = [
             format!("/{}", target_path),
             target_path.clone(),
@@ -53,13 +56,27 @@ impl FinderApp {
 
         for p in &candidates {
             if let Ok(read_dir) = fs::read_dir(p) {
+                let mut count = 0;
                 for entry in read_dir.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if name == "." || name == ".." { continue; }
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                    let size = entry.metadata().map(|m| m.len() as usize).unwrap_or(0);
+
+                    let size = if is_dir {
+                        0
+                    } else {
+                        let full_file_path = format!("{}/{}", p.trim_end_matches('/'), name);
+                        fs::metadata(&full_file_path)
+                            .map(|m| m.len() as usize)
+                            .unwrap_or_else(|_| {
+                                fs::read(&full_file_path).map(|b| b.len()).unwrap_or(0)
+                            })
+                    };
+
                     self.entries.push(FinderEntry { name, is_dir, size });
+                    count += 1;
                 }
+                crate::f_info!("FINDER", "fs::read_dir('{}') successful: read {} entries", p, count);
                 read_success = true;
                 break;
             }
@@ -67,7 +84,6 @@ impl FinderApp {
 
         self.current_path = target_path;
 
-        // إضافة خيار الرجوع للخلف إذا لم نكن في المجلد الرئيسي
         if self.current_path.contains('/') || (self.current_path != "EOS SHARE" && self.current_path != "RootFS" && self.current_path != "Initrd") {
             self.entries.insert(0, FinderEntry {
                 name: String::from(".."),
@@ -76,7 +92,6 @@ impl FinderApp {
             });
         }
 
-        // فرز العناصر: .. أولاً، ثم المجلدات، ثم الملفات
         self.entries.sort_by(|a, b| {
             if a.name == ".." {
                 std::cmp::Ordering::Less
@@ -97,6 +112,7 @@ impl FinderApp {
     fn open_entry(&mut self, idx: usize) {
         if idx >= self.entries.len() { return; }
         let entry = self.entries[idx].clone();
+        crate::f_info!("FINDER", "User activated entry: '{}' (is_dir: {})", entry.name, entry.is_dir);
 
         if entry.is_dir {
             if entry.name == ".." {
@@ -109,6 +125,12 @@ impl FinderApp {
             } else {
                 let next_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
                 self.load_directory(&next_path);
+            }
+        } else {
+            let lower = entry.name.to_lowercase();
+            if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+                let full_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
+                self.pending_open_image = Some((entry.name.clone(), full_path));
             }
         }
     }
@@ -130,7 +152,6 @@ impl Widget for FinderApp {
         let tb_h = theme.pt(40.0);
         let sb_h = theme.pt(26.0);
 
-        // شريط العنوان والمواقع
         canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, 0);
         canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
 
@@ -149,7 +170,6 @@ impl Widget for FinderApp {
         let path_text = format!("Location: /{}", self.current_path);
         canvas.draw_text_clipped(fav_x + theme.pt(8.0), self.bounds.y + theme.pt(11.0), self.bounds.w - (fav_x - self.bounds.x) - theme.pt(16.0), &path_text, theme.text_primary, theme.font_body());
 
-        // منطقة عرض القائمة
         let list_y = self.bounds.y + tb_h + 1;
         let list_h = (self.bounds.h - tb_h - sb_h - 1).max(0);
         canvas.push_clip(Rect::new(self.bounds.x, list_y, self.bounds.w, list_h));
@@ -176,7 +196,7 @@ impl Widget for FinderApp {
                     "📁"
                 } else if entry.name.ends_with(".elf") {
                     "⚙️"
-                } else if entry.name.ends_with(".png") || entry.name.ends_with(".jpg") {
+                } else if entry.name.ends_with(".png") || entry.name.ends_with(".jpg") || entry.name.ends_with(".jpeg") {
                     "🖼️"
                 } else {
                     "📄"
@@ -185,7 +205,14 @@ impl Widget for FinderApp {
                 let label = if entry.is_dir {
                     format!("{}  {}", icon, entry.name)
                 } else {
-                    format!("{}  {} ({} bytes)", icon, entry.name, entry.size)
+                    let sz_str = if entry.size >= 1024 * 1024 {
+                        format!("{:.2} MB", (entry.size as f64) / (1024.0 * 1024.0))
+                    } else if entry.size >= 1024 {
+                        format!("{} KB", entry.size / 1024)
+                    } else {
+                        format!("{} B", entry.size)
+                    };
+                    format!("{}  {} ({})", icon, entry.name, sz_str)
                 };
 
                 let txt_c = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
@@ -196,7 +223,6 @@ impl Widget for FinderApp {
 
         canvas.pop_clip();
 
-        // شريط الحالة
         let sb_y = self.bounds.y + self.bounds.h - sb_h;
         canvas.draw_rect(self.bounds.x, sb_y, self.bounds.w, sb_h, theme.bg_titlebar, 0);
         canvas.draw_line_h(self.bounds.x, sb_y, self.bounds.w, theme.border_window);
@@ -210,7 +236,6 @@ impl Widget for FinderApp {
         let sb_h = theme.pt(26.0);
 
         if pressed {
-            // شريط المواقع العلوي
             if my >= self.bounds.y && my <= self.bounds.y + tb_h {
                 let favorites = ["EOS SHARE", "RootFS", "Initrd"];
                 let mut fav_x = self.bounds.x + theme.pt(12.0);
@@ -225,7 +250,6 @@ impl Widget for FinderApp {
                 return true;
             }
 
-            // النقر على العناصر
             let list_y = self.bounds.y + tb_h + 1;
             let list_h = self.bounds.h - tb_h - sb_h;
             if my >= list_y && my <= list_y + list_h {
@@ -265,13 +289,13 @@ impl Widget for FinderApp {
 
     fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
         match keycode {
-            0x1C => { // Enter
+            0x1C => {
                 if let Some(idx) = self.selected_idx {
                     self.open_entry(idx);
                     return true;
                 }
             }
-            0x48 => { // Arrow Up
+            0x48 => {
                 if let Some(idx) = self.selected_idx {
                     if idx > 0 { self.selected_idx = Some(idx - 1); return true; }
                 } else if !self.entries.is_empty() {
@@ -279,7 +303,7 @@ impl Widget for FinderApp {
                     return true;
                 }
             }
-            0x50 => { // Arrow Down
+            0x50 => {
                 if let Some(idx) = self.selected_idx {
                     if idx + 1 < self.entries.len() { self.selected_idx = Some(idx + 1); return true; }
                 } else if !self.entries.is_empty() {
@@ -287,7 +311,7 @@ impl Widget for FinderApp {
                     return true;
                 }
             }
-            0x0E => { // Backspace
+            0x0E => {
                 let back_entry = FinderEntry { name: String::from(".."), is_dir: true, size: 0 };
                 if let Some(pos) = self.current_path.rfind('/') {
                     let parent = self.current_path[..pos].to_string();

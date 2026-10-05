@@ -661,7 +661,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         510 => { // sys_start_async_decode(src_user_ptr: rdi, src_len: rsi)
             let src_ptr = frame.rdi;
             let src_len = frame.rsi as usize;
-            if src_len > 0 && src_len <= 64 * 1024 * 1024 && validate_user_range(src_ptr, src_len) {
+            if src_len > 0 && src_len <= 128 * 1024 * 1024 && validate_user_range(src_ptr, src_len) {
                 let mut buf = alloc::vec![0u8; src_len];
                 if copy_from_user(&mut buf, src_ptr, src_len).is_ok() {
                     crate::task::start_multicore_decode(buf);

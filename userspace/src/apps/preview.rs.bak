@@ -1,17 +1,96 @@
 use crate::framework::*;
+use std::fs;
+use core::arch::asm;
+
+pub fn sys_start_async_decode(data: &[u8]) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!("syscall", inout("rax") 510i64 => ret, in("rdi") data.as_ptr() as u64, in("rsi") data.len() as u64, out("rcx") _, out("r11") _);
+    }
+    ret
+}
+
+pub fn sys_poll_async_decode(pixels: &mut [u32], meta: &mut [u64; 2]) -> i64 {
+    let ret: i64;
+    unsafe {
+        asm!("syscall", inout("rax") 511i64 => ret, in("rdi") pixels.as_mut_ptr() as u64, in("rsi") meta.as_mut_ptr() as u64, out("rcx") _, out("r11") _);
+    }
+    ret
+}
 
 pub struct PreviewApp {
     bounds: Rect,
     pub title: String,
-    pub image_data: Vec<u8>,
+    pub file_path: String,
+    pub pixels: Vec<u32>,
+    pub img_w: usize,
+    pub img_h: usize,
+    pub status: String,
+    pub is_decoding: bool,
+    pub is_fullscreen: bool,
 }
 
 impl PreviewApp {
-    pub fn new(title: String, image_data: Vec<u8>) -> Self {
-        Self {
+    pub fn new(title: String, file_path: String) -> Self {
+        let mut app = Self {
             bounds: Rect::default(),
-            title,
-            image_data,
+            title: title.clone(),
+            file_path: file_path.clone(),
+            pixels: Vec::new(),
+            img_w: 0,
+            img_h: 0,
+            status: String::from("Reading image file..."),
+            is_decoding: false,
+            is_fullscreen: false,
+        };
+        app.start_load();
+        app
+    }
+
+    pub fn start_load(&mut self) {
+        let attempts = [
+            format!("/{}", self.file_path.trim_start_matches('/')),
+            self.file_path.clone(),
+        ];
+
+        let mut data = Vec::new();
+        for p in &attempts {
+            if let Ok(bytes) = fs::read(p) {
+                if !bytes.is_empty() {
+                    data = bytes;
+                    break;
+                }
+            }
+        }
+
+        if data.is_empty() {
+            self.status = format!("File empty or not found: {}", self.file_path);
+            return;
+        }
+
+        self.status = format!("Decoding on dynamic background SMP Core...");
+        self.is_decoding = true;
+        let _ = sys_start_async_decode(&data);
+    }
+
+    pub fn poll_decode(&mut self) {
+        if !self.is_decoding { return; }
+
+        if self.pixels.len() < 3840 * 2160 {
+            self.pixels = vec![0u32; 3840 * 2160];
+        }
+
+        let mut meta = [0u64; 2];
+        let res = sys_poll_async_decode(&mut self.pixels, &mut meta);
+        if res == 1 {
+            self.img_w = meta[0] as usize;
+            self.img_h = meta[1] as usize;
+            self.pixels.truncate(self.img_w * self.img_h);
+            self.is_decoding = false;
+            self.status = format!("{}x{} px | Dynamic Fit", self.img_w, self.img_h);
+        } else if res == -1 {
+            self.is_decoding = false;
+            self.status = String::from("Background Decode Failed");
         }
     }
 }
@@ -26,14 +105,101 @@ impl Widget for PreviewApp {
     }
 
     fn paint(&self, canvas: &mut Canvas) {
-        let theme = get_theme();
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF0F172A, 0);
+        unsafe {
+            let self_mut = self as *const Self as *mut Self;
+            (*self_mut).poll_decode();
+        }
 
-        let info = format!("Image: {} ({} bytes)", self.title, self.image_data.len());
-        canvas.draw_text(self.bounds.x + theme.pt(24.0), self.bounds.y + theme.pt(24.0), &info, 0xFFF8FAFC, theme.font_body());
+        let theme = get_theme();
+        let draw_x = if self.is_fullscreen { 0 } else { self.bounds.x };
+        let draw_y = if self.is_fullscreen { 0 } else { self.bounds.y };
+        let draw_w = if self.is_fullscreen { canvas.width as i32 } else { self.bounds.w };
+        let draw_h = if self.is_fullscreen { canvas.height as i32 } else { self.bounds.h };
+
+        canvas.draw_rect(draw_x, draw_y, draw_w, draw_h, 0xFF0B1120, 0);
+
+        let sb_h = if self.is_fullscreen { 0 } else { theme.pt(32.0) };
+        let content_h = (draw_h - sb_h).max(0);
+
+        if self.img_w > 0 && self.img_h > 0 && !self.pixels.is_empty() {
+            let avail_w = draw_w.max(1) as f32;
+            let avail_h = content_h.max(1) as f32;
+
+            let scale = (avail_w / self.img_w as f32).min(avail_h / self.img_h as f32);
+            let disp_w = (self.img_w as f32 * scale).round() as i32;
+            let disp_h = (self.img_h as f32 * scale).round() as i32;
+
+            let off_x = draw_x + (draw_w - disp_w) / 2;
+            let off_y = draw_y + (content_h - disp_h) / 2;
+
+            for dy in 0..disp_h {
+                let target_y = off_y + dy;
+                if target_y < draw_y || target_y >= draw_y + content_h { continue; }
+                let src_y = ((dy as f32 / scale) as usize).min(self.img_h - 1);
+
+                for dx in 0..disp_w {
+                    let target_x = off_x + dx;
+                    if target_x < draw_x || target_x >= draw_x + draw_w { continue; }
+                    let src_x = ((dx as f32 / scale) as usize).min(self.img_w - 1);
+
+                    let color = self.pixels[src_y * self.img_w + src_x];
+                    let idx = (target_y as usize) * canvas.width + (target_x as usize);
+                    if idx < canvas.buffer.len() {
+                        canvas.buffer[idx] = color;
+                    }
+                }
+            }
+        } else {
+            let (tw, th) = canvas.measure_text(&self.status, theme.font_body());
+            canvas.draw_text(draw_x + (draw_w - tw as i32) / 2, draw_y + (content_h - th as i32) / 2, &self.status, 0xFF94A3B8, theme.font_body());
+        }
+
+        if !self.is_fullscreen {
+            let bar_y = self.bounds.y + self.bounds.h - sb_h;
+            canvas.draw_rect(self.bounds.x, bar_y, self.bounds.w, sb_h, theme.bg_titlebar, 0);
+            canvas.draw_line_h(self.bounds.x, bar_y, self.bounds.w, theme.border_window);
+
+            let fs_btn_w = theme.pt(90.0);
+            let fs_btn_x = self.bounds.x + self.bounds.w - fs_btn_w - theme.pt(8.0);
+            canvas.draw_rect(fs_btn_x, bar_y + theme.pt(4.0), fs_btn_w, sb_h - theme.pt(8.0), theme.accent, theme.pt(4.0) as usize);
+            let (ftw, fth) = canvas.measure_text("Full Screen", theme.font_caption());
+            canvas.draw_text(fs_btn_x + (fs_btn_w - ftw as i32) / 2, bar_y + (sb_h - fth as i32) / 2, "Full Screen", 0xFFFFFFFF, theme.font_caption());
+
+            canvas.draw_text_clipped(self.bounds.x + theme.pt(12.0), bar_y + theme.pt(6.0), self.bounds.w - fs_btn_w - theme.pt(28.0), &self.status, theme.text_muted, theme.font_caption());
+        }
     }
 
-    fn handle_mouse(&mut self, mx: i32, my: i32, _pressed: bool) -> bool {
-        self.bounds.contains(mx, my)
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        if self.is_fullscreen {
+            if pressed {
+                self.is_fullscreen = false;
+                return true;
+            }
+            return true;
+        }
+
+        if !self.bounds.contains(mx, my) { return false; }
+
+        if pressed {
+            let theme = get_theme();
+            let sb_h = theme.pt(32.0);
+            let bar_y = self.bounds.y + self.bounds.h - sb_h;
+
+            let fs_btn_w = theme.pt(90.0);
+            let fs_btn_x = self.bounds.x + self.bounds.w - fs_btn_w - theme.pt(8.0);
+            if mx >= fs_btn_x && mx <= fs_btn_x + fs_btn_w && my >= bar_y && my <= bar_y + sb_h {
+                self.is_fullscreen = true;
+                return true;
+            }
+        }
+        true
+    }
+
+    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
+        if keycode == 0x01 && self.is_fullscreen { // Escape
+            self.is_fullscreen = false;
+            return true;
+        }
+        false
     }
 }

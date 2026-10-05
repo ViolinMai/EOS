@@ -18,7 +18,7 @@ pub struct Theme {
 }
 
 pub static mut CURRENT_THEME: Theme = Theme {
-    scale: 1.35, // مقياس مريح ومناسب لشاشات Full HD افتراضياً
+    scale: 2.0, // مقياس 2x كافتراضي
     bg_desktop: 0xFF1E293B,
     bg_menubar: 0xEE1E293B,
     border_menubar: 0x33FFFFFF,
@@ -34,6 +34,8 @@ pub static mut CURRENT_THEME: Theme = Theme {
     accent_hover: 0xFF0369A1,
     accent_active: 0xFF075985,
 };
+
+pub static mut DESKTOP_WALLPAPER: Option<(Vec<u32>, usize, usize)> = None;
 
 impl Theme {
     #[inline(always)]
@@ -74,6 +76,6 @@ pub fn get_theme() -> &'static Theme {
 pub fn set_theme_scale(scale: f32) {
     unsafe {
         let t = &mut *core::ptr::addr_of_mut!(CURRENT_THEME);
-        t.scale = scale.clamp(0.8, 3.0);
+        t.scale = scale.clamp(1.0, 4.0);
     }
 }

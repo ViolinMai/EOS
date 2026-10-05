@@ -70,8 +70,17 @@ pub fn start_multicore_decode(data: Vec<u8>) {
     }
     DECODE_STATUS.store(1, Ordering::SeqCst);
 
-    let _ = dispatch_job(3, core3_decode_worker);
-    let _ = dispatch_job(4, core4_decode_assist);
+    // البحث ديناميكياً عن أول نواة SMP حرة من Core 3 حتى Core 7
+    let mut target_core = None;
+    for c in 3..8 {
+        if crate::CORE_READY[c].load(Ordering::Acquire) && !CORE_IS_BUSY[c].load(Ordering::Acquire) {
+            target_core = Some(c);
+            break;
+        }
+    }
+    let chosen_core = target_core.unwrap_or(3);
+    crate::log_info!("SMP", "Dispatching async image decode task to dynamic Core {}", chosen_core);
+    let _ = dispatch_job(chosen_core, core_decode_dynamic_worker);
 }
 
 pub fn poll_multicore_decode() -> (i32, usize, usize, Option<Vec<u32>>) {
@@ -88,32 +97,6 @@ pub fn poll_multicore_decode() -> (i32, usize, usize, Option<Vec<u32>>) {
     } else {
         (0, 0, 0, None)
     }
-}
-
-fn core3_decode_worker() {
-    let input = unsafe { (*addr_of_mut!(DECODE_INPUT)).take() };
-    if let Some(bytes) = input {
-        crate::log_info!("SMP_DECODE", "Core 3 & 4 -> Parallel decoding started ({} bytes)...", bytes.len());
-        match crate::fs::image::decode_image_to_raw(&bytes) {
-            Ok((pixels, w, h)) => {
-                crate::log_info!("SMP_DECODE", "Core 3 -> Successfully decoded image: {}x{} px", w, h);
-                DECODE_W.store(w, Ordering::Release);
-                DECODE_H.store(h, Ordering::Release);
-                unsafe { *addr_of_mut!(DECODE_OUTPUT) = Some(pixels); }
-                DECODE_STATUS.store(2, Ordering::Release);
-            }
-            Err(e) => {
-                crate::log_error!("SMP_DECODE", "Core 3 -> Decode error: {}", e);
-                DECODE_STATUS.store(-1, Ordering::Release);
-            }
-        }
-    } else {
-        DECODE_STATUS.store(-1, Ordering::Release);
-    }
-}
-
-fn core4_decode_assist() {
-    core::hint::spin_loop();
 }
 
 pub struct SpinLockGuard(usize);
@@ -269,5 +252,28 @@ pub fn yield_now() {
             let prev_rsp_ptr = &mut sched.tasks[prev_idx].rsp as *mut u64;
             context::context_switch(prev_rsp_ptr, sched.tasks[next_idx].rsp);
         }
+    }
+}
+
+fn core_decode_dynamic_worker() {
+    let input = unsafe { (*addr_of_mut!(DECODE_INPUT)).take() };
+    if let Some(bytes) = input {
+        let core_id = crate::profiler::get_core_id();
+        crate::log_info!("SMP", "Core {} executing image decode ({} bytes)...", core_id, bytes.len());
+        match crate::fs::image::decode_image_to_raw(&bytes) {
+            Ok((pixels, w, h)) => {
+                crate::log_info!("SMP", "Core {} -> Decode successful: {}x{} px", core_id, w, h);
+                DECODE_W.store(w, Ordering::Release);
+                DECODE_H.store(h, Ordering::Release);
+                unsafe { *addr_of_mut!(DECODE_OUTPUT) = Some(pixels); }
+                DECODE_STATUS.store(2, Ordering::Release);
+            }
+            Err(e) => {
+                crate::log_error!("SMP", "Core {} -> Decode error: {}", core_id, e);
+                DECODE_STATUS.store(-1, Ordering::Release);
+            }
+        }
+    } else {
+        DECODE_STATUS.store(-1, Ordering::Release);
     }
 }

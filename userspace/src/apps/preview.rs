@@ -9,6 +9,7 @@ pub struct PreviewApp {
     pub img_w: usize,
     pub img_h: usize,
     pub status: String,
+    pub is_fullscreen: bool,
 }
 
 impl PreviewApp {
@@ -20,13 +21,14 @@ impl PreviewApp {
             pixels: Vec::new(),
             img_w: 0,
             img_h: 0,
-            status: String::from("Loading image..."),
+            status: String::from("Reading image file..."),
+            is_fullscreen: false,
         };
-        app.load_image();
+        app.load_image_safe();
         app
     }
 
-    pub fn load_image(&mut self) {
+    pub fn load_image_safe(&mut self) {
         let attempts = [
             format!("/{}", self.file_path.trim_start_matches('/')),
             self.file_path.clone(),
@@ -42,13 +44,15 @@ impl PreviewApp {
             }
         }
 
-        if data.len() == 0 {
-            self.status = format!("Failed to read file: {}", self.file_path);
+        if data.is_empty() {
+            self.status = format!("File not found: {}", self.file_path);
             return;
         }
 
         let total_bytes = data.len();
+        self.status = format!("Decoding image ({} KB)...", total_bytes / 1024);
 
+        // 1. فك تشفير PNG
         if data.len() >= 8 && &data[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
             match crate::png::decode_png(&data) {
                 Ok((px, w, h)) => {
@@ -65,24 +69,45 @@ impl PreviewApp {
             }
         }
 
+        // 2. فك تشفير JPEG عبر zune-jpeg مباشرة في مساحة الـ Userspace
         if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
             let mut decoder = zune_jpeg::JpegDecoder::new(&data);
             match decoder.decode() {
                 Ok(raw) => {
                     if let Some(info) = decoder.info() {
-                        let w = info.width as usize;
-                        let h = info.height as usize;
-                        let mut px = vec![0u32; w * h];
-                        for i in 0..(w * h) {
-                            let o = i * 3;
-                            if o + 2 < raw.len() {
-                                px[i] = (0xFF << 24) | ((raw[o] as u32) << 16) | ((raw[o+1] as u32) << 8) | (raw[o+2] as u32);
+                        let orig_w = info.width as usize;
+                        let orig_h = info.height as usize;
+
+                        // حماية الذاكرة: تقليص الدقة تلقائياً إذا كانت الصورة عملاقة (أكبر من 1080p)
+                        let max_disp_w = 1920usize;
+                        let max_disp_h = 1080usize;
+                        let step = ((orig_w + max_disp_w - 1) / max_disp_w).max((orig_h + max_disp_h - 1) / max_disp_h).max(1);
+
+                        let out_w = orig_w / step;
+                        let out_h = orig_h / step;
+                        let mut px = vec![0u32; out_w * out_h];
+
+                        for dy in 0..out_h {
+                            let sy = dy * step;
+                            let src_row = sy * orig_w * 3;
+                            let dst_row = dy * out_w;
+
+                            for dx in 0..out_w {
+                                let sx = dx * step;
+                                let o = src_row + (sx * 3);
+                                if o + 2 < raw.len() {
+                                    px[dst_row + dx] = (0xFF << 24)
+                                        | ((raw[o] as u32) << 16)
+                                        | ((raw[o+1] as u32) << 8)
+                                        | (raw[o+2] as u32);
+                                }
                             }
                         }
+
                         self.pixels = px;
-                        self.img_w = w;
-                        self.img_h = h;
-                        self.status = format!("JPEG ({}x{} px | {} KB)", w, h, total_bytes / 1024);
+                        self.img_w = out_w;
+                        self.img_h = out_h;
+                        self.status = format!("JPEG (Orig: {}x{}, Fitted: {}x{})", orig_w, orig_h, out_w, out_h);
                         return;
                     }
                 }
@@ -108,37 +133,39 @@ impl Widget for PreviewApp {
 
     fn paint(&self, canvas: &mut Canvas) {
         let theme = get_theme();
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF0F172A, 0);
+        let draw_x = if self.is_fullscreen { 0 } else { self.bounds.x };
+        let draw_y = if self.is_fullscreen { 0 } else { self.bounds.y };
+        let draw_w = if self.is_fullscreen { canvas.width as i32 } else { self.bounds.w };
+        let draw_h = if self.is_fullscreen { canvas.height as i32 } else { self.bounds.h };
 
-        let sb_h = theme.pt(28.0);
-        let content_h = (self.bounds.h - sb_h).max(0);
+        canvas.draw_rect(draw_x, draw_y, draw_w, draw_h, 0xFF0B1120, 0);
+
+        let sb_h = if self.is_fullscreen { 0 } else { theme.pt(32.0) };
+        let content_h = (draw_h - sb_h).max(0);
 
         if self.img_w > 0 && self.img_h > 0 && !self.pixels.is_empty() {
-            let avail_w = self.bounds.w.max(1) as usize;
-            let avail_h = content_h.max(1) as usize;
+            let avail_w = draw_w.max(1) as f32;
+            let avail_h = content_h.max(1) as f32;
 
-            let step_w = (self.img_w + avail_w - 1) / avail_w;
-            let step_h = (self.img_h + avail_h - 1) / avail_h;
-            let step = step_w.max(step_h).max(1);
+            let scale = (avail_w / self.img_w as f32).min(avail_h / self.img_h as f32);
+            let disp_w = (self.img_w as f32 * scale).round() as i32;
+            let disp_h = (self.img_h as f32 * scale).round() as i32;
 
-            let disp_w = (self.img_w / step).min(avail_w);
-            let disp_h = (self.img_h / step).min(avail_h);
-
-            let off_x = self.bounds.x + ((self.bounds.w - disp_w as i32) / 2);
-            let off_y = self.bounds.y + ((content_h - disp_h as i32) / 2);
+            let off_x = draw_x + (draw_w - disp_w) / 2;
+            let off_y = draw_y + (content_h - disp_h) / 2;
 
             for dy in 0..disp_h {
-                let src_y = dy * step;
-                let dst_y = off_y + dy as i32;
-                if dst_y < self.bounds.y || dst_y >= self.bounds.y + content_h { continue; }
+                let target_y = off_y + dy;
+                if target_y < draw_y || target_y >= draw_y + content_h { continue; }
+                let src_y = ((dy as f32 / scale) as usize).min(self.img_h - 1);
 
                 for dx in 0..disp_w {
-                    let src_x = dx * step;
-                    let dst_x = off_x + dx as i32;
-                    if dst_x < self.bounds.x || dst_x >= self.bounds.x + self.bounds.w { continue; }
+                    let target_x = off_x + dx;
+                    if target_x < draw_x || target_x >= draw_x + draw_w { continue; }
+                    let src_x = ((dx as f32 / scale) as usize).min(self.img_w - 1);
 
                     let color = self.pixels[src_y * self.img_w + src_x];
-                    let idx = (dst_y as usize) * canvas.width + (dst_x as usize);
+                    let idx = (target_y as usize) * canvas.width + (target_x as usize);
                     if idx < canvas.buffer.len() {
                         canvas.buffer[idx] = color;
                     }
@@ -146,18 +173,55 @@ impl Widget for PreviewApp {
             }
         } else {
             let (tw, th) = canvas.measure_text(&self.status, theme.font_body());
-            let tx = self.bounds.x + ((self.bounds.w - tw as i32) / 2);
-            let ty = self.bounds.y + ((content_h - th as i32) / 2);
-            canvas.draw_text(tx, ty, &self.status, 0xFF94A3B8, theme.font_body());
+            canvas.draw_text(draw_x + (draw_w - tw as i32) / 2, draw_y + (content_h - th as i32) / 2, &self.status, 0xFF94A3B8, theme.font_body());
         }
 
-        let sb_y = self.bounds.y + self.bounds.h - sb_h;
-        canvas.draw_rect(self.bounds.x, sb_y, self.bounds.w, sb_h, 0xFF1E293B, 0);
-        canvas.draw_line_h(self.bounds.x, sb_y, self.bounds.w, 0xFF334155);
-        canvas.draw_text_clipped(self.bounds.x + theme.pt(12.0), sb_y + theme.pt(6.0), self.bounds.w - theme.pt(24.0), &self.status, 0xFFF8FAFC, theme.font_caption());
+        if !self.is_fullscreen {
+            let bar_y = self.bounds.y + self.bounds.h - sb_h;
+            canvas.draw_rect(self.bounds.x, bar_y, self.bounds.w, sb_h, theme.bg_titlebar, 0);
+            canvas.draw_line_h(self.bounds.x, bar_y, self.bounds.w, theme.border_window);
+
+            let fs_btn_w = theme.pt(90.0);
+            let fs_btn_x = self.bounds.x + self.bounds.w - fs_btn_w - theme.pt(8.0);
+            canvas.draw_rect(fs_btn_x, bar_y + theme.pt(4.0), fs_btn_w, sb_h - theme.pt(8.0), theme.accent, theme.pt(4.0) as usize);
+            let (ftw, fth) = canvas.measure_text("Full Screen", theme.font_caption());
+            canvas.draw_text(fs_btn_x + (fs_btn_w - ftw as i32) / 2, bar_y + (sb_h - fth as i32) / 2, "Full Screen", 0xFFFFFFFF, theme.font_caption());
+
+            canvas.draw_text_clipped(self.bounds.x + theme.pt(12.0), bar_y + theme.pt(6.0), self.bounds.w - fs_btn_w - theme.pt(28.0), &self.status, theme.text_muted, theme.font_caption());
+        }
     }
 
-    fn handle_mouse(&mut self, mx: i32, my: i32, _pressed: bool) -> bool {
-        self.bounds.contains(mx, my)
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        if self.is_fullscreen {
+            if pressed {
+                self.is_fullscreen = false;
+                return true;
+            }
+            return true;
+        }
+
+        if !self.bounds.contains(mx, my) { return false; }
+
+        if pressed {
+            let theme = get_theme();
+            let sb_h = theme.pt(32.0);
+            let bar_y = self.bounds.y + self.bounds.h - sb_h;
+
+            let fs_btn_w = theme.pt(90.0);
+            let fs_btn_x = self.bounds.x + self.bounds.w - fs_btn_w - theme.pt(8.0);
+            if mx >= fs_btn_x && mx <= fs_btn_x + fs_btn_w && my >= bar_y && my <= bar_y + sb_h {
+                self.is_fullscreen = true;
+                return true;
+            }
+        }
+        true
+    }
+
+    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
+        if keycode == 0x01 && self.is_fullscreen {
+            self.is_fullscreen = false;
+            return true;
+        }
+        false
     }
 }

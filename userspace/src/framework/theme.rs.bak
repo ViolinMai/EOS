@@ -18,7 +18,7 @@ pub struct Theme {
 }
 
 pub static mut CURRENT_THEME: Theme = Theme {
-    scale: 1.0,
+    scale: 1.35, // مقياس مريح ومناسب لشاشات Full HD افتراضياً
     bg_desktop: 0xFF1E293B,
     bg_menubar: 0xEE1E293B,
     border_menubar: 0x33FFFFFF,
@@ -43,22 +43,27 @@ impl Theme {
 
     #[inline(always)]
     pub fn font_caption(&self) -> usize {
-        (11.0 * self.scale).max(9.0) as usize
+        (11.0 * self.scale).round().max(10.0) as usize
     }
 
     #[inline(always)]
     pub fn font_body(&self) -> usize {
-        (13.0 * self.scale).max(11.0) as usize
+        (13.5 * self.scale).round().max(12.0) as usize
     }
 
     #[inline(always)]
     pub fn font_title(&self) -> usize {
-        (15.0 * self.scale).max(13.0) as usize
+        (16.0 * self.scale).round().max(14.0) as usize
     }
 
     #[inline(always)]
     pub fn font_large(&self) -> usize {
-        (20.0 * self.scale).max(16.0) as usize
+        (22.0 * self.scale).round().max(18.0) as usize
+    }
+
+    #[inline(always)]
+    pub fn font_heading(&self) -> usize {
+        (28.0 * self.scale).round().max(22.0) as usize
     }
 }
 
@@ -69,6 +74,6 @@ pub fn get_theme() -> &'static Theme {
 pub fn set_theme_scale(scale: f32) {
     unsafe {
         let t = &mut *core::ptr::addr_of_mut!(CURRENT_THEME);
-        t.scale = scale.clamp(0.5, 4.0);
+        t.scale = scale.clamp(0.8, 3.0);
     }
 }

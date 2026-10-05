@@ -50,6 +50,10 @@ pub struct WindowFrame {
     pub is_dragging: bool,
     pub drag_offset_x: i32,
     pub drag_offset_y: i32,
+    pub last_title_click_tick: u64,
+    pub hover_close: bool,
+    pub hover_min: bool,
+    pub hover_max: bool,
 }
 
 impl WindowFrame {
@@ -63,7 +67,7 @@ impl WindowFrame {
     ) -> Self {
         let bounds = Rect::new(x, y, w, h);
         let theme = crate::framework::get_theme();
-        let tb_h = theme.pt(32.0) as i32;
+        let tb_h = theme.pt(32.0);
         let content_y = y + tb_h + 1;
         let content_h = (h - tb_h - 1).max(0);
         content.layout(x, content_y, w, content_h);
@@ -80,6 +84,22 @@ impl WindowFrame {
             is_dragging: false,
             drag_offset_x: 0,
             drag_offset_y: 0,
+            last_title_click_tick: 0,
+            hover_close: false,
+            hover_min: false,
+            hover_max: false,
+        }
+    }
+
+    pub fn toggle_maximize(&mut self) {
+        let theme = crate::framework::get_theme();
+        if self.is_maximized {
+            self.layout(self.saved_bounds.x, self.saved_bounds.y, self.saved_bounds.w, self.saved_bounds.h);
+            self.is_maximized = false;
+        } else {
+            self.saved_bounds = self.bounds;
+            self.layout(0, theme.pt(32.0), 1920, 1080 - theme.pt(32.0) - theme.pt(70.0));
+            self.is_maximized = true;
         }
     }
 }
@@ -91,7 +111,7 @@ impl Widget for WindowFrame {
     fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
         self.bounds = Rect::new(x, y, w, h);
         let theme = crate::framework::get_theme();
-        let tb_h = theme.pt(32.0) as i32;
+        let tb_h = theme.pt(32.0);
         let content_y = self.bounds.y + tb_h + 1;
         let content_h = (self.bounds.h - tb_h - 1).max(0);
         self.content.layout(self.bounds.x, content_y, self.bounds.w, content_h);
@@ -102,26 +122,45 @@ impl Widget for WindowFrame {
         if self.is_closed || self.is_minimized { return; }
 
         let theme = crate::framework::get_theme();
-        let tb_h = theme.pt(32.0) as i32;
-        let cr = theme.pt(10.0) as i32;
+        let tb_h = theme.pt(32.0);
+        let cr = if self.is_maximized { 0 } else { theme.pt(10.0) };
 
+        // جسم النافذة وشريط العنوان الشفاف الزجاجي
         canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, cr as usize);
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, cr as usize);
-        canvas.draw_rect(self.bounds.x, self.bounds.y + tb_h - cr, self.bounds.w, cr, theme.bg_titlebar, 0);
+        canvas.draw_frosted_glass_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, 0xDD1E293B, cr as usize);
         canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
 
         let border_col = if self.is_active { theme.accent } else { theme.border_window };
-        canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, border_col, cr as usize);
+        if !self.is_maximized {
+            canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, border_col, cr as usize);
+        }
 
-        let by = self.bounds.y + (tb_h - (theme.pt(12.0) as i32)) / 2;
-        canvas.draw_rect(self.bounds.x + (theme.pt(16.0) as i32), by, theme.pt(12.0) as i32, theme.pt(12.0) as i32, 0xFFFF5F56, theme.pt(6.0) as usize);
-        canvas.draw_rect(self.bounds.x + (theme.pt(36.0) as i32), by, theme.pt(12.0) as i32, theme.pt(12.0) as i32, 0xFFFFBD2E, theme.pt(6.0) as usize);
-        canvas.draw_rect(self.bounds.x + (theme.pt(56.0) as i32), by, theme.pt(12.0) as i32, theme.pt(12.0) as i32, 0xFF27C93F, theme.pt(6.0) as usize);
+        let btn_sz = theme.pt(14.0);
+        let by = self.bounds.y + (tb_h - btn_sz) / 2;
 
-        let tx = self.bounds.x + (theme.pt(80.0) as i32);
+        // 1. زر الإغلاق: دائري بلون رمادي/داكن، وعند الـ Hover يتحول للأحمر
+        let close_c = if self.hover_close { 0xFFEF4444 } else { 0x6694A3B8 };
+        canvas.draw_rect(self.bounds.x + theme.pt(14.0), by, btn_sz, btn_sz, close_c, (btn_sz / 2) as usize);
+
+        // 2. زر التصغير: علامة '-'
+        let min_c = if self.hover_min { 0xFFE2E8F0 } else { 0xFF94A3B8 };
+        let min_bx = self.bounds.x + theme.pt(36.0);
+        canvas.draw_rect(min_bx, by, btn_sz, btn_sz, 0x44334155, theme.pt(3.0) as usize);
+        let my_mid = by + (btn_sz / 2);
+        canvas.draw_line_h(min_bx + theme.pt(3.0), my_mid, btn_sz - theme.pt(6.0), min_c);
+
+        // 3. زر التكبير/الشاشة الكاملة: علامة '+'
+        let max_c = if self.hover_max { 0xFFE2E8F0 } else { 0xFF94A3B8 };
+        let max_bx = self.bounds.x + theme.pt(58.0);
+        canvas.draw_rect(max_bx, by, btn_sz, btn_sz, 0x44334155, theme.pt(3.0) as usize);
+        let mx_mid = max_bx + (btn_sz / 2);
+        canvas.draw_line_h(max_bx + theme.pt(3.0), my_mid, btn_sz - theme.pt(6.0), max_c);
+        canvas.draw_line_v(mx_mid, by + theme.pt(3.0), btn_sz - theme.pt(6.0), max_c);
+
+        let tx = self.bounds.x + theme.pt(84.0);
         let (_, th) = canvas.measure_text(&self.title, theme.font_title());
         let ty = self.bounds.y + (tb_h - (th as i32)) / 2;
-        canvas.draw_text_clipped(tx, ty, (self.bounds.w - (theme.pt(160.0) as i32)).max(0), &self.title, theme.text_primary, theme.font_title());
+        canvas.draw_text_clipped(tx, ty, (self.bounds.w - theme.pt(170.0)).max(0), &self.title, theme.text_primary, theme.font_title());
 
         let content_rect = Rect {
             x: self.bounds.x,
@@ -138,36 +177,42 @@ impl Widget for WindowFrame {
     fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
         if self.is_closed || self.is_minimized { return false; }
         let theme = crate::framework::get_theme();
-        let tb_h = theme.pt(32.0) as i32;
+        let tb_h = theme.pt(32.0);
+        let btn_sz = theme.pt(14.0);
+        let by = self.bounds.y + (tb_h - btn_sz) / 2;
+
+        let in_close = mx >= self.bounds.x + theme.pt(14.0) && mx <= self.bounds.x + theme.pt(14.0) + btn_sz && my >= by && my <= by + btn_sz;
+        let in_min = mx >= self.bounds.x + theme.pt(36.0) && mx <= self.bounds.x + theme.pt(36.0) + btn_sz && my >= by && my <= by + btn_sz;
+        let in_max = mx >= self.bounds.x + theme.pt(58.0) && mx <= self.bounds.x + theme.pt(58.0) + btn_sz && my >= by && my <= by + btn_sz;
+
+        self.hover_close = in_close;
+        self.hover_min = in_min;
+        self.hover_max = in_max;
 
         if pressed {
-            if mx >= self.bounds.x && mx <= self.bounds.x + self.bounds.w && my >= self.bounds.y && my < self.bounds.y + tb_h {
-                let by = self.bounds.y + (tb_h - (theme.pt(12.0) as i32)) / 2;
-                let btn_sz = theme.pt(12.0) as i32;
-                // Close button
-                if mx >= self.bounds.x + (theme.pt(16.0) as i32) && mx <= self.bounds.x + (theme.pt(16.0) as i32) + btn_sz && my >= by && my <= by + btn_sz {
-                    self.is_closed = true;
-                    return true;
-                }
-                // Minimize button
-                if mx >= self.bounds.x + (theme.pt(36.0) as i32) && mx <= self.bounds.x + (theme.pt(36.0) as i32) + btn_sz && my >= by && my <= by + btn_sz {
-                    self.is_minimized = true;
-                    return true;
-                }
-                // Maximize button
-                if mx >= self.bounds.x + (theme.pt(56.0) as i32) && mx <= self.bounds.x + (theme.pt(56.0) as i32) + btn_sz && my >= by && my <= by + btn_sz {
-                    if self.is_maximized {
-                        self.layout(self.saved_bounds.x, self.saved_bounds.y, self.saved_bounds.w, self.saved_bounds.h);
-                        self.is_maximized = false;
-                    } else {
-                        self.saved_bounds = self.bounds;
-                        self.layout(0, theme.pt(32.0) as i32, 1920, 1080 - (theme.pt(32.0) as i32));
-                        self.is_maximized = true;
-                    }
-                    return true;
-                }
+            if in_close {
+                self.is_closed = true;
+                return true;
+            }
+            if in_min {
+                self.is_minimized = true;
+                return true;
+            }
+            if in_max {
+                self.toggle_maximize();
+                return true;
+            }
 
-                // Titlebar drag start
+            if mx >= self.bounds.x && mx <= self.bounds.x + self.bounds.w && my >= self.bounds.y && my < self.bounds.y + tb_h {
+                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
+                if now.saturating_sub(self.last_title_click_tick) < 350 {
+                    self.toggle_maximize();
+                    self.last_title_click_tick = 0;
+                    self.is_dragging = false;
+                    return true;
+                }
+                self.last_title_click_tick = now;
+
                 if !self.is_maximized {
                     self.is_dragging = true;
                     self.drag_offset_x = mx - self.bounds.x;
@@ -175,20 +220,11 @@ impl Widget for WindowFrame {
                 }
                 return true;
             }
-        } else {
-            self.is_dragging = false;
-        }
-
-        if self.is_dragging {
-            let new_x = (mx - self.drag_offset_x).max(0).min(1920 - 100);
-            let new_y = (my - self.drag_offset_y).max(theme.pt(32.0) as i32).min(1080 - 50);
-            self.layout(new_x, new_y, self.bounds.w, self.bounds.h);
-            return true;
         }
 
         if self.bounds.contains(mx, my) {
             let _ = self.content.handle_mouse(mx, my, pressed);
-            return true; // Consume click to avoid bleeding to windows behind
+            return true;
         }
 
         false
