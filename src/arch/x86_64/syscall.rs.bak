@@ -613,23 +613,20 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             if validate_user_range(frame.rdi, frame.rsi as usize) {
                 let mut buf = alloc::vec![0u8; frame.rsi as usize];
                 if copy_from_user(&mut buf, frame.rdi, frame.rsi as usize).is_ok() {
-                    unsafe { crate::net::RAW_TX_QUEUE.push(buf); }
+                    crate::net::enqueue_tx(buf);
                     frame.rax = frame.rsi;
                 } else { frame.rax = -14i64 as u64; }
             } else { frame.rax = -14i64 as u64; }
         }
         513 => { // sys_net_rx
             if validate_user_range(frame.rdi, frame.rsi as usize) {
-                unsafe {
-                    if !crate::net::RAW_RX_QUEUE.is_empty() {
-                        let packet = crate::net::RAW_RX_QUEUE.remove(0);
-                        let len = core::cmp::min(packet.len(), frame.rsi as usize);
-                        if copy_to_user(frame.rdi, &packet[..len]).is_ok() {
-                            frame.rax = len as u64;
-                        } else { frame.rax = -14i64 as u64; }
-                    } else {
-                        frame.rax = 0;
-                    }
+                if let Some(packet) = crate::net::dequeue_rx() {
+                    let len = core::cmp::min(packet.len(), frame.rsi as usize);
+                    if copy_to_user(frame.rdi, &packet[..len]).is_ok() {
+                        frame.rax = len as u64;
+                    } else { frame.rax = -14i64 as u64; }
+                } else {
+                    frame.rax = 0;
                 }
             } else { frame.rax = -14i64 as u64; }
         }

@@ -7,12 +7,20 @@ pub fn sys_present(pixels: *const u32, w: usize, h: usize) {
     }
 }
 
-pub fn sys_poll_event() -> Option<[u64; 2]> {
-    let type_val: u64; let data_val: u64;
+pub fn sys_poll_event() -> Option<[u64; 3]> {
+    let type_val: u64;
+    let data1: u64;
+    let data2: u64;
     unsafe {
-        asm!("syscall", inout("rax") 503u64 => type_val, out("rdi") data_val, out("rcx") _, out("r11") _);
+        asm!(
+            "syscall",
+            inout("rax") 503u64 => type_val,
+            out("rdi") data1,
+            out("rsi") data2,
+            out("rcx") _, out("r11") _
+        );
     }
-    if type_val == 0 { None } else { Some([type_val, data_val]) }
+    if type_val == 0 { None } else { Some([type_val, data1, data2]) }
 }
 
 pub fn sys_present_rects(pixels: *const u32, width: usize, height: usize, rects: &[[u32; 4]]) {
@@ -39,4 +47,20 @@ pub fn sys_net_mac(buf: &mut [u8; 6]) {
     unsafe {
         core::arch::asm!("syscall", in("rax") 514, in("rdi") buf.as_mut_ptr() as u64, out("rcx") _, out("r11") _);
     }
+}
+
+pub fn sys_wait_event(timeout_ms: u64) -> Option<[u64; 3]> {
+    let type_val: u64;
+    let data1: u64;
+    let data2: u64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") 505u64 => type_val,
+            inout("rdi") timeout_ms => data1,
+            out("rsi") data2,
+            out("rcx") _, out("r11") _
+        );
+    }
+    if type_val == 0 { None } else { Some([type_val, data1, data2]) }
 }

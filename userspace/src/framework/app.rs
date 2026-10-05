@@ -1,336 +1,233 @@
 use std::collections::BTreeMap;
 use rusttype::Font;
-
-use super::canvas::Canvas;
-use super::widget::{Widget, WindowFrame, Rect};
-use super::theme::{get_theme, set_theme_scale};
-use super::menu::MenuBar;
-use crate::apps::{FinderApp, TerminalApp, SettingsApp, TextEditApp, ActivityMonitorApp, PreviewApp, BrowserApp};
-use crate::{sdk, f_info, f_warn};
+use crate::framework::canvas::Canvas;
+use crate::framework::menu::MenuBar;
+use crate::framework::theme::{get_theme, set_theme_scale};
+use crate::framework::widget::{Widget, WindowFrame, Rect};
+use crate::framework::layout::ContainerWidget;
+use crate::apps::finder::FinderApp;
+use crate::apps::settings::SettingsApp;
+use crate::apps::terminal::TerminalApp;
+use crate::apps::activity_monitor::ActivityMonitorApp;
+use crate::apps::textedit::TextEditApp;
+use crate::apps::browser::BrowserApp;
+use crate::apps::preview::PreviewApp;
+use crate::syscall::{sys_present, sys_wait_event, sys_poll_event};
 
 pub struct FrameworkApp<'a> {
+    pub buffer: Vec<u32>,
     pub width: usize,
     pub height: usize,
-    pub buffer: Vec<u32>,
-    font: Option<Font<'a>>,
-    font_cache: BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>,
+    pub font: Option<Font<'a>>,
+    pub font_cache: BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>,
     pub root_widgets: Vec<Box<dyn Widget>>,
-    pub mouse_x: usize,
-    pub mouse_y: usize,
-    pub mouse_clicked: bool,
-    pub dock_items: Vec<(&'static str, &'static str, u32)>,
-    pub dock_hovered: Option<usize>,
-    pub on_dock_click: Option<Box<dyn FnMut(usize)>>,
     pub menubar: MenuBar,
-    pub active_app_title: String,
-    pub needs_redraw: bool,
+    pub dock_items: Vec<String>,
+    pub mouse_x: i32,
+    pub mouse_y: i32,
+    pub dock_handler: Option<Box<dyn FnMut(usize)>>,
 }
 
 impl<'a> FrameworkApp<'a> {
     pub fn new(font_bytes: &'a [u8], width: usize, height: usize) -> Self {
-        let font = if !font_bytes.is_empty() && crate::is_valid_truetype_font(font_bytes) {
-            f_info!("FONT", "Successfully initialized TrueType font engine.");
+        let font = if !font_bytes.is_empty() {
             Font::try_from_bytes(font_bytes)
         } else {
-            f_warn!("FONT", "No TTF available. Switching to High-Resolution Scaled Bitmap Rasterizer.");
             None
         };
 
-        let mut buffer = Vec::new();
-        buffer.resize(width * height, 0xFF0F172A);
-
-        set_theme_scale(1.75); // HiDPI 1080p Scale
         let mut menubar = MenuBar::new();
-        menubar.bounds = Rect::new(0, 0, width, get_theme().pt(32.0));
+        menubar.bounds = Rect::new(0, 0, width as i32, get_theme().pt(32.0));
 
         Self {
-            width, height, buffer, font, font_cache: BTreeMap::new(),
+            buffer: vec![0; width * height],
+            width,
+            height,
+            font,
+            font_cache: BTreeMap::new(),
             root_widgets: Vec::new(),
-            mouse_x: width / 2, mouse_y: height / 2,
-            mouse_clicked: false,
-            dock_items: vec![
-                ("Finder", "FND", 0xFF0284C7),
-                ("Terminal", "TRM", 0xFF18181B),
-                ("Browser", "NET", 0xFF2563EB),
-                ("Activity Monitor", "ACT", 0xFFE11D48),
-                ("TextEdit", "TXT", 0xFF0D9488),
-                ("Settings", "SET", 0xFF475569),
-            ],
-            dock_hovered: None,
-            on_dock_click: None,
             menubar,
-            active_app_title: "Finder".into(),
-            needs_redraw: true,
+            dock_items: vec![
+                "Finder".into(),
+                "Settings".into(),
+                "Terminal".into(),
+                "Activity Monitor".into(),
+                "TextEdit".into(),
+                "Browser".into(),
+            ],
+            mouse_x: (width / 2) as i32,
+            mouse_y: (height / 2) as i32,
+            dock_handler: None,
         }
     }
 
-    pub fn set_dock_handler(&mut self, handler: impl FnMut(usize) + 'static) {
-        self.on_dock_click = Some(Box::new(handler));
+    pub fn set_dock_handler<F: FnMut(usize) + 'static>(&mut self, handler: F) {
+        self.dock_handler = Some(Box::new(handler));
     }
 
     pub fn spawn_app(&mut self, name: &str) {
+        let theme = get_theme();
         for w in &mut self.root_widgets {
             if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
-                if frame.title == name {
+                if frame.title.contains(name) {
                     frame.is_closed = false;
-                    self.active_app_title = name.to_string();
-                    self.needs_redraw = true;
-                    f_info!("APP", "Unminimized and focused existing app: '{}'", name);
+                    frame.is_minimized = false;
+                    frame.is_active = true;
                     return;
                 }
             }
         }
 
-        let theme = get_theme();
-        let new_win: Box<dyn Widget> = match name {
-            "Finder" => Box::new(WindowFrame::new("Finder", theme.pt(60.0), theme.pt(45.0), theme.pt(720.0), theme.pt(460.0), Box::new(FinderApp::new()))),
-            "Terminal" => Box::new(WindowFrame::new("Terminal", theme.pt(120.0), theme.pt(80.0), theme.pt(600.0), theme.pt(380.0), Box::new(TerminalApp::new()))),
-            "Browser" => Box::new(WindowFrame::new("Browser", theme.pt(130.0), theme.pt(65.0), theme.pt(740.0), theme.pt(480.0), Box::new(BrowserApp::new()))),
-            "Activity Monitor" => Box::new(WindowFrame::new("Activity Monitor", theme.pt(150.0), theme.pt(90.0), theme.pt(640.0), theme.pt(420.0), Box::new(ActivityMonitorApp::new()))),
-            "TextEdit" => Box::new(WindowFrame::new("TextEdit", theme.pt(180.0), theme.pt(110.0), theme.pt(580.0), theme.pt(400.0), Box::new(TextEditApp::new()))),
-            "Settings" => Box::new(WindowFrame::new("Settings", theme.pt(200.0), theme.pt(80.0), theme.pt(560.0), theme.pt(380.0), Box::new(SettingsApp::new()))),
-            _ => return,
+        let content: Box<dyn Widget> = match name {
+            "Finder" => Box::new(FinderApp::new()),
+            "Settings" => Box::new(SettingsApp::new()),
+            "Terminal" => Box::new(TerminalApp::new()),
+            "Activity Monitor" => Box::new(ActivityMonitorApp::new()),
+            "Browser" => Box::new(BrowserApp::new()),
+            _ => Box::new(ContainerWidget::vbox()),
         };
 
-        f_info!("APP", "Spawned new application window: '{}'", name);
-        self.active_app_title = name.to_string();
-        self.root_widgets.push(new_win);
-        self.needs_redraw = true;
-    }
-
-    pub fn spawn_preview(&mut self, name: String, data: Vec<u8>) {
-        let theme = get_theme();
-        f_info!("APP", "Spawning PreviewApp for image: '{}' ({} bytes)", name, data.len());
-        let win = Box::new(WindowFrame::new(format!("Preview - {}", name), theme.pt(140.0), theme.pt(70.0), theme.pt(680.0), theme.pt(480.0), Box::new(PreviewApp::new(name, data))));
+        let win = Box::new(WindowFrame::new(
+            name,
+            theme.pt(80.0) + (self.root_widgets.len() as i32 * theme.pt(25.0)),
+            theme.pt(60.0) + (self.root_widgets.len() as i32 * theme.pt(25.0)),
+            theme.pt(620.0),
+            theme.pt(420.0),
+            content,
+        ));
         self.root_widgets.push(win);
-        self.needs_redraw = true;
     }
 
-    pub fn spawn_textedit(&mut self, name: String, content: String) {
-        let theme = get_theme();
-        f_info!("APP", "Spawning TextEdit for document: '{}' ({} characters)", name, content.len());
-        let win = Box::new(WindowFrame::new(format!("TextEdit - {}", name), theme.pt(160.0), theme.pt(90.0), theme.pt(620.0), theme.pt(420.0), Box::new(TextEditApp::with_content(name, content))));
-        self.root_widgets.push(win);
-        self.needs_redraw = true;
-    }
-
-    pub fn render_frame(&mut self) {
-        let theme = get_theme();
-        self.buffer.fill(theme.bg_desktop);
-
-        // 1. Windows Rendering
-        {
-            let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-            for w in &self.root_widgets {
-                w.paint(&mut canvas);
-            }
-        }
-
-        // 2. MenuBar
-        {
-            let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-            self.menubar.paint(&mut canvas, &self.active_app_title);
-        }
-
-        // 3. Dock Rendering
-        {
-            let item_count = self.dock_items.len();
-            let base_item_w = theme.pt(48.0);
-            let gap = theme.pt(12.0);
-            let total_dock_w = (item_count * base_item_w) + ((item_count + 1) * gap);
-            let dock_h = theme.pt(64.0);
-            let dock_x = (self.width.saturating_sub(total_dock_w)) / 2;
-            let dock_y = self.height.saturating_sub(dock_h + theme.pt(12.0));
-
-            let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-            canvas.draw_rect(dock_x, dock_y, total_dock_w, dock_h, theme.bg_dock, theme.radius_dock);
-            canvas.draw_rect_outline(dock_x, dock_y, total_dock_w, dock_h, theme.border_dock, theme.radius_dock);
-
-            let mut cur_x = dock_x + gap;
-            for (idx, &(name, label, color)) in self.dock_items.iter().enumerate() {
-                let is_hovered = self.dock_hovered == Some(idx);
-                let sz = if is_hovered { theme.pt(54.0) } else { base_item_w };
-                let iy = if is_hovered { dock_y + theme.pt(4.0) } else { dock_y + theme.pt(8.0) };
-
-                canvas.draw_rect(cur_x, iy, sz, sz, color, theme.pt(12.0));
-                let (lw, _) = canvas.measure_text(label, theme.font_body());
-                canvas.draw_text(cur_x + (sz.saturating_sub(lw) / 2), iy + (sz / 3), label, 0xFFFFFFFF, theme.font_body());
-
-                let is_running = self.root_widgets.iter().any(|w| {
-                    if let Some(frame) = w.as_any().downcast_ref::<WindowFrame>() {
-                        frame.title.contains(name) && !frame.is_closed
-                    } else { false }
-                });
-                if is_running {
-                    canvas.draw_rect(cur_x + (sz / 2) - 3, dock_y + dock_h - theme.pt(6.0), 6, 6, theme.accent_hover, 3);
-                }
-
-                if is_hovered {
-                    let tip_w = name.len() * theme.pt(8.0) + theme.pt(20.0);
-                    let tip_x = cur_x.saturating_add(sz / 2).saturating_sub(tip_w / 2);
-                    let tip_y = dock_y.saturating_sub(theme.pt(30.0));
-                    canvas.draw_rect(tip_x, tip_y, tip_w, theme.pt(22.0), theme.bg_dock, theme.pt(6.0));
-                    canvas.draw_rect_outline(tip_x, tip_y, tip_w, theme.pt(22.0), theme.border_dock, theme.pt(6.0));
-                    canvas.draw_text(tip_x + theme.pt(8.0), tip_y + theme.pt(4.0), name, theme.text_primary, theme.font_caption());
-                }
-
-                cur_x += base_item_w + gap;
-            }
-        }
-
-        // 4. Mouse Cursor
-        {
-            let cur_sz = theme.pt(14.0);
-            let cur_col = if self.mouse_clicked { theme.accent_hover } else { 0xFFFFFFFF };
-            let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-            let mx = self.mouse_x.saturating_sub(cur_sz / 2);
-            let my = self.mouse_y.saturating_sub(cur_sz / 2);
-            canvas.draw_rect(mx, my, cur_sz, cur_sz, cur_col, cur_sz / 2);
-            canvas.draw_rect_outline(mx, my, cur_sz, cur_sz, 0xFF000000, cur_sz / 2);
-        }
-
-        sdk::window::present(self.buffer.as_ptr(), self.width, self.height);
-    }
-
-    pub fn run_loop(&mut self) -> ! {
-        self.render_frame();
-        let mut last_click_state = false;
-
+    pub fn run_loop(&mut self) {
         loop {
-            let mut has_input = false;
-            while let Some(ev) = sdk::window::poll_event() {
-                has_input = true;
-                let (etype, data) = (ev[0], ev[1]);
-                match etype {
-                    1 => {
-                        let dx = (data & 0xFFFFFFFF) as i32;
-                        let dy = ((data >> 32) & 0xFFFFFFFF) as i32;
-                        self.mouse_x = (self.mouse_x as isize + dx as isize).clamp(0, (self.width - 1) as isize) as usize;
-                        self.mouse_y = (self.mouse_y as isize + dy as isize).clamp(0, (self.height - 1) as isize) as usize;
-                    }
-                    2 => {
-                        self.mouse_clicked = (data >> 8) == 1;
-                    }
-                    4 => {
-                        let c = (data as u8) as char;
+            let theme = get_theme();
+
+            // 1. استهلاك وتفريغ جميع الأحداث المتراكمة في الطابور دفعة واحدة (Drain Queue)
+            // هذا يمنع تراكم حركة الماوس وتأخر الاستجابة الزمني نهائياً
+            let mut first_ev = sys_wait_event(16);
+            while let Some(ev) = first_ev {
+                let ev_type = ev[0];
+                let dock_h = theme.pt(54.0);
+                let dock_w = (self.dock_items.len() as i32) * theme.pt(52.0) + theme.pt(20.0);
+                let dock_x = ((self.width as i32) - dock_w) / 2;
+                let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
+
+                match ev_type {
+                    1 => { // MouseMove
+                        let dx = (ev[1] as u32) as i32;
+                        let dy = ((ev[1] >> 32) as u32) as i32;
+
+                        self.mouse_x = (self.mouse_x + dx).clamp(0, self.width as i32 - 1);
+                        self.mouse_y = (self.mouse_y + dy).clamp(0, self.height as i32 - 1);
+
                         for w in self.root_widgets.iter_mut().rev() {
-                            if w.handle_char(c) { break; }
+                            if w.handle_mouse(self.mouse_x, self.mouse_y, false) {
+                                break;
+                            }
+                        }
+                    }
+                    2 => { // MouseButton
+                        let btn = (ev[1] & 0xFF) as u8;
+                        let pressed = ((ev[1] >> 8) & 0xFF) != 0;
+
+                        if btn == 0 && pressed {
+                            if self.mouse_y >= dock_y && self.mouse_y <= dock_y + dock_h && self.mouse_x >= dock_x && self.mouse_x <= dock_x + dock_w {
+                                let idx = ((self.mouse_x - dock_x - theme.pt(12.0)) / theme.pt(52.0)) as usize;
+                                if idx < self.dock_items.len() {
+                                    let app_name = self.dock_items[idx].clone();
+                                    self.spawn_app(&app_name);
+                                    first_ev = sys_poll_event();
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let mut hit_idx = None;
+                        for (idx, w) in self.root_widgets.iter_mut().enumerate().rev() {
+                            if w.handle_mouse(self.mouse_x, self.mouse_y, pressed) {
+                                hit_idx = Some(idx);
+                                break;
+                            }
+                        }
+
+                        if let Some(idx) = hit_idx {
+                            if pressed {
+                                for (i, w) in self.root_widgets.iter_mut().enumerate() {
+                                    if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                                        f.is_active = i == idx;
+                                    }
+                                }
+                                let win = self.root_widgets.remove(idx);
+                                self.root_widgets.push(win);
+                            }
+                        }
+                    }
+                    3 => { // KeyDown
+                        let keycode = (ev[1] & 0xFF) as u8;
+                        let mods = ((ev[1] >> 8) & 0xFF) as u8;
+                        if let Some(active_win) = self.root_widgets.last_mut() {
+                            active_win.handle_key(keycode, mods);
+                        }
+                    }
+                    4 => { // Char
+                        let c_code = ev[1] as u32;
+                        if let Some(c) = char::from_u32(c_code) {
+                            if let Some(active_win) = self.root_widgets.last_mut() {
+                                active_win.handle_char(c);
+                            }
+                        }
+                    }
+                    5 => { // Scroll
+                        let dy = (ev[1] as u32) as i32;
+                        for w in self.root_widgets.iter_mut().rev() {
+                            if w.handle_scroll(self.mouse_x, self.mouse_y, dy) {
+                                break;
+                            }
                         }
                     }
                     _ => {}
                 }
+
+                // سحب باقي الأحداث في الطابور دون نوم
+                first_ev = sys_poll_event();
             }
 
-            if has_input { self.needs_redraw = true; }
-
-            let mut pending_img = None;
-            let mut pending_txt = None;
-            for w in &mut self.root_widgets {
-                if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
-                    if let Some(finder) = frame.content.as_any_mut().downcast_mut::<FinderApp>() {
-                        if let Some(img) = finder.pending_open_image.take() {
-                            pending_img = Some(img);
-                            break;
-                        }
-                        if let Some(txt) = finder.pending_open_text.take() {
-                            pending_txt = Some(txt);
-                            break;
-                        }
-                    }
-                }
-            }
-            if let Some((name, data)) = pending_img {
-                self.spawn_preview(name, data);
-            }
-            if let Some((name, content)) = pending_txt {
-                self.spawn_textedit(name, content);
+            // 2. دورة الرسم المنعشة بعد تفريغ الأحداث
+            for p in &mut self.buffer {
+                *p = theme.bg_desktop;
             }
 
-            // MenuBar events
-            if let Some(action) = self.menubar.handle_mouse(self.mouse_x, self.mouse_y, self.mouse_clicked && !last_click_state) {
-                match action {
-                    101 => f_info!("MENU", "About EOS Triggered."),
-                    102 => self.spawn_app("Settings"),
-                    103 => f_warn!("MENU", "Reboot Request Triggered."),
-                    201 => self.spawn_app(&self.active_app_title.clone()),
-                    203 => {
-                        if let Some(top) = self.root_widgets.last_mut() {
-                            if let Some(frame) = top.as_any_mut().downcast_mut::<WindowFrame>() {
-                                frame.is_closed = true;
-                            }
-                        }
-                    }
-                    _ => f_info!("MENU", "Action id {} triggered", action),
-                }
-                self.needs_redraw = true;
-            }
-
-            // Dock Hover and Click
-            let theme = get_theme();
-            let item_count = self.dock_items.len();
-            let base_item_w = theme.pt(48.0);
-            let gap = theme.pt(12.0);
-            let total_dock_w = (item_count * base_item_w) + ((item_count + 1) * gap);
-            let dock_h = theme.pt(64.0);
-            let dock_x = (self.width.saturating_sub(total_dock_w)) / 2;
-            let dock_y = self.height.saturating_sub(dock_h + theme.pt(12.0));
-
-            let in_dock_zone = self.mouse_x >= dock_x && self.mouse_x < dock_x + total_dock_w && self.mouse_y >= dock_y && self.mouse_y < dock_y + dock_h;
-
-            if in_dock_zone {
-                let mut cur_x = dock_x + gap;
-                let mut found_hover = None;
-                for (idx, _) in self.dock_items.iter().enumerate() {
-                    if self.mouse_x >= cur_x && self.mouse_x < cur_x + base_item_w {
-                        found_hover = Some(idx);
-                        if self.mouse_clicked && !last_click_state {
-                            let title = self.dock_items[idx].0;
-                            self.spawn_app(title);
-                        }
-                        break;
-                    }
-                    cur_x += base_item_w + gap;
-                }
-                if self.dock_hovered != found_hover {
-                    self.dock_hovered = found_hover;
-                    self.needs_redraw = true;
-                }
-            } else if self.dock_hovered.is_some() {
-                self.dock_hovered = None;
-                self.needs_redraw = true;
-            }
-
-            // Window Focus & Event Handling
-            let mut brought_to_front = None;
-            for (idx, w) in self.root_widgets.iter_mut().enumerate().rev() {
-                if w.handle_mouse(self.mouse_x, self.mouse_y, self.mouse_clicked) {
-                    if self.mouse_clicked && !last_click_state {
-                        brought_to_front = Some(idx);
-                    }
-                    self.needs_redraw = true;
-                    break;
+            {
+                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                for w in &self.root_widgets {
+                    w.paint(&mut canvas);
                 }
             }
 
-            if let Some(idx) = brought_to_front {
-                if idx < self.root_widgets.len() - 1 {
-                    let top_win = self.root_widgets.remove(idx);
-                    if let Some(frame) = top_win.as_any().downcast_ref::<WindowFrame>() {
-                        f_info!("WINDOW", "Focus shifted to front window: '{}'", frame.title);
-                        self.active_app_title = frame.title.clone();
-                    }
-                    self.root_widgets.push(top_win);
+            let dock_h = theme.pt(54.0);
+            let dock_w = (self.dock_items.len() as i32) * theme.pt(52.0) + theme.pt(20.0);
+            let dock_x = ((self.width as i32) - dock_w) / 2;
+            let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
+
+            {
+                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                canvas.draw_rect(dock_x, dock_y, dock_w, dock_h, theme.bg_dock, theme.pt(16.0) as usize);
+                canvas.draw_rect_outline(dock_x, dock_y, dock_w, dock_h, theme.border_dock, theme.pt(16.0) as usize);
+
+                for (i, item) in self.dock_items.iter().enumerate() {
+                    let ix = dock_x + theme.pt(12.0) + (i as i32 * theme.pt(52.0));
+                    let iy = dock_y + theme.pt(7.0);
+                    canvas.draw_rect(ix, iy, theme.pt(40.0), theme.pt(40.0), theme.accent, theme.pt(8.0) as usize);
+                    let initial = item.chars().next().unwrap_or('A').to_string();
+                    let (tw, th) = canvas.measure_text(&initial, theme.font_title());
+                    canvas.draw_text(ix + ((theme.pt(40.0) - tw as i32) / 2), iy + ((theme.pt(40.0) - th as i32) / 2), &initial, 0xFFFFFFFF, theme.font_title());
                 }
+
+                self.menubar.paint(&mut canvas);
+                canvas.draw_linux_cursor(self.mouse_x, self.mouse_y);
             }
 
-            last_click_state = self.mouse_clicked;
-
-            if self.needs_redraw {
-                self.render_frame();
-                self.needs_redraw = false;
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(16));
+            sys_present(self.buffer.as_ptr(), self.width, self.height);
         }
     }
 }

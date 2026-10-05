@@ -33,7 +33,7 @@ impl PreviewApp {
 
     pub fn process_decode(&mut self) {
         if self.image_data.is_empty() {
-            let err = "Image byte buffer is empty (0 bytes).".to_string();
+            let err = "Image buffer is empty.".to_string();
             f_error!("PREVIEW", "{}", err);
             self.status = DecodeStatus::Failed(err);
             return;
@@ -41,15 +41,13 @@ impl PreviewApp {
 
         f_info!(
             "PREVIEW",
-            "Starting decode for '{}' ({:.2} MB, Magic: {:02X?})",
+            "Decoding '{}' ({:.2} MB)",
             self.title,
-            (self.image_data.len() as f64) / (1024.0 * 1024.0),
-            &self.image_data[..core::cmp::min(8, self.image_data.len())]
+            (self.image_data.len() as f64) / (1024.0 * 1024.0)
         );
 
         let t_start = std::time::Instant::now();
 
-        // 1. فك ضغط صور JPEG
         if self.image_data.len() >= 2 && self.image_data[0] == 0xFF && self.image_data[1] == 0xD8 {
             let mut decoder = zune_jpeg::JpegDecoder::new(&self.image_data);
             match decoder.decode() {
@@ -74,7 +72,7 @@ impl PreviewApp {
                                 }
                             }
                         }
-                        f_info!("PREVIEW", "JPEG successfully decoded: {}x{} px in {:?}", self.width, self.height, t_start.elapsed());
+                        f_info!("PREVIEW", "JPEG decoded: {}x{} px in {:?}", self.width, self.height, t_start.elapsed());
                         self.status = DecodeStatus::Ready;
                         return;
                     }
@@ -88,14 +86,13 @@ impl PreviewApp {
             }
         }
 
-        // 2. فك ضغط صور PNG
         if self.image_data.starts_with(b"\x89PNG\r\n\x1a\n") {
             match crate::png::decode_png(&self.image_data) {
                 Ok((px, w, h)) => {
                     self.width = w;
                     self.height = h;
                     self.raw_pixels = px;
-                    f_info!("PREVIEW", "PNG successfully decoded: {}x{} px in {:?}", self.width, self.height, t_start.elapsed());
+                    f_info!("PREVIEW", "PNG decoded: {}x{} px in {:?}", self.width, self.height, t_start.elapsed());
                     self.status = DecodeStatus::Ready;
                     return;
                 }
@@ -108,7 +105,6 @@ impl PreviewApp {
             }
         }
 
-        // 3. دعم صور BMP
         if self.image_data.starts_with(b"BM") && self.image_data.len() > 54 {
             let data_offset = u32::from_le_bytes([self.image_data[10], self.image_data[11], self.image_data[12], self.image_data[13]]) as usize;
             let w = i32::from_le_bytes([self.image_data[18], self.image_data[19], self.image_data[20], self.image_data[21]]).abs() as usize;
@@ -135,13 +131,13 @@ impl PreviewApp {
                 self.width = w;
                 self.height = h;
                 self.raw_pixels = pixels;
-                f_info!("PREVIEW", "BMP successfully decoded: {}x{} px in {:?}", w, h, t_start.elapsed());
+                f_info!("PREVIEW", "BMP decoded: {}x{} px in {:?}", w, h, t_start.elapsed());
                 self.status = DecodeStatus::Ready;
                 return;
             }
         }
 
-        let err = format!("Unsupported image format (Magic: {:02X?})", &self.image_data[..core::cmp::min(4, self.image_data.len())]);
+        let err = format!("Unsupported format (Magic: {:02X?})", &self.image_data[..core::cmp::min(4, self.image_data.len())]);
         f_error!("PREVIEW", "{}", err);
         self.status = DecodeStatus::Failed(err);
     }

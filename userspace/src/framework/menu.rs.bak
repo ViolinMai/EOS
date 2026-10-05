@@ -21,6 +21,7 @@ pub struct MenuBar {
     pub active_menu: Option<usize>,
     pub hovered_item: Option<usize>,
     pub bounds: Rect,
+    category_rects: Vec<Rect>,
 }
 
 impl MenuBar {
@@ -80,6 +81,7 @@ impl MenuBar {
             active_menu: None,
             hovered_item: None,
             bounds: Rect::default(),
+            category_rects: Vec::new(),
         }
     }
 
@@ -87,51 +89,63 @@ impl MenuBar {
         let theme = get_theme();
         let h = self.bounds.h;
         canvas.draw_rect(0, 0, canvas.width, h, theme.bg_menubar, 0);
-        canvas.draw_line_h(0, h, canvas.width, theme.border_menubar);
+        canvas.draw_line_h(0, h.saturating_sub(1), canvas.width, theme.border_menubar);
 
         let mut cur_x = theme.pt(16.0);
         let font_sz = theme.font_body();
+        self.category_rects.clear();
 
-        // Render Apple Icon
+        // 1. Apple Logo
         let (apple_w, _) = canvas.measure_text("", font_sz + 4);
-        canvas.draw_text(cur_x, theme.pt(8.0), "", theme.text_primary, font_sz + 4);
-        cur_x += apple_w + theme.pt(16.0);
+        let apple_rect = Rect::new(cur_x, 0, apple_w + theme.pt(14.0), h);
+        if self.active_menu == Some(0) {
+            canvas.draw_rect(apple_rect.x, theme.pt(3.0), apple_rect.w, h.saturating_sub(theme.pt(6.0)), theme.accent, theme.pt(4.0));
+            canvas.draw_text(cur_x + theme.pt(7.0), theme.pt(7.0), "", 0xFFFFFFFF, font_sz + 4);
+        } else {
+            canvas.draw_text(cur_x + theme.pt(7.0), theme.pt(7.0), "", theme.text_primary, font_sz + 4);
+        }
+        self.category_rects.push(apple_rect);
+        cur_x += apple_rect.w + theme.pt(8.0);
 
-        // Render Active Application Title (Bold styled)
+        // 2. Active Application Name (macOS bold title style)
         let (title_w, _) = canvas.measure_text(current_app_title, font_sz + 2);
-        canvas.draw_text(cur_x, theme.pt(8.0), current_app_title, theme.text_primary, font_sz + 2);
+        canvas.draw_text(cur_x, theme.pt(7.0), current_app_title, theme.text_primary, font_sz + 2);
         cur_x += title_w + theme.pt(20.0);
 
+        // 3. Regular Menu Headers
         for (idx, cat) in self.categories.iter().enumerate().skip(1) {
             let (tw, _) = canvas.measure_text(&cat.title, font_sz);
             let item_w = tw + theme.pt(16.0);
+            let cat_rect = Rect::new(cur_x, 0, item_w, h);
+            
             if self.active_menu == Some(idx) {
-                canvas.draw_rect(cur_x.saturating_sub(theme.pt(8.0)), theme.pt(4.0), item_w, h.saturating_sub(theme.pt(8.0)), theme.accent, theme.pt(4.0));
-                canvas.draw_text(cur_x, theme.pt(8.0), &cat.title, 0xFFFFFFFF, font_sz);
+                canvas.draw_rect(cat_rect.x, theme.pt(3.0), cat_rect.w, h.saturating_sub(theme.pt(6.0)), theme.accent, theme.pt(4.0));
+                canvas.draw_text(cur_x + theme.pt(8.0), theme.pt(7.0), &cat.title, 0xFFFFFFFF, font_sz);
             } else {
-                canvas.draw_text(cur_x, theme.pt(8.0), &cat.title, theme.text_secondary, font_sz);
+                canvas.draw_text(cur_x + theme.pt(8.0), theme.pt(7.0), &cat.title, theme.text_secondary, font_sz);
             }
-            cur_x += item_w + theme.pt(6.0);
+            self.category_rects.push(cat_rect);
+            cur_x += item_w + theme.pt(4.0);
         }
 
-        // Right side indicators (Clock & status)
+        // 4. System Status Items
         let status = "Oct 2 | 8 Cores | 1.5x HiDPI";
         let (sw, _) = canvas.measure_text(status, font_sz);
-        canvas.draw_text(canvas.width.saturating_sub(sw + theme.pt(20.0)), theme.pt(8.0), status, theme.accent_hover, font_sz);
+        canvas.draw_text(canvas.width.saturating_sub(sw + theme.pt(16.0)), theme.pt(7.0), status, theme.accent_hover, font_sz);
 
-        // Render Active Dropdown Menu
+        // 5. Active Dropdown Menu
         if let Some(active_idx) = self.active_menu {
             if let Some(cat) = self.categories.get(active_idx) {
-                let drop_w = theme.pt(200.0);
-                let item_h = theme.pt(28.0);
-                let drop_h = cat.items.len() * item_h + theme.pt(12.0);
-                let drop_x = theme.pt(16.0) + (active_idx * theme.pt(60.0)).min(canvas.width.saturating_sub(drop_w));
-                let drop_y = h + 2;
+                let drop_w = theme.pt(220.0);
+                let item_h = theme.pt(30.0);
+                let drop_h = cat.items.len() * item_h + theme.pt(10.0);
+                let drop_x = self.category_rects.get(active_idx).map(|r| r.x).unwrap_or(theme.pt(16.0)).min(canvas.width.saturating_sub(drop_w));
+                let drop_y = h + 1;
 
                 canvas.draw_rect(drop_x, drop_y, drop_w, drop_h, theme.bg_titlebar, theme.pt(8.0));
                 canvas.draw_rect_outline(drop_x, drop_y, drop_w, drop_h, theme.border_window, theme.pt(8.0));
 
-                let mut item_y = drop_y + theme.pt(6.0);
+                let mut item_y = drop_y + theme.pt(5.0);
                 for (item_idx, item) in cat.items.iter().enumerate() {
                     if item.is_separator {
                         canvas.draw_line_h(drop_x + theme.pt(10.0), item_y + (item_h / 2), drop_w.saturating_sub(theme.pt(20.0)), theme.separator);
@@ -161,14 +175,11 @@ impl MenuBar {
 
         if my <= h {
             if pressed {
-                let mut cur_x = theme.pt(16.0);
-                for (idx, cat) in self.categories.iter().enumerate() {
-                    let item_w = (cat.title.len() * theme.pt(8.0)) + theme.pt(24.0);
-                    if mx >= cur_x && mx <= cur_x + item_w {
+                for (idx, rect) in self.category_rects.iter().enumerate() {
+                    if rect.contains(mx, my) {
                         self.active_menu = if self.active_menu == Some(idx) { None } else { Some(idx) };
                         return None;
                     }
-                    cur_x += item_w;
                 }
             }
             return None;
@@ -176,14 +187,14 @@ impl MenuBar {
 
         if let Some(active_idx) = self.active_menu {
             if let Some(cat) = self.categories.get(active_idx) {
-                let drop_w = theme.pt(200.0);
-                let item_h = theme.pt(28.0);
-                let drop_h = cat.items.len() * item_h + theme.pt(12.0);
-                let drop_x = theme.pt(16.0) + (active_idx * theme.pt(60.0));
-                let drop_y = h + 2;
+                let drop_w = theme.pt(220.0);
+                let item_h = theme.pt(30.0);
+                let drop_h = cat.items.len() * item_h + theme.pt(10.0);
+                let drop_x = self.category_rects.get(active_idx).map(|r| r.x).unwrap_or(theme.pt(16.0)).min(1920 - drop_w);
+                let drop_y = h + 1;
 
                 if mx >= drop_x && mx <= drop_x + drop_w && my >= drop_y && my <= drop_y + drop_h {
-                    let rel_y = my.saturating_sub(drop_y + theme.pt(6.0));
+                    let rel_y = my.saturating_sub(drop_y + theme.pt(5.0));
                     let clicked_item = rel_y / item_h;
                     if clicked_item < cat.items.len() {
                         self.hovered_item = Some(clicked_item);

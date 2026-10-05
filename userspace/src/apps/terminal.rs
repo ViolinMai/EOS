@@ -1,12 +1,10 @@
 use crate::framework::*;
-use crate::net_manager::{NET, poll_network, TcpState};
 
 pub struct TerminalApp {
     bounds: Rect,
-    history: Vec<(String, u32)>,
+    history: Vec<String>,
     input: String,
-    cwd: String,
-    next_dns_id: u16,
+    scroll_y: i32,
 }
 
 impl TerminalApp {
@@ -14,228 +12,35 @@ impl TerminalApp {
         Self {
             bounds: Rect::default(),
             history: vec![
-                ("EOS Terminal v2.0 (x86_64-unknown-linux-musl)".into(), 0xFF94A3B8),
-                ("Type 'help' for commands. Try 'ping 10.0.2.2' or 'curl 10.0.2.2'".into(), 0xFF64748B),
+                "EOS POSIX Ring 3 Terminal".into(),
+                "Type 'help' or 'clear' to test shell execution.".into(),
             ],
             input: String::new(),
-            cwd: "/EOS SHARE".into(),
-            next_dns_id: 100,
+            scroll_y: 0,
         }
-    }
-
-    fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
-        let parts: Vec<&str> = s.split('.').collect();
-        if parts.len() != 4 { return None; }
-        let mut ip = [0u8; 4];
-        for i in 0..4 {
-            ip[i] = parts[i].parse().ok()?;
-        }
-        Some(ip)
-    }
-
-    fn resolve_host(&mut self, host: &str) -> Result<[u8; 4], String> {
-        if let Some(ip) = Self::parse_ipv4(host) {
-            return Ok(ip);
-        }
-
-        let qid = self.next_dns_id;
-        self.next_dns_id = self.next_dns_id.wrapping_add(1);
-
-        {
-            let mut lock = NET.lock().unwrap();
-            let net = lock.as_mut().ok_or("Network subsystem not initialized")?;
-            net.dns_replies.remove(&qid);
-            net.resolve_dns(host, qid);
-        }
-
-        let t_start = std::time::Instant::now();
-        while t_start.elapsed().as_millis() < 2500 {
-            poll_network();
-            {
-                let mut lock = NET.lock().unwrap();
-                if let Some(net) = lock.as_mut() {
-                    if let Some(res) = net.dns_replies.remove(&qid) {
-                        return res.ok_or_else(|| format!("ping: cannot resolve {}: Unknown host (NXDOMAIN)", host));
-                    }
-                }
-            }
-            std::thread::yield_now();
-        }
-
-        Err(format!("ping: cannot resolve {}: DNS request timed out", host))
     }
 
     fn execute(&mut self) {
         let cmd = self.input.trim().to_string();
-        let echo = format!("{}> {}", self.cwd, cmd);
-        self.history.push((echo.clone(), 0xFF38BDF8));
-        println!("[TERM] {}", echo);
+        self.history.push(format!("eos$ {}", cmd));
         self.input.clear();
 
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        if parts.is_empty() { return; }
-
-        match parts[0] {
+        match cmd.as_str() {
             "help" => {
-                self.history.push(("Available commands:".into(), 0xFFF8FAFC));
-                self.history.push(("  ping <host/ip> - Real ICMP packets with DNS resolution".into(), 0xFFCBD5E1));
-                self.history.push(("  ipconfig       - Display IP, MAC, Gateway, and ARP table".into(), 0xFFCBD5E1));
-                self.history.push(("  curl <host/ip> - Real HTTP/1.1 client with TCP handshake".into(), 0xFFCBD5E1));
-                self.history.push(("  ls [path]      - List directory entries".into(), 0xFFCBD5E1));
-                self.history.push(("  cat <file>     - Display file contents".into(), 0xFFCBD5E1));
-                self.history.push(("  clear          - Clear console screen".into(), 0xFFCBD5E1));
+                self.history.push("Commands: help, clear, uname, ping, ipconfig".into());
             }
-            "ipconfig" | "ifconfig" => {
-                poll_network();
-                let lock = NET.lock().unwrap();
-                if let Some(net) = lock.as_ref() {
-                    self.history.push(("eth0: flags=UP,BROADCAST,RUNNING".into(), 0xFF22C55E));
-                    self.history.push((format!("      inet {}.{}.{}.{}  netmask 255.255.255.0", net.ip[0], net.ip[1], net.ip[2], net.ip[3]), 0xFFFFFFFF));
-                    self.history.push((format!("      gateway {}.{}.{}.{}  dns {}.{}.{}.{}", net.gateway[0], net.gateway[1], net.gateway[2], net.gateway[3], net.dns_server[0], net.dns_server[1], net.dns_server[2], net.dns_server[3]), 0xFF94A3B8));
-                    self.history.push((format!("      ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", net.mac[0], net.mac[1], net.mac[2], net.mac[3], net.mac[4], net.mac[5]), 0xFF38BDF8));
-                    self.history.push((format!("ARP Table ({} entries):", net.arp_cache.len()), 0xFFCBD5E1));
-                    for (ip, mac) in &net.arp_cache {
-                        self.history.push((format!("  {}.{}.{}.{} at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", ip[0], ip[1], ip[2], ip[3], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]), 0xFFCBD5E1));
-                    }
-                }
+            "clear" => {
+                self.history.clear();
             }
-            "ping" => {
-                if parts.len() < 2 {
-                    self.history.push(("usage: ping <hostname or IP address>".into(), 0xFFEF4444));
-                    return;
-                }
-                let target_host = parts[1];
-                let target_ip = match self.resolve_host(target_host) {
-                    Ok(ip) => ip,
-                    Err(e) => {
-                        self.history.push((e, 0xFFEF4444));
-                        return;
-                    }
-                };
-
-                self.history.push((format!("PING {} ({}.{}.{}.{}): 56 data bytes", target_host, target_ip[0], target_ip[1], target_ip[2], target_ip[3]), 0xFFF8FAFC));
-
-                {
-                    let mut lock = NET.lock().unwrap();
-                    if let Some(net) = lock.as_mut() {
-                        net.ping_replies.clear();
-                        net.ping(target_ip, 1);
-                    }
-                }
-
-                let t_start = std::time::Instant::now();
-                let mut got_reply = false;
-                while t_start.elapsed().as_millis() < 1200 {
-                    poll_network();
-                    {
-                        let mut lock = NET.lock().unwrap();
-                        if let Some(net) = lock.as_mut() {
-                            if let Some((from, seq, len)) = net.ping_replies.pop() {
-                                let rtt = t_start.elapsed().as_millis();
-                                self.history.push((format!("{} bytes from {}.{}.{}.{}: icmp_seq={} time={} ms", len, from[0], from[1], from[2], from[3], seq, rtt), 0xFF22C55E));
-                                got_reply = true;
-                                break;
-                            }
-                        }
-                    }
-                    std::thread::yield_now();
-                }
-                if !got_reply {
-                    self.history.push(("Request timeout for icmp_seq 1".into(), 0xFFEF4444));
-                }
+            "uname" => {
+                self.history.push("EOS 0.1.0 x86_64 SMP Monolithic + Ring 3 UI".into());
             }
-            "curl" => {
-                if parts.len() < 2 {
-                    self.history.push(("usage: curl <hostname or IP address> [path]".into(), 0xFFEF4444));
-                    return;
-                }
-                let target_host = parts[1];
-                let req_path = if parts.len() > 2 { parts[2] } else { "/" };
-                let target_ip = match self.resolve_host(target_host) {
-                    Ok(ip) => ip,
-                    Err(e) => {
-                        self.history.push((e, 0xFFEF4444));
-                        return;
-                    }
-                };
-
-                self.history.push((format!("Connecting to http://{}{} ({}.{}.{}.{}):80 ...", target_host, req_path, target_ip[0], target_ip[1], target_ip[2], target_ip[3]), 0xFF38BDF8));
-                let sock_port = {
-                    let mut lock = NET.lock().unwrap();
-                    let net = lock.as_mut().unwrap();
-                    net.http_get(target_ip, target_host, req_path)
-                };
-
-                let t_start = std::time::Instant::now();
-                let mut received = false;
-                while t_start.elapsed().as_millis() < 3000 {
-                    poll_network();
-                    {
-                        let mut lock = NET.lock().unwrap();
-                        if let Some(net) = lock.as_mut() {
-                            if let Some(sock) = net.tcp_sockets.get_mut(&sock_port) {
-                                if !sock.rx_buffer.is_empty() {
-                                    let content = String::from_utf8_lossy(&sock.rx_buffer).to_string();
-                                    for line in content.lines().take(15) {
-                                        self.history.push((line.to_string(), 0xFF22C55E));
-                                    }
-                                    if content.lines().count() > 15 {
-                                        self.history.push(("... [truncated response]".into(), 0xFF94A3B8));
-                                    }
-                                    received = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    std::thread::yield_now();
-                }
-
-                if !received {
-                    let lock = NET.lock().unwrap();
-                    let state = lock.as_ref().and_then(|n| n.tcp_sockets.get(&sock_port)).map(|s| s.state);
-                    self.history.push((format!("curl: Connection timed out (TCP state: {:?})", state.unwrap_or(TcpState::Closed)), 0xFFEF4444));
-                }
+            "ipconfig" | "net" => {
+                self.history.push("eth0: IP=10.0.2.15 Subnet=255.255.255.0 Gateway=10.0.2.2".into());
             }
-            "clear" => self.history.clear(),
-            "pwd" => {
-                self.history.push((self.cwd.clone(), 0xFF22C55E));
-            }
-            "cd" => {
-                if parts.len() > 1 { self.cwd = parts[1].to_string(); } else { self.cwd = "/EOS SHARE".into(); }
-            }
-            "ls" => {
-                let target_dir = if parts.len() > 1 { parts[1] } else { &self.cwd };
-                if let Ok(entries) = std::fs::read_dir(target_dir).or_else(|_| std::fs::read_dir(target_dir.trim_start_matches('/'))) {
-                    let mut line = String::new();
-                    for e in entries.flatten() {
-                        let is_d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                        let name = e.file_name().to_string_lossy().to_string();
-                        let label = format!("{} {}   ", if is_d { "📁" } else { "📄" }, name);
-                        line.push_str(&label);
-                    }
-                    if !line.is_empty() { self.history.push((line, 0xFFFFFFFF)); } else { self.history.push(("(empty directory)".into(), 0xFF94A3B8)); }
-                } else {
-                    self.history.push((format!("ls: cannot access '{}': No such file", target_dir), 0xFFEF4444));
-                }
-            }
-            "cat" => {
-                if parts.len() < 2 {
-                    self.history.push(("Usage: cat <filename>".into(), 0xFFEF4444));
-                } else {
-                    let p = parts[1];
-                    let full_path = if p.starts_with('/') { p.to_string() } else { format!("{}/{}", self.cwd, p) };
-                    if let Ok(content) = std::fs::read_to_string(&full_path).or_else(|_| std::fs::read_to_string(p)) {
-                        for l in content.lines() {
-                            self.history.push((l.replace('\t', "    "), 0xFFE2E8F0));
-                        }
-                    } else {
-                        self.history.push((format!("cat: {}: No such file", p), 0xFFEF4444));
-                    }
-                }
-            }
+            "" => {}
             _ => {
-                self.history.push((format!("command not found: {}", parts[0]), 0xFFEF4444));
+                self.history.push(format!("Command not found: {}", cmd));
             }
         }
     }
@@ -244,37 +49,54 @@ impl TerminalApp {
 impl Widget for TerminalApp {
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
-    fn layout(&mut self, x: usize, y: usize, w: usize, h: usize) -> Rect {
-        self.bounds = Rect { x, y, w, h };
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect::new(x, y, w, h);
         self.bounds
     }
 
     fn paint(&self, canvas: &mut Canvas) {
         let theme = get_theme();
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF090D16, 0);
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF18181B, 0);
 
-        let line_h = theme.pt(24.0);
-        let max_lines = self.bounds.h.saturating_sub(theme.pt(36.0)) / line_h;
-        let start = if self.history.len() > max_lines { self.history.len() - max_lines } else { 0 };
+        let line_h = theme.pt(20.0);
+        let mut cy = self.bounds.y + theme.pt(12.0) - self.scroll_y;
 
-        let mut cy = self.bounds.y + theme.pt(12.0);
-        for (line, color) in &self.history[start..] {
-            canvas.draw_text(self.bounds.x + theme.pt(18.0), cy, line, *color, theme.font_body());
+        for line in &self.history {
+            if cy + line_h > self.bounds.y && cy < self.bounds.y + self.bounds.h - line_h {
+                canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), cy, self.bounds.w - theme.pt(28.0), line, 0xFFE2E8F0, theme.font_body());
+            }
             cy += line_h;
         }
-        let prompt = format!("{}> {}_", self.cwd, self.input);
-        canvas.draw_text(self.bounds.x + theme.pt(18.0), cy, &prompt, 0xFFFFFFFF, theme.font_body());
+
+        let prompt = format!("eos$ {}_", self.input);
+        canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), cy, self.bounds.w - theme.pt(28.0), &prompt, 0xFF38BDF8, theme.font_body());
     }
 
-    fn handle_mouse(&mut self, mx: usize, my: usize, _p: bool) -> bool {
+    fn handle_mouse(&mut self, mx: i32, my: i32, _pressed: bool) -> bool {
         self.bounds.contains(mx, my)
     }
 
-    fn handle_char(&mut self, c: char) -> bool {
-        if c == '\n' {
+    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        if dy < 0 {
+            self.scroll_y = (self.scroll_y + 24).min(2000);
+        } else {
+            self.scroll_y = (self.scroll_y - 24).max(0);
+        }
+        true
+    }
+
+    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
+        if keycode == 0x1C { // Enter
             self.execute();
             return true;
-        } else if c == '\x08' {
+        }
+        false
+    }
+
+    fn handle_char(&mut self, c: char) -> bool {
+        if c == '\x08' {
             self.input.pop();
             return true;
         } else if c >= ' ' && c <= '~' {

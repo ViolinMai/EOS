@@ -1,0 +1,303 @@
+use crate::framework::{get_theme, Canvas, Rect, Widget};
+use std::any::Any;
+
+pub struct LabelWidget {
+    pub bounds: Rect,
+    pub text: String,
+    pub color: Option<u32>,
+    pub font_size: usize,
+}
+
+impl LabelWidget {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            bounds: Rect::default(),
+            text: text.into(),
+            color: None,
+            font_size: 14,
+        }
+    }
+
+    pub fn with_size(mut self, size: usize) -> Self {
+        self.font_size = size;
+        self
+    }
+
+    pub fn with_color(mut self, color: u32) -> Self {
+        self.color = Some(color);
+        self
+    }
+}
+
+impl Widget for LabelWidget {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect { x, y, w, h };
+        self.bounds
+    }
+
+    fn paint(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        let color = self.color.unwrap_or(theme.text_primary);
+        let (_, th) = canvas.measure_text(&self.text, self.font_size);
+        let text_y = self.bounds.y + ((self.bounds.h - th as i32) / 2);
+        canvas.draw_text(self.bounds.x, text_y, &self.text, color, self.font_size);
+    }
+}
+
+pub struct ButtonWidget {
+    pub bounds: Rect,
+    pub text: String,
+    pub on_click: Option<Box<dyn FnMut()>>,
+    pub is_hovered: bool,
+    pub is_pressed: bool,
+}
+
+impl ButtonWidget {
+    pub fn new(text: impl Into<String>) -> Self {
+        Self {
+            bounds: Rect::default(),
+            text: text.into(),
+            on_click: None,
+            is_hovered: false,
+            is_pressed: false,
+        }
+    }
+
+    pub fn on_click<F: FnMut() + 'static>(mut self, cb: F) -> Self {
+        self.on_click = Some(Box::new(cb));
+        self
+    }
+}
+
+impl Widget for ButtonWidget {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect { x, y, w, h };
+        self.bounds
+    }
+
+    fn paint(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        let bg_color = if self.is_pressed {
+            theme.accent_hover
+        } else if self.is_hovered {
+            theme.accent_hover
+        } else {
+            theme.accent
+        };
+
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, bg_color, theme.pt(6.0) as usize);
+        let (tw, th) = canvas.measure_text(&self.text, theme.font_body());
+        let text_x = self.bounds.x + ((self.bounds.w - tw as i32) / 2);
+        let text_y = self.bounds.y + ((self.bounds.h - th as i32) / 2);
+        canvas.draw_text(text_x, text_y, &self.text, 0xFFFFFFFF, theme.font_body());
+    }
+
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        let contains = self.bounds.contains(mx, my);
+        self.is_hovered = contains;
+
+        if contains {
+            if pressed {
+                self.is_pressed = true;
+            } else if self.is_pressed {
+                self.is_pressed = false;
+                if let Some(cb) = &mut self.on_click {
+                    cb();
+                }
+            }
+            return true;
+        } else {
+            self.is_pressed = false;
+            return false;
+        }
+    }
+}
+
+pub struct TextInputWidget {
+    pub bounds: Rect,
+    pub text: String,
+    pub placeholder: String,
+    pub is_focused: bool,
+    pub cursor_pos: usize,
+    pub on_submit: Option<Box<dyn FnMut(&str)>>,
+}
+
+impl TextInputWidget {
+    pub fn new(placeholder: impl Into<String>) -> Self {
+        Self {
+            bounds: Rect::default(),
+            text: String::new(),
+            placeholder: placeholder.into(),
+            is_focused: false,
+            cursor_pos: 0,
+            on_submit: None,
+        }
+    }
+
+    pub fn with_text(mut self, text: impl Into<String>) -> Self {
+        self.text = text.into();
+        self.cursor_pos = self.text.len();
+        self
+    }
+
+    pub fn on_submit<F: FnMut(&str) + 'static>(mut self, cb: F) -> Self {
+        self.on_submit = Some(Box::new(cb));
+        self
+    }
+}
+
+impl Widget for TextInputWidget {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn is_focusable(&self) -> bool { true }
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect { x, y, w, h };
+        self.bounds
+    }
+
+    fn paint(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_titlebar, theme.pt(6.0) as usize);
+
+        let border_color = if self.is_focused { theme.accent } else { theme.border_window };
+        canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, border_color, theme.pt(6.0) as usize);
+
+        let pad_x = self.bounds.x + (theme.pt(8.0) as i32);
+        let (_, th) = canvas.measure_text("A", theme.font_body());
+        let text_y = self.bounds.y + ((self.bounds.h - th as i32) / 2);
+
+        if self.text.is_empty() {
+            canvas.draw_text(pad_x, text_y, &self.placeholder, theme.text_muted, theme.font_body());
+        } else {
+            canvas.draw_text(pad_x, text_y, &self.text, theme.text_primary, theme.font_body());
+        }
+
+        if self.is_focused {
+            let cursor_str = &self.text[..self.cursor_pos.min(self.text.len())];
+            let (cw, _) = canvas.measure_text(cursor_str, theme.font_body());
+            let caret_x = pad_x + cw as i32;
+            canvas.draw_line_v(caret_x, text_y, th as i32, theme.accent);
+        }
+    }
+
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        if self.bounds.contains(mx, my) {
+            if pressed {
+                self.is_focused = true;
+                self.cursor_pos = self.text.len();
+            }
+            true
+        } else {
+            if pressed {
+                self.is_focused = false;
+            }
+            false
+        }
+    }
+
+    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
+        if !self.is_focused { return false; }
+        match keycode {
+            0x1C => {
+                if let Some(cb) = &mut self.on_submit {
+                    let val = self.text.clone();
+                    cb(&val);
+                }
+                true
+            }
+            0x4B => {
+                if self.cursor_pos > 0 { self.cursor_pos -= 1; }
+                true
+            }
+            0x4D => {
+                if self.cursor_pos < self.text.len() { self.cursor_pos += 1; }
+                true
+            }
+            _ => false
+        }
+    }
+
+    fn handle_char(&mut self, c: char) -> bool {
+        if !self.is_focused { return false; }
+        if c == '\x08' {
+            if self.cursor_pos > 0 && !self.text.is_empty() {
+                self.cursor_pos -= 1;
+                self.text.remove(self.cursor_pos);
+            }
+            return true;
+        } else if c >= ' ' && c <= '~' {
+            self.text.insert(self.cursor_pos, c);
+            self.cursor_pos += 1;
+            return true;
+        }
+        false
+    }
+}
+
+pub struct ScrollViewWidget {
+    pub bounds: Rect,
+    pub child: Box<dyn Widget>,
+    pub content_height: i32,
+    pub scroll_y: i32,
+}
+
+impl ScrollViewWidget {
+    pub fn new(child: Box<dyn Widget>, content_height: i32) -> Self {
+        Self {
+            bounds: Rect::default(),
+            child,
+            content_height,
+            scroll_y: 0,
+        }
+    }
+}
+
+impl Widget for ScrollViewWidget {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect { x, y, w, h };
+        let child_y = y - self.scroll_y;
+        self.child.layout(x, child_y, w, self.content_height.max(h));
+        self.bounds
+    }
+
+    fn paint(&self, canvas: &mut Canvas) {
+        canvas.push_clip(self.bounds);
+        self.child.paint(canvas);
+        canvas.pop_clip();
+    }
+
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        self.child.handle_mouse(mx, my, pressed)
+    }
+
+    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        let max_scroll = (self.content_height - self.bounds.h).max(0);
+        if dy < 0 {
+            self.scroll_y = (self.scroll_y + 28).min(max_scroll);
+        } else {
+            self.scroll_y = (self.scroll_y - 28).max(0);
+        }
+        self.layout(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h);
+        true
+    }
+
+    fn handle_key(&mut self, keycode: u8, mods: u8) -> bool {
+        self.child.handle_key(keycode, mods)
+    }
+
+    fn handle_char(&mut self, c: char) -> bool {
+        self.child.handle_char(c)
+    }
+}

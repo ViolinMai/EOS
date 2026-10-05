@@ -74,15 +74,12 @@ impl Widget for TextEditApp {
             if line_idx >= self.lines.len() { break; }
             if cy + line_h > editor_y + editor_h { break; }
 
-            // Line numbers in gutter
             canvas.draw_text(self.bounds.x + theme.pt(12.0), cy, &format!("{:3}", line_idx + 1), theme.text_muted, theme.font_caption());
 
-            // Text line with horizontal bounds clipping
             let clean_line = self.lines[line_idx].replace('\t', "    ");
             let text_avail_w = self.bounds.w.saturating_sub(gutter_w + theme.pt(24.0));
             canvas.draw_text_clipped(self.bounds.x + gutter_w + theme.pt(16.0), cy, text_avail_w, &clean_line, theme.text_primary, theme.font_body());
 
-            // Cursor
             if line_idx == self.cursor_row {
                 let cursor_x = self.bounds.x + gutter_w + theme.pt(16.0) + (self.cursor_col * theme.pt(9.0));
                 if cursor_x < self.bounds.x + self.bounds.w.saturating_sub(theme.pt(8.0)) {
@@ -92,7 +89,6 @@ impl Widget for TextEditApp {
             cy += line_h;
         }
 
-        // Scrollbar Track & Thumb
         if self.lines.len() > max_visible_lines && max_visible_lines > 0 {
             let track_x = self.bounds.x + self.bounds.w.saturating_sub(theme.pt(8.0));
             let thumb_h = ((max_visible_lines * editor_h) / self.lines.len()).max(theme.pt(24.0));
@@ -100,7 +96,6 @@ impl Widget for TextEditApp {
             canvas.draw_rect(track_x, thumb_y, theme.pt(6.0), thumb_h, theme.text_muted, theme.pt(3.0));
         }
 
-        // Status bar
         let sb_y = self.bounds.y + self.bounds.h.saturating_sub(status_h);
         canvas.draw_rect(self.bounds.x, sb_y, self.bounds.w, status_h, theme.bg_menubar, 0);
         canvas.draw_line_h(self.bounds.x, sb_y, self.bounds.w, theme.border_menubar);
@@ -113,13 +108,11 @@ impl Widget for TextEditApp {
 
     fn handle_char(&mut self, c: char) -> bool {
         if c == '\n' {
-            self.lines.insert(self.cursor_row + 1, String::new());
-            self.cursor_row += 1;
-            self.cursor_col = 0;
-            let theme = get_theme();
-            let visible_count = self.bounds.h.saturating_sub(theme.pt(64.0)) / theme.pt(26.0);
-            if self.cursor_row >= self.scroll_y + visible_count {
-                self.scroll_y = self.cursor_row.saturating_sub(visible_count.saturating_sub(1));
+            if self.cursor_row < self.lines.len() {
+                let remainder = self.lines[self.cursor_row].split_off(self.cursor_col);
+                self.cursor_row += 1;
+                self.lines.insert(self.cursor_row, remainder);
+                self.cursor_col = 0;
             }
             return true;
         } else if c == '\x08' {
@@ -127,16 +120,11 @@ impl Widget for TextEditApp {
                 self.lines[self.cursor_row].remove(self.cursor_col - 1);
                 self.cursor_col -= 1;
             } else if self.cursor_row > 0 {
-                let prev_len = self.lines[self.cursor_row - 1].len();
-                let curr_line = self.lines.remove(self.cursor_row);
+                let current_line = self.lines.remove(self.cursor_row);
                 self.cursor_row -= 1;
-                self.lines[self.cursor_row].push_str(&curr_line);
-                self.cursor_col = prev_len;
+                self.cursor_col = self.lines[self.cursor_row].len();
+                self.lines[self.cursor_row].push_str(&current_line);
             }
-            return true;
-        } else if c == '\t' {
-            self.lines[self.cursor_row].insert_str(self.cursor_col, "    ");
-            self.cursor_col += 4;
             return true;
         } else if c >= ' ' && c <= '~' {
             self.lines[self.cursor_row].insert(self.cursor_col, c);

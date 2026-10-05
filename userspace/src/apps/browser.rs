@@ -14,7 +14,7 @@ pub struct BrowserApp {
     input_active: bool,
     results: Vec<SearchResultItem>,
     status_text: String,
-    scroll_y: usize,
+    scroll_y: i32,
     active_sock: Option<u16>,
     loading: bool,
 }
@@ -145,14 +145,14 @@ impl Widget for BrowserApp {
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 
-    fn layout(&mut self, x: usize, y: usize, w: usize, h: usize) -> Rect {
-        self.bounds = Rect { x, y, w, h };
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect::new(x, y, w, h);
         self.bounds
     }
 
     fn paint(&self, canvas: &mut Canvas) {
         let theme = get_theme();
-        let _tb_h = theme.pt(46.0);
+        let tb_h = theme.pt(46.0);
         let status_h = theme.pt(26.0);
 
         unsafe {
@@ -162,52 +162,39 @@ impl Widget for BrowserApp {
 
         canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFFFFFFFF, 0);
 
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, _tb_h, 0xFFF1F5F9, 0);
-        canvas.draw_line_h(self.bounds.x, self.bounds.y + _tb_h, self.bounds.w, 0xFFCBD5E1);
-
-        canvas.draw_text(self.bounds.x + theme.pt(16.0), self.bounds.y + theme.pt(14.0), "G", 0xFF4285F4, theme.font_title());
-        canvas.draw_text(self.bounds.x + theme.pt(28.0), self.bounds.y + theme.pt(14.0), "o", 0xFFEA4335, theme.font_title());
-        canvas.draw_text(self.bounds.x + theme.pt(38.0), self.bounds.y + theme.pt(14.0), "o", 0xFFFBBC05, theme.font_title());
-        canvas.draw_text(self.bounds.x + theme.pt(48.0), self.bounds.y + theme.pt(14.0), "g", 0xFF4285F4, theme.font_title());
-        canvas.draw_text(self.bounds.x + theme.pt(58.0), self.bounds.y + theme.pt(14.0), "l", 0xFF34A853, theme.font_title());
-        canvas.draw_text(self.bounds.x + theme.pt(64.0), self.bounds.y + theme.pt(14.0), "e", 0xFFEA4335, theme.font_title());
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, 0xFFF1F3F4, 0);
+        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, 0xFFDADCE0);
 
         let bar_x = self.bounds.x + theme.pt(84.0);
-        let btn_w = theme.pt(70.0);
-        let bar_w = self.bounds.w.saturating_sub(theme.pt(170.0));
-        let bar_h = theme.pt(32.0);
         let bar_y = self.bounds.y + theme.pt(7.0);
+        let bar_w = (self.bounds.w - theme.pt(170.0)).max(100);
+        let bar_h = theme.pt(32.0);
 
-        canvas.draw_rect(bar_x, bar_y, bar_w, bar_h, 0xFFFFFFFF, theme.pt(16.0));
-        let border_col = if self.input_active { 0xFF4285F4 } else { 0xFFCBD5E1 };
-        canvas.draw_rect_outline(bar_x, bar_y, bar_w, bar_h, border_col, theme.pt(16.0));
+        canvas.draw_rect(bar_x, bar_y, bar_w, bar_h, 0xFFFFFFFF, theme.pt(8.0) as usize);
+        let border_col = if self.input_active { theme.accent } else { 0xFFDADCE0 };
+        canvas.draw_rect_outline(bar_x, bar_y, bar_w, bar_h, border_col, theme.pt(8.0) as usize);
 
-        let display_input = if self.url_input.is_empty() && !self.input_active {
-            "Search Google or type a URL..."
-        } else {
-            &self.url_input
-        };
-        let text_col = if self.url_input.is_empty() && !self.input_active { 0xFF94A3B8 } else { 0xFF0F172A };
-        canvas.draw_text_clipped(bar_x + theme.pt(14.0), bar_y + theme.pt(7.0), bar_w.saturating_sub(theme.pt(28.0)), display_input, text_col, theme.font_body());
+        let text_col = if self.url_input.is_empty() { 0xFF9AA0A6 } else { 0xFF202124 };
+        let display_input = if self.url_input.is_empty() { "Search Google or type a URL" } else { &self.url_input };
+        canvas.draw_text_clipped(bar_x + theme.pt(14.0), bar_y + theme.pt(7.0), bar_w - theme.pt(28.0), display_input, text_col, theme.font_body());
 
         let btn_x = bar_x + bar_w + theme.pt(10.0);
-        canvas.draw_rect(btn_x, bar_y, btn_w, bar_h, 0xFF4285F4, theme.pt(16.0));
-        canvas.draw_text(btn_x + theme.pt(14.0), bar_y + theme.pt(7.0), "Search", 0xFFFFFFFF, theme.font_body());
+        let btn_w = theme.pt(68.0);
+        canvas.draw_rect(btn_x, bar_y, btn_w, bar_h, theme.accent, theme.pt(8.0) as usize);
+        canvas.draw_text(btn_x + theme.pt(12.0), bar_y + theme.pt(7.0), "Search", 0xFFFFFFFF, theme.font_body());
 
-        let content_y = self.bounds.y + _tb_h + 1;
-        let content_h = self.bounds.h.saturating_sub(_tb_h + status_h + 1);
-        let mut cur_y = content_y + theme.pt(16.0).saturating_sub(self.scroll_y);
+        let content_y = self.bounds.y + tb_h + 1;
+        let content_h = (self.bounds.h - tb_h - status_h - 1).max(0);
+        let mut cur_y = content_y + theme.pt(16.0) - self.scroll_y;
 
         if self.loading {
-            canvas.draw_text(self.bounds.x + theme.pt(32.0), content_y + theme.pt(30.0), "🔍 Sending HTTP request & querying Google search index...", 0xFF4285F4, theme.font_title());
+            canvas.draw_text(self.bounds.x + theme.pt(32.0), content_y + theme.pt(30.0), "🔍 Sending HTTP request & querying index...", 0xFF5F6368, theme.font_body());
         } else {
             for (idx, res) in self.results.iter().enumerate() {
                 if cur_y + theme.pt(60.0) > content_y && cur_y < content_y + content_h {
-                    if !res.url.is_empty() {
-                        canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y, self.bounds.w.saturating_sub(theme.pt(64.0)), &res.url, 0xFF202124, theme.font_caption());
-                    }
-                    canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y + theme.pt(16.0), self.bounds.w.saturating_sub(theme.pt(64.0)), &format!("{}. {}", idx + 1, res.title), 0xFF1A0DAB, theme.font_title());
-                    canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y + theme.pt(40.0), self.bounds.w.saturating_sub(theme.pt(64.0)), &res.snippet, 0xFF4D5156, theme.font_body());
+                    canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y, self.bounds.w - theme.pt(64.0), &res.url, 0xFF202124, theme.font_caption());
+                    canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y + theme.pt(16.0), self.bounds.w - theme.pt(64.0), &format!("{}. {}", idx + 1, res.title), 0xFF1A0DAB, theme.font_title());
+                    canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y + theme.pt(40.0), self.bounds.w - theme.pt(64.0), &res.snippet, 0xFF4D5156, theme.font_body());
                 }
                 cur_y += theme.pt(70.0);
             }
@@ -219,40 +206,54 @@ impl Widget for BrowserApp {
         canvas.draw_text(self.bounds.x + theme.pt(16.0), sb_y + theme.pt(5.0), &self.status_text, 0xFF64748B, theme.font_caption());
     }
 
-    fn handle_mouse(&mut self, mx: usize, my: usize, pressed: bool) -> bool {
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
         if !self.bounds.contains(mx, my) { return false; }
-        if !pressed { return true; }
-
         let theme = get_theme();
         let bar_x = self.bounds.x + theme.pt(84.0);
-        let btn_w = theme.pt(70.0);
-        let bar_w = self.bounds.w.saturating_sub(theme.pt(170.0));
         let bar_h = theme.pt(32.0);
+        let bar_w = (self.bounds.w - theme.pt(170.0)).max(100);
         let bar_y = self.bounds.y + theme.pt(7.0);
         let btn_x = bar_x + bar_w + theme.pt(10.0);
+        let btn_w = theme.pt(68.0);
 
-        if mx >= bar_x && mx <= bar_x + bar_w && my >= bar_y && my <= bar_y + bar_h {
-            self.input_active = true;
-            return true;
+        if pressed {
+            if mx >= bar_x && mx <= bar_x + bar_w && my >= bar_y && my <= bar_y + bar_h {
+                self.input_active = true;
+                return true;
+            } else {
+                self.input_active = false;
+            }
+
+            if mx >= btn_x && mx <= btn_x + btn_w && my >= bar_y && my <= bar_y + bar_h {
+                self.perform_search();
+                return true;
+            }
         }
+        true
+    }
 
-        if mx >= btn_x && mx <= btn_x + btn_w && my >= bar_y && my <= bar_y + bar_h {
-            self.input_active = false;
+    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        if dy < 0 {
+            self.scroll_y = (self.scroll_y + 30).min(2000);
+        } else {
+            self.scroll_y = (self.scroll_y - 30).max(0);
+        }
+        true
+    }
+
+    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
+        if !self.input_active { return false; }
+        if keycode == 0x1C {
             self.perform_search();
             return true;
         }
-
-        self.input_active = false;
-        true
+        false
     }
 
     fn handle_char(&mut self, c: char) -> bool {
         if !self.input_active { return false; }
-        if c == '\n' {
-            self.input_active = false;
-            self.perform_search();
-            return true;
-        } else if c == '\x08' {
+        if c == '\x08' {
             self.url_input.pop();
             return true;
         } else if c >= ' ' && c <= '~' {

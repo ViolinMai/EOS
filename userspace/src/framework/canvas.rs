@@ -1,14 +1,16 @@
-use std::collections::BTreeMap;
+use crate::framework::widget::Rect;
 use rusttype::{Font, Scale, point};
-use super::widget::Rect;
+use std::collections::BTreeMap;
+
+pub type FontGlyphCache = BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>;
 
 pub struct Canvas<'a> {
     pub buffer: &'a mut [u32],
     pub width: usize,
     pub height: usize,
-    font: Option<&'a Font<'a>>,
-    cache: &'a mut BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>,
-    pub clip_rect: Option<Rect>,
+    pub font: Option<&'a Font<'a>>,
+    pub font_cache: Option<&'a mut FontGlyphCache>,
+    pub clip_stack: Vec<Rect>,
 }
 
 impl<'a> Canvas<'a> {
@@ -17,34 +19,69 @@ impl<'a> Canvas<'a> {
         width: usize,
         height: usize,
         font: Option<&'a Font<'a>>,
-        cache: &'a mut BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>,
+        font_cache: &'a mut FontGlyphCache,
     ) -> Self {
-        Self { buffer, width, height, font, cache, clip_rect: None }
+        Self {
+            buffer,
+            width,
+            height,
+            font,
+            font_cache: Some(font_cache),
+            clip_stack: Vec::new(),
+        }
     }
 
-    #[inline(always)]
-    pub fn set_clip(&mut self, clip: Option<Rect>) {
-        self.clip_rect = clip;
+    pub fn push_clip(&mut self, rect: Rect) {
+        let intersected = if let Some(current) = self.clip_stack.last() {
+            let x1 = rect.x.max(current.x);
+            let y1 = rect.y.max(current.y);
+            let x2 = (rect.x + rect.w).min(current.x + current.w);
+            let y2 = (rect.y + rect.h).min(current.y + current.h);
+            Rect {
+                x: x1,
+                y: y1,
+                w: (x2 - x1).max(0),
+                h: (y2 - y1).max(0),
+            }
+        } else {
+            rect
+        };
+        self.clip_stack.push(intersected);
+    }
+
+    pub fn pop_clip(&mut self) {
+        self.clip_stack.pop();
     }
 
     pub fn intersect_clip(&mut self, rect: Rect) {
-        if let Some(c) = self.clip_rect {
-            let x1 = c.x.max(rect.x);
-            let y1 = c.y.max(rect.y);
-            let x2 = (c.x + c.w).min(rect.x + rect.w);
-            let y2 = (c.y + c.h).min(rect.y + rect.h);
-            if x2 > x1 && y2 > y1 {
-                self.clip_rect = Some(Rect::new(x1, y1, x2 - x1, y2 - y1));
-            } else {
-                self.clip_rect = Some(Rect::new(0, 0, 0, 0));
-            }
+        self.push_clip(rect);
+    }
+
+    pub fn set_clip(&mut self, rect: Option<Rect>) {
+        self.clip_stack.clear();
+        if let Some(r) = rect {
+            self.clip_stack.push(r);
+        }
+    }
+
+    pub fn current_clip(&self) -> Option<Rect> {
+        self.clip_stack.last().copied()
+    }
+
+    #[inline(always)]
+    fn is_clipped(&self, x: i32, y: i32) -> bool {
+        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
+            return true;
+        }
+        if let Some(clip) = self.clip_stack.last() {
+            !clip.contains(x, y)
         } else {
-            self.clip_rect = Some(rect);
+            false
         }
     }
 
     #[inline(always)]
-    pub fn blend(bg: u32, fg: u32, alpha: u32) -> u32 {
+    fn blend(bg: u32, fg: u32, alpha: u32) -> u32 {
         if alpha >= 255 { return fg | 0xFF000000; }
         if alpha == 0 { return bg | 0xFF000000; }
         let inv = 255 - alpha;
@@ -53,411 +90,203 @@ impl<'a> Canvas<'a> {
         0xFF000000 | rb | g
     }
 
-    pub fn draw_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32, radius: usize) {
-        let mut sx = x;
-        let mut sy = y;
-        let mut ex = (x + w).min(self.width);
-        let mut ey = (y + h).min(self.height);
-
-        if let Some(clip) = self.clip_rect {
-            sx = sx.max(clip.x);
-            sy = sy.max(clip.y);
-            ex = ex.min(clip.x + clip.w);
-            ey = ey.min(clip.y + clip.h);
-        }
-
+    pub fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, radius: usize) {
+        let ex = (x + w).min(self.width as i32);
+        let ey = (y + h).min(self.height as i32);
+        let sx = x.max(0);
+        let sy = y.max(0);
         if sx >= ex || sy >= ey { return; }
 
-        if radius == 0 {
-            for cy in sy..ey {
-                let start = cy * self.width + sx;
-                self.buffer[start..start + (ex - sx)].fill(color);
-            }
-        } else {
-            let r_sq = (radius * radius) as isize;
-            let orig_ex = x + w;
-            let orig_ey = y + h;
-            for cy in sy..ey {
-                let is_top = cy < y + radius;
-                let is_bottom = cy >= orig_ey - radius;
-                let dy = if is_top {
-                    (y + radius - 1) as isize - cy as isize
-                } else if is_bottom {
-                    cy as isize - (orig_ey - radius) as isize
-                } else {
-                    0
-                };
+        let r = radius as i32;
+        let r_sq = r * r;
 
-                let row = cy * self.width;
-                for cx in sx..ex {
-                    let is_left = cx < x + radius;
-                    let is_right = cx >= orig_ex - radius;
+        for cy in sy..ey {
+            for cx in sx..ex {
+                if self.is_clipped(cx, cy) { continue; }
+
+                if r > 0 {
+                    let is_top = cy < y + r;
+                    let is_bottom = cy >= ey - r;
+                    let is_left = cx < x + r;
+                    let is_right = cx >= ex - r;
+
                     if (is_top || is_bottom) && (is_left || is_right) {
-                        let dx = if is_left {
-                            (x + radius - 1) as isize - cx as isize
-                        } else {
-                            cx as isize - (orig_ex - radius) as isize
-                        };
-                        if dx * dx + dy * dy >= r_sq { continue; }
+                        let dx = if is_left { (x + r) - cx - 1 } else { cx - (ex - r) };
+                        let dy = if is_top { (y + r) - cy - 1 } else { cy - (ey - r) };
+                        if dx * dx + dy * dy >= r_sq {
+                            continue;
+                        }
                     }
-                    self.buffer[row + cx] = color;
                 }
+
+                let idx = (cy as usize) * self.width + (cx as usize);
+                let alpha = (color >> 24) & 0xFF;
+                self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
             }
         }
     }
 
-    pub fn draw_rect_outline(&mut self, x: usize, y: usize, w: usize, h: usize, color: u32, radius: usize) {
-        let ex = (x + w).min(self.width);
-        let ey = (y + h).min(self.height);
-        if x >= ex || y >= ey { return; }
-
+    pub fn draw_rect_outline(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, radius: usize) {
         if radius == 0 {
             self.draw_line_h(x, y, w, color);
-            self.draw_line_h(x, ey.saturating_sub(1), w, color);
+            self.draw_line_h(x, y + h - 1, w, color);
             self.draw_line_v(x, y, h, color);
-            self.draw_line_v(ex.saturating_sub(1), y, h, color);
-            return;
-        }
+            self.draw_line_v(x + w - 1, y, h, color);
+        } else {
+            let r = radius as i32;
+            let ex = (x + w).min(self.width as i32);
+            let ey = (y + h).min(self.height as i32);
+            let sx = x.max(0);
+            let sy = y.max(0);
+            let r_sq = r * r;
+            let inner_r = (r - 1).max(0);
+            let inner_r_sq = inner_r * inner_r;
 
-        let r_sq = (radius * radius) as isize;
-        let inner_r = radius.saturating_sub(1);
-        let inner_r_sq = (inner_r * inner_r) as isize;
-
-        let mut sx = x;
-        let mut sy = y;
-        let mut clip_ex = ex;
-        let mut clip_ey = ey;
-        if let Some(clip) = self.clip_rect {
-            sx = sx.max(clip.x);
-            sy = sy.max(clip.y);
-            clip_ex = clip_ex.min(clip.x + clip.w);
-            clip_ey = clip_ey.min(clip.y + clip.h);
-        }
-
-        for cy in sy..clip_ey {
-            let is_top = cy < y + radius;
-            let is_bottom = cy >= ey - radius;
-            let dy = if is_top {
-                (y + radius - 1) as isize - cy as isize
-            } else if is_bottom {
-                cy as isize - (ey - radius) as isize
-            } else {
-                0
-            };
-
-            let row = cy * self.width;
-            for cx in sx..clip_ex {
-                let is_left = cx < x + radius;
-                let is_right = cx >= ex - radius;
-
-                if (is_top || is_bottom) && (is_left || is_right) {
-                    let dx = if is_left {
-                        (x + radius - 1) as isize - cx as isize
-                    } else {
-                        cx as isize - (ex - radius) as isize
-                    };
-                    let dist = dx * dx + dy * dy;
-                    if dist <= r_sq && dist >= inner_r_sq {
-                        self.buffer[row + cx] = color;
-                    }
-                } else if cy == y || cy == ey - 1 || cx == x || cx == ex - 1 {
-                    self.buffer[row + cx] = color;
-                }
-            }
-        }
-    }
-
-    pub fn draw_line_h(&mut self, x: usize, y: usize, w: usize, color: u32) {
-        if let Some(clip) = self.clip_rect {
-            if y < clip.y || y >= clip.y + clip.h { return; }
-        }
-        let mut sx = x;
-        let mut ex = (x + w).min(self.width);
-        if let Some(clip) = self.clip_rect {
-            sx = sx.max(clip.x);
-            ex = ex.min(clip.x + clip.w);
-        }
-        if sx < ex && y < self.height {
-            let start = y * self.width + sx;
-            self.buffer[start..start + (ex - sx)].fill(color);
-        }
-    }
-
-    pub fn draw_line_v(&mut self, x: usize, y: usize, h: usize, color: u32) {
-        if let Some(clip) = self.clip_rect {
-            if x < clip.x || x >= clip.x + clip.w { return; }
-        }
-        let mut sy = y;
-        let mut ey = (y + h).min(self.height);
-        if let Some(clip) = self.clip_rect {
-            sy = sy.max(clip.y);
-            ey = ey.min(clip.y + clip.h);
-        }
-        if x < self.width {
             for cy in sy..ey {
-                self.buffer[cy * self.width + x] = color;
-            }
-        }
-    }
+                for cx in sx..ex {
+                    if self.is_clipped(cx, cy) { continue; }
+                    let is_top = cy < y + r;
+                    let is_bottom = cy >= ey - r;
+                    let is_left = cx < x + r;
+                    let is_right = cx >= ex - r;
 
-    pub fn measure_text(&mut self, text: &str, size: usize) -> (usize, usize) {
-        if let Some(font) = self.font {
-            let scale = Scale::uniform(size as f32);
-            let v_metrics = font.v_metrics(scale);
-            let mut width = 0;
+                    let mut draw_px = false;
+                    if (is_top || is_bottom) && (is_left || is_right) {
+                        let dx = if is_left { (x + r) - cx - 1 } else { cx - (ex - r) };
+                        let dy = if is_top { (y + r) - cy - 1 } else { cy - (ey - r) };
+                        let d_sq = dx * dx + dy * dy;
+                        if d_sq < r_sq && d_sq >= inner_r_sq { draw_px = true; }
+                    } else if cx == x || cx == ex - 1 || cy == y || cy == ey - 1 {
+                        draw_px = true;
+                    }
 
-            for c in text.chars() {
-                if c == '\n' { continue; }
-                let key = (size, c);
-                if !self.cache.contains_key(&key) {
-                    let glyph = font.glyph(c).scaled(scale).positioned(point(0.0, v_metrics.ascent));
-                    let adv = glyph.unpositioned().h_metrics().advance_width.round() as usize;
-                    if let Some(bb) = glyph.pixel_bounding_box() {
-                        let mut cov = vec![0u8; bb.width() as usize * bb.height() as usize];
-                        glyph.draw(|gx, gy, v| cov[gy as usize * bb.width() as usize + gx as usize] = (v * 255.0) as u8);
-                        self.cache.insert(key, (bb.width() as usize, bb.height() as usize, bb.min.x as isize, bb.min.y as isize, adv.max(1), cov));
-                    } else {
-                        self.cache.insert(key, (0, 0, 0, 0, adv.max(size / 3), Vec::new()));
+                    if draw_px {
+                        let idx = (cy as usize) * self.width + (cx as usize);
+                        let alpha = (color >> 24) & 0xFF;
+                        self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
                     }
                 }
-                let (_, _, _, _, adv, _) = self.cache.get(&key).unwrap();
-                width += *adv;
             }
-            (width, size)
-        } else {
-            let scale = (size.max(8)) / 8;
-            (text.len() * 8 * scale, 16 * scale)
         }
     }
 
-    pub fn draw_text(&mut self, x: usize, y: usize, text: &str, color: u32, size: usize) {
-        let (clip_min_x, clip_min_y, clip_max_x, clip_max_y) = if let Some(c) = self.clip_rect {
-            (c.x, c.y, c.x + c.w, c.y + c.h)
+    pub fn draw_line_h(&mut self, x: i32, y: i32, w: i32, color: u32) {
+        let ex = (x + w).min(self.width as i32);
+        let sx = x.max(0);
+        if y < 0 || y >= self.height as i32 || sx >= ex { return; }
+        for cx in sx..ex {
+            if !self.is_clipped(cx, y) {
+                let idx = (y as usize) * self.width + (cx as usize);
+                let alpha = (color >> 24) & 0xFF;
+                self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
+            }
+        }
+    }
+
+    pub fn draw_line_v(&mut self, x: i32, y: i32, h: i32, color: u32) {
+        let ey = (y + h).min(self.height as i32);
+        let sy = y.max(0);
+        if x < 0 || x >= self.width as i32 || sy >= ey { return; }
+        for cy in sy..ey {
+            if !self.is_clipped(x, cy) {
+                let idx = (cy as usize) * self.width + (x as usize);
+                let alpha = (color >> 24) & 0xFF;
+                self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
+            }
+        }
+    }
+
+    pub fn measure_text(&self, text: &str, size_px: usize) -> (usize, usize) {
+        if let Some(font) = self.font {
+            let scale = Scale::uniform(size_px as f32);
+            let v_metrics = font.v_metrics(scale);
+            let h = (v_metrics.ascent - v_metrics.descent).ceil() as usize;
+            let mut w = 0.0;
+            for c in text.chars() {
+                let g = font.glyph(c).scaled(scale);
+                w += g.h_metrics().advance_width;
+            }
+            (w.ceil() as usize, h.max(size_px))
         } else {
-            (0, 0, self.width, self.height)
+            (text.chars().count() * ((size_px * 6) / 10), size_px)
+        }
+    }
+
+    pub fn draw_text(&mut self, x: i32, y: i32, text: &str, color: u32, size_px: usize) {
+        let font = match self.font {
+            Some(f) => f,
+            None => return,
         };
 
-        if let Some(font) = self.font {
-            let scale = Scale::uniform(size as f32);
-            let v_metrics = font.v_metrics(scale);
-            let mut cur_x = x;
+        let scale = Scale::uniform(size_px as f32);
+        let v_metrics = font.v_metrics(scale);
+        let mut cur_x = x as f32;
 
-            for c in text.chars() {
-                if c == '\n' { cur_x = x; continue; }
-                let key = (size, c);
-                if !self.cache.contains_key(&key) {
-                    let glyph = font.glyph(c).scaled(scale).positioned(point(0.0, v_metrics.ascent));
-                    let adv = glyph.unpositioned().h_metrics().advance_width.round() as usize;
-                    if let Some(bb) = glyph.pixel_bounding_box() {
-                        let mut cov = vec![0u8; bb.width() as usize * bb.height() as usize];
-                        glyph.draw(|gx, gy, v| cov[gy as usize * bb.width() as usize + gx as usize] = (v * 255.0) as u8);
-                        self.cache.insert(key, (bb.width() as usize, bb.height() as usize, bb.min.x as isize, bb.min.y as isize, adv.max(1), cov));
-                    } else {
-                        self.cache.insert(key, (0, 0, 0, 0, adv.max(size / 3), Vec::new()));
-                    }
-                }
-                let (gw, gh, bx, by, adv, cov) = self.cache.get(&key).unwrap();
-                let gx = (cur_x as isize + bx).max(0) as usize;
-                let gy = (y as isize + by).max(0) as usize;
-
-                for row in 0..*gh {
-                    let py = gy + row;
-                    if py >= clip_max_y { break; }
-                    if py < clip_min_y || py >= self.height { continue; }
-                    let fb_row = py * self.width;
-                    for col in 0..*gw {
-                        let px = gx + col;
-                        if px >= clip_max_x { break; }
-                        if px < clip_min_x || px >= self.width { continue; }
-                        let alpha = cov[row * gw + col] as u32;
+        for c in text.chars() {
+            if c == '\n' { continue; }
+            let glyph = font.glyph(c).scaled(scale).positioned(point(cur_x, y as f32 + v_metrics.ascent));
+            if let Some(bb) = glyph.pixel_bounding_box() {
+                glyph.draw(|gx, gy, v| {
+                    let px = bb.min.x + gx as i32;
+                    let py = bb.min.y + gy as i32;
+                    if !self.is_clipped(px, py) {
+                        let alpha = ((v * 255.0) as u32).min(255);
                         if alpha > 0 {
-                            let idx = fb_row + px;
+                            let idx = (py as usize) * self.width + (px as usize);
                             self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
                         }
                     }
-                }
-                cur_x += adv;
+                });
             }
-        } else {
-            let scale = (size.max(8)) / 8;
-            let mut cur_x = x;
-
-            for c in text.chars() {
-                if c == '\n' { cur_x = x; continue; }
-                let glyph = get_fallback_glyph(c);
-                for gy in 0..16 {
-                    let byte = glyph[gy];
-                    for gx in 0..8 {
-                        if (byte & (1 << (7 - gx))) != 0 {
-                            for sy in 0..scale {
-                                let py = y + gy * scale + sy;
-                                if py < clip_min_y || py >= clip_max_y || py >= self.height { continue; }
-                                for sx in 0..scale {
-                                    let px = cur_x + gx * scale + sx;
-                                    if px < clip_min_x || px >= clip_max_x || px >= self.width { continue; }
-                                    self.buffer[py * self.width + px] = color;
-                                }
-                            }
-                        }
-                    }
-                }
-                cur_x += 8 * scale;
-            }
+            cur_x += glyph.unpositioned().h_metrics().advance_width;
         }
     }
 
-    pub fn draw_text_clipped(&mut self, x: usize, y: usize, max_w: usize, text: &str, color: u32, size: usize) {
-        let (full_w, _) = self.measure_text(text, size);
-        if full_w <= max_w {
-            self.draw_text(x, y, text, color, size);
-            return;
-        }
-
-        let (dots_w, _) = self.measure_text("...", size);
-        if max_w <= dots_w {
-            self.draw_text(x, y, ".", color, size);
-            return;
-        }
-
-        let avail_w = max_w - dots_w;
-        let mut cur_w = 0;
-        let mut end_idx = 0;
-
-        for (i, c) in text.char_indices() {
-            let (cw, _) = self.measure_text(&c.to_string(), size);
-            if cur_w + cw > avail_w { break; }
-            cur_w += cw;
-            end_idx = i + c.len_utf8();
-        }
-
-        let truncated = format!("{}...", &text[..end_idx]);
-        self.draw_text(x, y, &truncated, color, size);
+    pub fn draw_text_clipped(&mut self, x: i32, y: i32, max_w: i32, text: &str, color: u32, size_px: usize) {
+        if max_w <= 0 { return; }
+        let clip_rect = Rect { x, y, w: max_w, h: (size_px + 8) as i32 };
+        self.push_clip(clip_rect);
+        self.draw_text(x, y, text, color, size_px);
+        self.pop_clip();
     }
 
-    pub fn draw_text_wrapped(&mut self, x: usize, y: usize, max_w: usize, line_height: usize, text: &str, color: u32, size: usize) -> usize {
-        let mut cur_y = y;
-        let mut line_buf = String::new();
-        let mut line_w = 0;
+    /// مؤشر ماوس لينكس الكلاسيكي (X11 / Breeze / DMZ-White)
+    pub fn draw_linux_cursor(&mut self, mx: i32, my: i32) {
+        // 0: شفاف, 1: حد أسود كلاسيكي, 2: جسم أبيض ناصع
+        #[rustfmt::skip]
+        const LINUX_CURSOR_BITMAP: [[u8; 11]; 16] = [
+            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+            [1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0],
+            [1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0],
+            [1, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0],
+            [1, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0],
+            [1, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0],
+            [1, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0],
+            [1, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0],
+            [1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0],
+            [1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1],
+            [1, 2, 2, 1, 2, 2, 1, 0, 0, 0, 0],
+            [1, 2, 1, 0, 1, 2, 2, 1, 0, 0, 0],
+            [1, 1, 0, 0, 0, 1, 2, 2, 1, 0, 0],
+            [1, 0, 0, 0, 0, 0, 1, 2, 1, 0, 0],
+            [0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0],
+        ];
 
-        for word in text.split_whitespace() {
-            let (word_w, _) = self.measure_text(word, size);
-            let (space_w, _) = self.measure_text(" ", size);
-
-            if line_w + word_w + space_w > max_w && !line_buf.is_empty() {
-                self.draw_text(x, cur_y, &line_buf, color, size);
-                cur_y += line_height;
-                line_buf.clear();
-                line_w = 0;
+        for (r, row) in LINUX_CURSOR_BITMAP.iter().enumerate() {
+            let py = my + r as i32;
+            if py < 0 || py >= self.height as i32 { continue; }
+            for (c, &val) in row.iter().enumerate() {
+                let px = mx + c as i32;
+                if px < 0 || px >= self.width as i32 { continue; }
+                let color = match val {
+                    1 => 0xFF000000, // حد أسود حاد ومحدد
+                    2 => 0xFFFFFFFF, // أبيض ناصع
+                    _ => continue,
+                };
+                let idx = (py as usize) * self.width + (px as usize);
+                self.buffer[idx] = color;
             }
-
-            if !line_buf.is_empty() {
-                line_buf.push(' ');
-                line_w += space_w;
-            }
-            line_buf.push_str(word);
-            line_w += word_w;
         }
-
-        if !line_buf.is_empty() {
-            self.draw_text(x, cur_y, &line_buf, color, size);
-            cur_y += line_height;
-        }
-
-        cur_y.saturating_sub(y)
-    }
-}
-
-pub fn get_fallback_glyph(c: char) -> [u8; 16] {
-    match c {
-        ' ' => [0; 16],
-        '!' => [0, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0, 0, 0x18, 0x18, 0, 0, 0, 0],
-        '"' => [0, 0x66, 0x66, 0x66, 0x24, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        '#' => [0, 0x24, 0x24, 0x7E, 0x24, 0x24, 0x7E, 0x24, 0x24, 0, 0, 0, 0, 0, 0, 0],
-        '$' => [0, 0x18, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0x18, 0x18, 0, 0, 0, 0, 0, 0, 0],
-        '%' => [0, 0x62, 0x64, 0x08, 0x10, 0x20, 0x26, 0x46, 0, 0, 0, 0, 0, 0, 0, 0],
-        '&' => [0, 0x38, 0x6C, 0x38, 0x76, 0xCE, 0xCE, 0x7B, 0, 0, 0, 0, 0, 0, 0, 0],
-        '\'' => [0, 0x18, 0x18, 0x10, 0x08, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        '(' => [0, 0x0C, 0x18, 0x30, 0x30, 0x30, 0x30, 0x18, 0x0C, 0, 0, 0, 0, 0, 0, 0],
-        ')' => [0, 0x30, 0x18, 0x0C, 0x0C, 0x0C, 0x0C, 0x18, 0x30, 0, 0, 0, 0, 0, 0, 0],
-        '*' => [0, 0, 0x66, 0x3C, 0xFF, 0x3C, 0x66, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        '+' => [0, 0, 0x18, 0x18, 0x7E, 0x18, 0x18, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        ',' => [0, 0, 0, 0, 0, 0, 0, 0x18, 0x18, 0x10, 0x08, 0, 0, 0, 0, 0],
-        '-' => [0, 0, 0, 0, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        '.' => [0, 0, 0, 0, 0, 0, 0, 0x18, 0x18, 0, 0, 0, 0, 0, 0, 0],
-        '/' => [0, 0x02, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x40, 0, 0, 0, 0, 0, 0, 0, 0],
-        '0' => [0, 0x3C, 0x66, 0x6E, 0x76, 0x66, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        '1' => [0, 0x18, 0x38, 0x18, 0x18, 0x18, 0x18, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0],
-        '2' => [0, 0x3C, 0x66, 0x06, 0x0C, 0x18, 0x30, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0],
-        '3' => [0, 0x3C, 0x66, 0x06, 0x1C, 0x06, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        '4' => [0, 0x0C, 0x1C, 0x34, 0x64, 0x7E, 0x04, 0x04, 0, 0, 0, 0, 0, 0, 0, 0],
-        '5' => [0, 0x7E, 0x60, 0x7C, 0x06, 0x06, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        '6' => [0, 0x1C, 0x30, 0x60, 0x7C, 0x66, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        '7' => [0, 0x7E, 0x06, 0x0C, 0x18, 0x30, 0x30, 0x30, 0, 0, 0, 0, 0, 0, 0, 0],
-        '8' => [0, 0x3C, 0x66, 0x66, 0x3C, 0x66, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        '9' => [0, 0x3C, 0x66, 0x66, 0x3E, 0x06, 0x0C, 0x38, 0, 0, 0, 0, 0, 0, 0, 0],
-        ':' => [0, 0, 0x18, 0x18, 0, 0, 0x18, 0x18, 0, 0, 0, 0, 0, 0, 0, 0],
-        ';' => [0, 0, 0x18, 0x18, 0, 0, 0x18, 0x18, 0x10, 0x08, 0, 0, 0, 0, 0, 0],
-        '<' => [0, 0x0C, 0x18, 0x30, 0x60, 0x30, 0x18, 0x0C, 0, 0, 0, 0, 0, 0, 0, 0],
-        '=' => [0, 0, 0x7E, 0, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        '>' => [0, 0x30, 0x18, 0x0C, 0x06, 0x0C, 0x18, 0x30, 0, 0, 0, 0, 0, 0, 0, 0],
-        '?' => [0, 0x3C, 0x66, 0x0C, 0x18, 0x18, 0, 0x18, 0, 0, 0, 0, 0, 0, 0, 0],
-        '@' => [0, 0x3C, 0x66, 0x6E, 0x6A, 0x6E, 0x60, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'A' => [0, 0x18, 0x3C, 0x66, 0x66, 0x7E, 0x66, 0x66, 0, 0, 0, 0, 0, 0, 0, 0],
-        'B' => [0, 0x7C, 0x66, 0x66, 0x7C, 0x66, 0x66, 0x7C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'C' => [0, 0x3C, 0x66, 0x60, 0x60, 0x60, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'D' => [0, 0x78, 0x6C, 0x66, 0x66, 0x66, 0x6C, 0x78, 0, 0, 0, 0, 0, 0, 0, 0],
-        'E' => [0, 0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0],
-        'F' => [0, 0x7E, 0x60, 0x60, 0x7C, 0x60, 0x60, 0x60, 0, 0, 0, 0, 0, 0, 0, 0],
-        'G' => [0, 0x3C, 0x66, 0x60, 0x6E, 0x66, 0x66, 0x3E, 0, 0, 0, 0, 0, 0, 0, 0],
-        'H' => [0, 0x66, 0x66, 0x66, 0x7E, 0x66, 0x66, 0x66, 0, 0, 0, 0, 0, 0, 0, 0],
-        'I' => [0, 0x3C, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'J' => [0, 0x0E, 0x06, 0x06, 0x06, 0x06, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'K' => [0, 0x66, 0x6C, 0x78, 0x70, 0x78, 0x6C, 0x66, 0, 0, 0, 0, 0, 0, 0, 0],
-        'L' => [0, 0x60, 0x60, 0x60, 0x60, 0x60, 0x60, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0],
-        'M' => [0, 0x63, 0x77, 0x7F, 0x6B, 0x63, 0x63, 0x63, 0, 0, 0, 0, 0, 0, 0, 0],
-        'N' => [0, 0x66, 0x76, 0x7E, 0x7E, 0x6E, 0x66, 0x66, 0, 0, 0, 0, 0, 0, 0, 0],
-        'O' => [0, 0x3C, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'P' => [0, 0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0x60, 0, 0, 0, 0, 0, 0, 0, 0],
-        'Q' => [0, 0x3C, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x0E, 0x01, 0, 0, 0, 0, 0, 0, 0],
-        'R' => [0, 0x7C, 0x66, 0x66, 0x7C, 0x6C, 0x66, 0x66, 0, 0, 0, 0, 0, 0, 0, 0],
-        'S' => [0, 0x3C, 0x66, 0x60, 0x3C, 0x06, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'T' => [0, 0x7E, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0, 0, 0, 0, 0, 0, 0, 0],
-        'U' => [0, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'V' => [0, 0x66, 0x66, 0x66, 0x66, 0x66, 0x3C, 0x18, 0, 0, 0, 0, 0, 0, 0, 0],
-        'W' => [0, 0x63, 0x63, 0x63, 0x6B, 0x7F, 0x77, 0x63, 0, 0, 0, 0, 0, 0, 0, 0],
-        'X' => [0, 0x66, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0x66, 0, 0, 0, 0, 0, 0, 0, 0],
-        'Y' => [0, 0x66, 0x66, 0x66, 0x3C, 0x18, 0x18, 0x18, 0, 0, 0, 0, 0, 0, 0, 0],
-        'Z' => [0, 0x7E, 0x06, 0x0C, 0x18, 0x30, 0x60, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0],
-        'a' => [0, 0, 0, 0x3C, 0x06, 0x3E, 0x66, 0x3E, 0, 0, 0, 0, 0, 0, 0, 0],
-        'b' => [0, 0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x7C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'c' => [0, 0, 0, 0x3C, 0x66, 0x60, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'd' => [0, 0x06, 0x06, 0x3E, 0x66, 0x66, 0x66, 0x3E, 0, 0, 0, 0, 0, 0, 0, 0],
-        'e' => [0, 0, 0, 0x3C, 0x66, 0x7E, 0x60, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'f' => [0, 0x1C, 0x30, 0x7C, 0x30, 0x30, 0x30, 0x30, 0, 0, 0, 0, 0, 0, 0, 0],
-        'g' => [0, 0, 0, 0x3E, 0x66, 0x66, 0x3E, 0x06, 0x3C, 0, 0, 0, 0, 0, 0, 0],
-        'h' => [0, 0x60, 0x60, 0x7C, 0x66, 0x66, 0x66, 0x66, 0, 0, 0, 0, 0, 0, 0, 0],
-        'i' => [0, 0x18, 0, 0x38, 0x18, 0x18, 0x18, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'j' => [0, 0x0C, 0, 0x1C, 0x0C, 0x0C, 0x0C, 0x6C, 0x38, 0, 0, 0, 0, 0, 0, 0],
-        'k' => [0, 0x60, 0x60, 0x66, 0x6C, 0x78, 0x6C, 0x66, 0, 0, 0, 0, 0, 0, 0, 0],
-        'l' => [0, 0x38, 0x18, 0x18, 0x18, 0x18, 0x18, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'm' => [0, 0, 0, 0x76, 0x7F, 0x6B, 0x6B, 0x6B, 0, 0, 0, 0, 0, 0, 0, 0],
-        'n' => [0, 0, 0, 0x7C, 0x66, 0x66, 0x66, 0x66, 0, 0, 0, 0, 0, 0, 0, 0],
-        'o' => [0, 0, 0, 0x3C, 0x66, 0x66, 0x66, 0x3C, 0, 0, 0, 0, 0, 0, 0, 0],
-        'p' => [0, 0, 0, 0x7C, 0x66, 0x66, 0x7C, 0x60, 0x60, 0, 0, 0, 0, 0, 0, 0],
-        'q' => [0, 0, 0, 0x3E, 0x66, 0x66, 0x3E, 0x06, 0x06, 0, 0, 0, 0, 0, 0, 0],
-        'r' => [0, 0, 0, 0x5C, 0x66, 0x60, 0x60, 0x60, 0, 0, 0, 0, 0, 0, 0, 0],
-        's' => [0, 0, 0, 0x3E, 0x60, 0x3C, 0x06, 0x7C, 0, 0, 0, 0, 0, 0, 0, 0],
-        't' => [0, 0x10, 0x30, 0x7C, 0x30, 0x30, 0x34, 0x18, 0, 0, 0, 0, 0, 0, 0, 0],
-        'u' => [0, 0, 0, 0x66, 0x66, 0x66, 0x66, 0x3E, 0, 0, 0, 0, 0, 0, 0, 0],
-        'v' => [0, 0, 0, 0x66, 0x66, 0x66, 0x3C, 0x18, 0, 0, 0, 0, 0, 0, 0, 0],
-        'w' => [0, 0, 0, 0x63, 0x63, 0x6B, 0x7F, 0x36, 0, 0, 0, 0, 0, 0, 0, 0],
-        'x' => [0, 0, 0, 0x66, 0x3C, 0x18, 0x3C, 0x66, 0, 0, 0, 0, 0, 0, 0, 0],
-        'y' => [0, 0, 0, 0x66, 0x66, 0x66, 0x3E, 0x06, 0x3C, 0, 0, 0, 0, 0, 0, 0],
-        'z' => [0, 0, 0, 0x7E, 0x0C, 0x18, 0x30, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0],
-        '{' => [0, 0x0E, 0x18, 0x18, 0x70, 0x18, 0x18, 0x0E, 0, 0, 0, 0, 0, 0, 0, 0],
-        '|' => [0, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0x18, 0, 0, 0, 0, 0, 0, 0, 0],
-        '}' => [0, 0x70, 0x18, 0x18, 0x0E, 0x18, 0x18, 0x70, 0, 0, 0, 0, 0, 0, 0, 0],
-        '~' => [0, 0x3B, 0x6E, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-        _   => [0, 0x7E, 0x42, 0x42, 0x42, 0x42, 0x42, 0x7E, 0, 0, 0, 0, 0, 0, 0, 0],
     }
 }

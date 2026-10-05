@@ -23,18 +23,36 @@ pub mod window {
         }
     }
 
-    pub fn poll_event() -> Option<[u64; 2]> {
+    pub fn poll_event() -> Option<[u64; 3]> {
         let type_val: u64;
-        let data_val: u64;
+        let data1: u64;
+        let data2: u64;
         unsafe {
             asm!(
                 "syscall",
                 inout("rax") 503u64 => type_val,
-                out("rdi") data_val,
+                out("rdi") data1,
+                out("rsi") data2,
                 out("rcx") _, out("r11") _
             );
         }
-        if type_val == 0 { None } else { Some([type_val, data_val]) }
+        if type_val == 0 { None } else { Some([type_val, data1, data2]) }
+    }
+
+    pub fn wait_event(timeout_ms: u64) -> Option<[u64; 3]> {
+        let type_val: u64;
+        let data1: u64;
+        let data2: u64;
+        unsafe {
+            asm!(
+                "syscall",
+                inout("rax") 505u64 => type_val,
+                inout("rdi") timeout_ms => data1,
+                out("rsi") data2,
+                out("rcx") _, out("r11") _
+            );
+        }
+        if type_val == 0 { None } else { Some([type_val, data1, data2]) }
     }
 }
 

@@ -1,640 +1,503 @@
-### FILE: userspace/src/framework/theme.rs
-use std::sync::atomic::{AtomicU32, Ordering};
-
-pub struct Theme {
-    pub scale: f32,
-    pub bg_desktop: u32,
-    pub bg_menubar: u32,
-    pub border_menubar: u32,
-    pub bg_dock: u32,
-    pub border_dock: u32,
-    pub bg_window: u32,
-    pub border_window: u32,
-    pub bg_titlebar: u32,
-    pub border_titlebar: u32,
-    pub separator: u32,
-    pub text_primary: u32,
-    pub text_secondary: u32,
-    pub text_muted: u32,
-    pub accent: u32,
-    pub accent_hover: u32,
-    pub btn_close: u32,
-    pub btn_min: u32,
-    pub btn_max: u32,
-    pub radius_window: usize,
-    pub radius_dock: usize,
-}
-
-impl Theme {
-    #[inline(always)]
-    pub fn pt(&self, val: f32) -> usize {
-        (val * self.scale).round() as usize
-    }
-
-    pub fn font_caption(&self) -> usize { self.pt(12.0) }
-    pub fn font_body(&self) -> usize { self.pt(14.0) }
-    pub fn font_title(&self) -> usize { self.pt(16.0) }
-    pub fn font_large(&self) -> usize { self.pt(20.0) }
-}
-
-static CURRENT_SCALE_BITS: AtomicU32 = AtomicU32::new(0x3FE00000); // 1.75f32
-
-pub fn set_theme_scale(scale: f32) {
-    CURRENT_SCALE_BITS.store(scale.to_bits(), Ordering::Relaxed);
-}
-
-pub fn get_theme() -> Theme {
-    let scale = f32::from_bits(CURRENT_SCALE_BITS.load(Ordering::Relaxed));
-    let s_pt = |v: f32| (v * scale).round() as usize;
-
-    Theme {
-        scale,
-        bg_desktop: 0xFF0F172A,
-        bg_menubar: 0xF018181B,
-        border_menubar: 0x25FFFFFF,
-        bg_dock: 0xE01E293B,
-        border_dock: 0x30FFFFFF,
-        bg_window: 0xFF18181B,
-        border_window: 0xFF334155,
-        bg_titlebar: 0xFF27272A,
-        border_titlebar: 0xFF3F3F46,
-        separator: 0xFF3F3F46,
-        text_primary: 0xFFF8FAFC,
-        text_secondary: 0xFFCBD5E1,
-        text_muted: 0xFF94A3B8,
-        accent: 0xFF0284C7,
-        accent_hover: 0xFF38BDF8,
-        btn_close: 0xFFFF5F56,
-        btn_min: 0xFFFFBD2E,
-        btn_max: 0xFF27C93F,
-        radius_window: s_pt(12.0),
-        radius_dock: s_pt(20.0),
-    }
-}
-### END
-
-### FILE: userspace/src/framework/widget.rs
-use std::any::Any;
-use super::canvas::Canvas;
-use super::theme::get_theme;
-use crate::f_info;
-
-#[derive(Clone, Copy, Default, Debug)]
-pub struct Rect {
-    pub x: usize,
-    pub y: usize,
-    pub w: usize,
-    pub h: usize,
-}
-
-impl Rect {
-    pub fn new(x: usize, y: usize, w: usize, h: usize) -> Self { Self { x, y, w, h } }
-    #[inline(always)]
-    pub fn contains(&self, px: usize, py: usize) -> bool {
-        px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
-    }
-}
-
-pub trait Widget: Any {
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-    fn layout(&mut self, x: usize, y: usize, w: usize, h: usize) -> Rect;
-    fn paint(&self, canvas: &mut Canvas);
-    fn handle_mouse(&mut self, _mx: usize, _my: usize, _pressed: bool) -> bool { false }
-    fn handle_char(&mut self, _c: char) -> bool { false }
-}
-
-#[derive(PartialEq, Eq, Clone, Copy)]
-pub enum ResizeEdge {
-    None,
-    Right,
-    Bottom,
-    BottomRight,
-}
-
-pub struct WindowFrame {
-    pub title: String,
-    pub bounds: Rect,
-    pub is_dragging: bool,
-    pub is_resizing: ResizeEdge,
-    pub drag_offset_x: usize,
-    pub drag_offset_y: usize,
-    pub is_closed: bool,
-    pub content: Box<dyn Widget>,
-}
-
-impl WindowFrame {
-    pub fn new(title: impl Into<String>, x: usize, y: usize, w: usize, h: usize, mut content: Box<dyn Widget>) -> Self {
-        let theme = get_theme();
-        let tb_h = theme.pt(36.0);
-        content.layout(x, y + tb_h, w, h.saturating_sub(tb_h));
-
-        Self {
-            title: title.into(),
-            bounds: Rect::new(x, y, w, h),
-            is_dragging: false,
-            is_resizing: ResizeEdge::None,
-            drag_offset_x: 0,
-            drag_offset_y: 0,
-            is_closed: false,
-            content,
-        }
-    }
-}
-
-impl Widget for WindowFrame {
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
-
-    fn layout(&mut self, x: usize, y: usize, w: usize, h: usize) -> Rect {
-        self.bounds = Rect::new(x, y, w, h);
-        let theme = get_theme();
-        let tb_h = theme.pt(36.0);
-        self.content.layout(x, y + tb_h, w, h.saturating_sub(tb_h));
-        self.bounds
-    }
-
-    fn paint(&self, canvas: &mut Canvas) {
-        if self.is_closed { return; }
-        let theme = get_theme();
-        let tb_h = theme.pt(36.0);
-        let r = theme.radius_window;
-
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, r);
-        canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.border_window, r);
-
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, r);
-        canvas.draw_rect(self.bounds.x, self.bounds.y + tb_h.saturating_sub(r), self.bounds.w, r, theme.bg_titlebar, 0);
-        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
-
-        let btn_sz = theme.pt(15.0);
-        let btn_y = self.bounds.y + (tb_h.saturating_sub(btn_sz) / 2);
-        let btn_rad = btn_sz / 2;
-
-        let c_x = self.bounds.x + theme.pt(16.0);
-        let m_x = c_x + btn_sz + theme.pt(8.0);
-        let x_x = m_x + btn_sz + theme.pt(8.0);
-
-        canvas.draw_rect(c_x, btn_y, btn_sz, btn_sz, theme.btn_close, btn_rad);
-        canvas.draw_rect(m_x, btn_y, btn_sz, btn_sz, theme.btn_min, btn_rad);
-        canvas.draw_rect(x_x, btn_y, btn_sz, btn_sz, theme.btn_max, btn_rad);
-
-        let (tw, _) = canvas.measure_text(&self.title, theme.font_title());
-        let tx = self.bounds.x + (self.bounds.w.saturating_sub(tw) / 2).max(theme.pt(80.0));
-        let ty = self.bounds.y + (tb_h.saturating_sub(theme.font_title()) / 2);
-        canvas.draw_text_clipped(tx, ty, self.bounds.w.saturating_sub(theme.pt(160.0)), &self.title, theme.text_primary, theme.font_title());
-
-        let old_clip = canvas.clip_rect;
-        let content_rect = Rect::new(
-            self.bounds.x + 1,
-            self.bounds.y + tb_h + 1,
-            self.bounds.w.saturating_sub(2),
-            self.bounds.h.saturating_sub(tb_h + 2),
-        );
-        canvas.intersect_clip(content_rect);
-        self.content.paint(canvas);
-        canvas.set_clip(old_clip);
-
-        let grip_sz = theme.pt(8.0);
-        let gx = self.bounds.x + self.bounds.w.saturating_sub(grip_sz + 2);
-        let gy = self.bounds.y + self.bounds.h.saturating_sub(grip_sz + 2);
-        canvas.draw_rect(gx, gy, grip_sz, 2, theme.text_muted, 0);
-        canvas.draw_rect(gx + 3, gy + 3, grip_sz - 3, 2, theme.text_muted, 0);
-    }
-
-    fn handle_mouse(&mut self, mx: usize, my: usize, pressed: bool) -> bool {
-        if self.is_closed { return false; }
-
-        if self.is_dragging {
-            if !pressed {
-                self.is_dragging = false;
-            } else {
-                let nx = mx.saturating_sub(self.drag_offset_x);
-                let ny = my.saturating_sub(self.drag_offset_y);
-                self.layout(nx, ny, self.bounds.w, self.bounds.h);
-            }
-            return true;
-        }
-
-        if self.is_resizing != ResizeEdge::None {
-            if !pressed {
-                self.is_resizing = ResizeEdge::None;
-                f_info!("WINDOW", "Window '{}' resize finished ({}x{}).", self.title, self.bounds.w, self.bounds.h);
-            } else {
-                let theme = get_theme();
-                let min_w = theme.pt(320.0);
-                let min_h = theme.pt(200.0);
-                match self.is_resizing {
-                    ResizeEdge::BottomRight => {
-                        let nw = (mx.saturating_sub(self.bounds.x)).max(min_w);
-                        let nh = (my.saturating_sub(self.bounds.y)).max(min_h);
-                        self.layout(self.bounds.x, self.bounds.y, nw, nh);
-                    }
-                    ResizeEdge::Right => {
-                        let nw = (mx.saturating_sub(self.bounds.x)).max(min_w);
-                        self.layout(self.bounds.x, self.bounds.y, nw, self.bounds.h);
-                    }
-                    ResizeEdge::Bottom => {
-                        let nh = (my.saturating_sub(self.bounds.y)).max(min_h);
-                        self.layout(self.bounds.x, self.bounds.y, self.bounds.w, nh);
-                    }
-                    ResizeEdge::None => {}
-                }
-            }
-            return true;
-        }
-
-        if !self.bounds.contains(mx, my) { return false; }
-
-        let theme = get_theme();
-        let tb_h = theme.pt(36.0);
-        let resize_margin = theme.pt(12.0);
-
-        if pressed {
-            let on_right = mx >= self.bounds.x + self.bounds.w.saturating_sub(resize_margin);
-            let on_bottom = my >= self.bounds.y + self.bounds.h.saturating_sub(resize_margin);
-            if on_right && on_bottom {
-                self.is_resizing = ResizeEdge::BottomRight;
-                return true;
-            } else if on_right {
-                self.is_resizing = ResizeEdge::Right;
-                return true;
-            } else if on_bottom {
-                self.is_resizing = ResizeEdge::Bottom;
-                return true;
-            }
-        }
-
-        if my < self.bounds.y + tb_h {
-            let close_hitbox = Rect::new(self.bounds.x + theme.pt(8.0), self.bounds.y, theme.pt(30.0), tb_h);
-            let min_hitbox   = Rect::new(self.bounds.x + theme.pt(38.0), self.bounds.y, theme.pt(28.0), tb_h);
-
-            if pressed && close_hitbox.contains(mx, my) {
-                f_info!("WINDOW", "Window '{}' closed via button.", self.title);
-                self.is_closed = true;
-                return true;
-            }
-
-            if pressed && min_hitbox.contains(mx, my) {
-                f_info!("WINDOW", "Window '{}' minimized.", self.title);
-                self.is_closed = true;
-                return true;
-            }
-
-            if pressed {
-                self.is_dragging = true;
-                self.drag_offset_x = mx.saturating_sub(self.bounds.x);
-                self.drag_offset_y = my.saturating_sub(self.bounds.y);
-            }
-            return true;
-        }
-
-        let _ = self.content.handle_mouse(mx, my, pressed);
-        true
-    }
-
-    fn handle_char(&mut self, c: char) -> bool {
-        if self.is_closed { return false; }
-        self.content.handle_char(c)
-    }
-}
-### END
-
 ### FILE: userspace/src/framework/app.rs
 use std::collections::BTreeMap;
 use rusttype::Font;
-
-use super::canvas::Canvas;
-use super::widget::{Widget, WindowFrame, Rect};
-use super::theme::{get_theme, set_theme_scale};
-use super::menu::MenuBar;
-use crate::apps::{FinderApp, TerminalApp, SettingsApp, TextEditApp, ActivityMonitorApp, PreviewApp, BrowserApp};
-use crate::{sdk, f_info, f_warn};
+use crate::framework::canvas::Canvas;
+use crate::framework::menu::MenuBar;
+use crate::framework::theme::{get_theme, set_theme_scale};
+use crate::framework::widget::{Widget, WindowFrame, Rect};
+use crate::framework::layout::ContainerWidget;
+use crate::apps::finder::FinderApp;
+use crate::apps::settings::SettingsApp;
+use crate::apps::terminal::TerminalApp;
+use crate::apps::activity_monitor::ActivityMonitorApp;
+use crate::apps::textedit::TextEditApp;
+use crate::apps::browser::BrowserApp;
+use crate::apps::preview::PreviewApp;
+use crate::syscall::{sys_present, sys_wait_event, sys_poll_event};
 
 pub struct FrameworkApp<'a> {
+    pub buffer: Vec<u32>,
     pub width: usize,
     pub height: usize,
-    pub buffer: Vec<u32>,
-    font: Option<Font<'a>>,
-    font_cache: BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>,
+    pub font: Option<Font<'a>>,
+    pub font_cache: BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>,
     pub root_widgets: Vec<Box<dyn Widget>>,
-    pub mouse_x: usize,
-    pub mouse_y: usize,
-    pub mouse_clicked: bool,
-    pub dock_items: Vec<(&'static str, &'static str, u32)>,
-    pub dock_hovered: Option<usize>,
-    pub on_dock_click: Option<Box<dyn FnMut(usize)>>,
     pub menubar: MenuBar,
-    pub active_app_title: String,
-    pub needs_redraw: bool,
+    pub dock_items: Vec<String>,
+    pub mouse_x: i32,
+    pub mouse_y: i32,
+    pub dock_handler: Option<Box<dyn FnMut(usize)>>,
 }
 
 impl<'a> FrameworkApp<'a> {
     pub fn new(font_bytes: &'a [u8], width: usize, height: usize) -> Self {
-        let font = if !font_bytes.is_empty() && crate::is_valid_truetype_font(font_bytes) {
-            f_info!("FONT", "Successfully initialized TrueType font engine.");
+        let font = if !font_bytes.is_empty() {
             Font::try_from_bytes(font_bytes)
         } else {
-            f_warn!("FONT", "No TTF available. Switching to High-Resolution Scaled Bitmap Rasterizer.");
             None
         };
 
-        let mut buffer = Vec::new();
-        buffer.resize(width * height, 0xFF0F172A);
-
-        set_theme_scale(1.75); // HiDPI 1080p Scale
         let mut menubar = MenuBar::new();
-        menubar.bounds = Rect::new(0, 0, width, get_theme().pt(32.0));
+        menubar.bounds = Rect::new(0, 0, width as i32, get_theme().pt(32.0));
 
         Self {
-            width, height, buffer, font, font_cache: BTreeMap::new(),
+            buffer: vec![0; width * height],
+            width,
+            height,
+            font,
+            font_cache: BTreeMap::new(),
             root_widgets: Vec::new(),
-            mouse_x: width / 2, mouse_y: height / 2,
-            mouse_clicked: false,
-            dock_items: vec![
-                ("Finder", "FND", 0xFF0284C7),
-                ("Terminal", "TRM", 0xFF18181B),
-                ("Browser", "NET", 0xFF2563EB),
-                ("Activity Monitor", "ACT", 0xFFE11D48),
-                ("TextEdit", "TXT", 0xFF0D9488),
-                ("Settings", "SET", 0xFF475569),
-            ],
-            dock_hovered: None,
-            on_dock_click: None,
             menubar,
-            active_app_title: "Finder".into(),
-            needs_redraw: true,
+            dock_items: vec![
+                "Finder".into(),
+                "Settings".into(),
+                "Terminal".into(),
+                "Activity Monitor".into(),
+                "TextEdit".into(),
+                "Browser".into(),
+            ],
+            mouse_x: (width / 2) as i32,
+            mouse_y: (height / 2) as i32,
+            dock_handler: None,
         }
     }
 
-    pub fn set_dock_handler(&mut self, handler: impl FnMut(usize) + 'static) {
-        self.on_dock_click = Some(Box::new(handler));
+    pub fn set_dock_handler<F: FnMut(usize) + 'static>(&mut self, handler: F) {
+        self.dock_handler = Some(Box::new(handler));
     }
 
     pub fn spawn_app(&mut self, name: &str) {
+        let theme = get_theme();
         for w in &mut self.root_widgets {
             if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
-                if frame.title == name {
+                if frame.title.contains(name) {
                     frame.is_closed = false;
-                    self.active_app_title = name.to_string();
-                    self.needs_redraw = true;
-                    f_info!("APP", "Unminimized and focused existing app: '{}'", name);
+                    frame.is_minimized = false;
+                    frame.is_active = true;
                     return;
                 }
             }
         }
 
-        let theme = get_theme();
-        let new_win: Box<dyn Widget> = match name {
-            "Finder" => Box::new(WindowFrame::new("Finder", theme.pt(60.0), theme.pt(45.0), theme.pt(720.0), theme.pt(460.0), Box::new(FinderApp::new()))),
-            "Terminal" => Box::new(WindowFrame::new("Terminal", theme.pt(120.0), theme.pt(80.0), theme.pt(600.0), theme.pt(380.0), Box::new(TerminalApp::new()))),
-            "Browser" => Box::new(WindowFrame::new("Browser", theme.pt(130.0), theme.pt(65.0), theme.pt(740.0), theme.pt(480.0), Box::new(BrowserApp::new()))),
-            "Activity Monitor" => Box::new(WindowFrame::new("Activity Monitor", theme.pt(150.0), theme.pt(90.0), theme.pt(640.0), theme.pt(420.0), Box::new(ActivityMonitorApp::new()))),
-            "TextEdit" => Box::new(WindowFrame::new("TextEdit", theme.pt(180.0), theme.pt(110.0), theme.pt(580.0), theme.pt(400.0), Box::new(TextEditApp::new()))),
-            "Settings" => Box::new(WindowFrame::new("Settings", theme.pt(200.0), theme.pt(80.0), theme.pt(560.0), theme.pt(380.0), Box::new(SettingsApp::new()))),
-            _ => return,
+        let content: Box<dyn Widget> = match name {
+            "Finder" => Box::new(FinderApp::new()),
+            "Settings" => Box::new(SettingsApp::new()),
+            "Terminal" => Box::new(TerminalApp::new()),
+            "Activity Monitor" => Box::new(ActivityMonitorApp::new()),
+            "Browser" => Box::new(BrowserApp::new()),
+            _ => Box::new(ContainerWidget::vbox()),
         };
 
-        f_info!("APP", "Spawned new application window: '{}'", name);
-        self.active_app_title = name.to_string();
-        self.root_widgets.push(new_win);
-        self.needs_redraw = true;
-    }
-
-    pub fn spawn_preview(&mut self, name: String, data: Vec<u8>) {
-        let theme = get_theme();
-        f_info!("APP", "Spawning PreviewApp for image: '{}' ({} bytes)", name, data.len());
-        let win = Box::new(WindowFrame::new(format!("Preview - {}", name), theme.pt(140.0), theme.pt(70.0), theme.pt(680.0), theme.pt(480.0), Box::new(PreviewApp::new(name, data))));
+        let win = Box::new(WindowFrame::new(
+            name,
+            theme.pt(80.0) + (self.root_widgets.len() as i32 * theme.pt(25.0)),
+            theme.pt(60.0) + (self.root_widgets.len() as i32 * theme.pt(25.0)),
+            theme.pt(620.0),
+            theme.pt(420.0),
+            content,
+        ));
         self.root_widgets.push(win);
-        self.needs_redraw = true;
     }
 
-    pub fn spawn_textedit(&mut self, name: String, content: String) {
-        let theme = get_theme();
-        f_info!("APP", "Spawning TextEdit for document: '{}' ({} characters)", name, content.len());
-        let win = Box::new(WindowFrame::new(format!("TextEdit - {}", name), theme.pt(160.0), theme.pt(90.0), theme.pt(620.0), theme.pt(420.0), Box::new(TextEditApp::with_content(name, content))));
-        self.root_widgets.push(win);
-        self.needs_redraw = true;
-    }
-
-    pub fn render_frame(&mut self) {
-        let theme = get_theme();
-        self.buffer.fill(theme.bg_desktop);
-
-        // 1. Windows Rendering
-        {
-            let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-            for w in &self.root_widgets {
-                w.paint(&mut canvas);
-            }
-        }
-
-        // 2. MenuBar
-        {
-            let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-            self.menubar.paint(&mut canvas, &self.active_app_title);
-        }
-
-        // 3. Dock Rendering
-        {
-            let item_count = self.dock_items.len();
-            let base_item_w = theme.pt(48.0);
-            let gap = theme.pt(12.0);
-            let total_dock_w = (item_count * base_item_w) + ((item_count + 1) * gap);
-            let dock_h = theme.pt(64.0);
-            let dock_x = (self.width.saturating_sub(total_dock_w)) / 2;
-            let dock_y = self.height.saturating_sub(dock_h + theme.pt(12.0));
-
-            let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-            canvas.draw_rect(dock_x, dock_y, total_dock_w, dock_h, theme.bg_dock, theme.radius_dock);
-            canvas.draw_rect_outline(dock_x, dock_y, total_dock_w, dock_h, theme.border_dock, theme.radius_dock);
-
-            let mut cur_x = dock_x + gap;
-            for (idx, &(name, label, color)) in self.dock_items.iter().enumerate() {
-                let is_hovered = self.dock_hovered == Some(idx);
-                let sz = if is_hovered { theme.pt(54.0) } else { base_item_w };
-                let iy = if is_hovered { dock_y + theme.pt(4.0) } else { dock_y + theme.pt(8.0) };
-
-                canvas.draw_rect(cur_x, iy, sz, sz, color, theme.pt(12.0));
-                let (lw, _) = canvas.measure_text(label, theme.font_body());
-                canvas.draw_text(cur_x + (sz.saturating_sub(lw) / 2), iy + (sz / 3), label, 0xFFFFFFFF, theme.font_body());
-
-                let is_running = self.root_widgets.iter().any(|w| {
-                    if let Some(frame) = w.as_any().downcast_ref::<WindowFrame>() {
-                        frame.title.contains(name) && !frame.is_closed
-                    } else { false }
-                });
-                if is_running {
-                    canvas.draw_rect(cur_x + (sz / 2) - 3, dock_y + dock_h - theme.pt(6.0), 6, 6, theme.accent_hover, 3);
-                }
-
-                if is_hovered {
-                    let tip_w = name.len() * theme.pt(8.0) + theme.pt(20.0);
-                    let tip_x = cur_x.saturating_add(sz / 2).saturating_sub(tip_w / 2);
-                    let tip_y = dock_y.saturating_sub(theme.pt(30.0));
-                    canvas.draw_rect(tip_x, tip_y, tip_w, theme.pt(22.0), theme.bg_dock, theme.pt(6.0));
-                    canvas.draw_rect_outline(tip_x, tip_y, tip_w, theme.pt(22.0), theme.border_dock, theme.pt(6.0));
-                    canvas.draw_text(tip_x + theme.pt(8.0), tip_y + theme.pt(4.0), name, theme.text_primary, theme.font_caption());
-                }
-
-                cur_x += base_item_w + gap;
-            }
-        }
-
-        // 4. Mouse Cursor
-        {
-            let cur_sz = theme.pt(14.0);
-            let cur_col = if self.mouse_clicked { theme.accent_hover } else { 0xFFFFFFFF };
-            let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-            let mx = self.mouse_x.saturating_sub(cur_sz / 2);
-            let my = self.mouse_y.saturating_sub(cur_sz / 2);
-            canvas.draw_rect(mx, my, cur_sz, cur_sz, cur_col, cur_sz / 2);
-            canvas.draw_rect_outline(mx, my, cur_sz, cur_sz, 0xFF000000, cur_sz / 2);
-        }
-
-        sdk::window::present(self.buffer.as_ptr(), self.width, self.height);
-    }
-
-    pub fn run_loop(&mut self) -> ! {
-        self.render_frame();
-        let mut last_click_state = false;
-
+    pub fn run_loop(&mut self) {
         loop {
-            let mut has_input = false;
-            while let Some(ev) = sdk::window::poll_event() {
-                has_input = true;
-                let (etype, data) = (ev[0], ev[1]);
-                match etype {
-                    1 => {
-                        let dx = (data & 0xFFFFFFFF) as i32;
-                        let dy = ((data >> 32) & 0xFFFFFFFF) as i32;
-                        self.mouse_x = (self.mouse_x as isize + dx as isize).clamp(0, (self.width - 1) as isize) as usize;
-                        self.mouse_y = (self.mouse_y as isize + dy as isize).clamp(0, (self.height - 1) as isize) as usize;
-                    }
-                    2 => {
-                        self.mouse_clicked = (data >> 8) == 1;
-                    }
-                    4 => {
-                        let c = (data as u8) as char;
+            let theme = get_theme();
+
+            // 1. استهلاك وتفريغ جميع الأحداث المتراكمة في الطابور دفعة واحدة (Drain Queue)
+            // هذا يمنع تراكم حركة الماوس وتأخر الاستجابة الزمني نهائياً
+            let mut first_ev = sys_wait_event(16);
+            while let Some(ev) = first_ev {
+                let ev_type = ev[0];
+                let dock_h = theme.pt(54.0);
+                let dock_w = (self.dock_items.len() as i32) * theme.pt(52.0) + theme.pt(20.0);
+                let dock_x = ((self.width as i32) - dock_w) / 2;
+                let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
+
+                match ev_type {
+                    1 => { // MouseMove
+                        let dx = (ev[1] as u32) as i32;
+                        let dy = ((ev[1] >> 32) as u32) as i32;
+
+                        self.mouse_x = (self.mouse_x + dx).clamp(0, self.width as i32 - 1);
+                        self.mouse_y = (self.mouse_y + dy).clamp(0, self.height as i32 - 1);
+
                         for w in self.root_widgets.iter_mut().rev() {
-                            if w.handle_char(c) { break; }
+                            if w.handle_mouse(self.mouse_x, self.mouse_y, false) {
+                                break;
+                            }
+                        }
+                    }
+                    2 => { // MouseButton
+                        let btn = (ev[1] & 0xFF) as u8;
+                        let pressed = ((ev[1] >> 8) & 0xFF) != 0;
+
+                        if btn == 0 && pressed {
+                            if self.mouse_y >= dock_y && self.mouse_y <= dock_y + dock_h && self.mouse_x >= dock_x && self.mouse_x <= dock_x + dock_w {
+                                let idx = ((self.mouse_x - dock_x - theme.pt(12.0)) / theme.pt(52.0)) as usize;
+                                if idx < self.dock_items.len() {
+                                    let app_name = self.dock_items[idx].clone();
+                                    self.spawn_app(&app_name);
+                                    first_ev = sys_poll_event();
+                                    continue;
+                                }
+                            }
+                        }
+
+                        let mut hit_idx = None;
+                        for (idx, w) in self.root_widgets.iter_mut().enumerate().rev() {
+                            if w.handle_mouse(self.mouse_x, self.mouse_y, pressed) {
+                                hit_idx = Some(idx);
+                                break;
+                            }
+                        }
+
+                        if let Some(idx) = hit_idx {
+                            if pressed {
+                                for (i, w) in self.root_widgets.iter_mut().enumerate() {
+                                    if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                                        f.is_active = i == idx;
+                                    }
+                                }
+                                let win = self.root_widgets.remove(idx);
+                                self.root_widgets.push(win);
+                            }
+                        }
+                    }
+                    3 => { // KeyDown
+                        let keycode = (ev[1] & 0xFF) as u8;
+                        let mods = ((ev[1] >> 8) & 0xFF) as u8;
+                        if let Some(active_win) = self.root_widgets.last_mut() {
+                            active_win.handle_key(keycode, mods);
+                        }
+                    }
+                    4 => { // Char
+                        let c_code = ev[1] as u32;
+                        if let Some(c) = char::from_u32(c_code) {
+                            if let Some(active_win) = self.root_widgets.last_mut() {
+                                active_win.handle_char(c);
+                            }
+                        }
+                    }
+                    5 => { // Scroll
+                        let dy = (ev[1] as u32) as i32;
+                        for w in self.root_widgets.iter_mut().rev() {
+                            if w.handle_scroll(self.mouse_x, self.mouse_y, dy) {
+                                break;
+                            }
                         }
                     }
                     _ => {}
                 }
+
+                // سحب باقي الأحداث في الطابور دون نوم
+                first_ev = sys_poll_event();
             }
 
-            if has_input { self.needs_redraw = true; }
-
-            let mut pending_img = None;
-            let mut pending_txt = None;
-            for w in &mut self.root_widgets {
-                if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
-                    if let Some(finder) = frame.content.as_any_mut().downcast_mut::<FinderApp>() {
-                        if let Some(img) = finder.pending_open_image.take() {
-                            pending_img = Some(img);
-                            break;
-                        }
-                        if let Some(txt) = finder.pending_open_text.take() {
-                            pending_txt = Some(txt);
-                            break;
-                        }
-                    }
-                }
-            }
-            if let Some((name, data)) = pending_img {
-                self.spawn_preview(name, data);
-            }
-            if let Some((name, content)) = pending_txt {
-                self.spawn_textedit(name, content);
+            // 2. دورة الرسم المنعشة بعد تفريغ الأحداث
+            for p in &mut self.buffer {
+                *p = theme.bg_desktop;
             }
 
-            // MenuBar events
-            if let Some(action) = self.menubar.handle_mouse(self.mouse_x, self.mouse_y, self.mouse_clicked && !last_click_state) {
-                match action {
-                    101 => f_info!("MENU", "About EOS Triggered."),
-                    102 => self.spawn_app("Settings"),
-                    103 => f_warn!("MENU", "Reboot Request Triggered."),
-                    201 => self.spawn_app(&self.active_app_title.clone()),
-                    203 => {
-                        if let Some(top) = self.root_widgets.last_mut() {
-                            if let Some(frame) = top.as_any_mut().downcast_mut::<WindowFrame>() {
-                                frame.is_closed = true;
-                            }
-                        }
-                    }
-                    _ => f_info!("MENU", "Action id {} triggered", action),
-                }
-                self.needs_redraw = true;
-            }
-
-            // Dock Hover and Click
-            let theme = get_theme();
-            let item_count = self.dock_items.len();
-            let base_item_w = theme.pt(48.0);
-            let gap = theme.pt(12.0);
-            let total_dock_w = (item_count * base_item_w) + ((item_count + 1) * gap);
-            let dock_h = theme.pt(64.0);
-            let dock_x = (self.width.saturating_sub(total_dock_w)) / 2;
-            let dock_y = self.height.saturating_sub(dock_h + theme.pt(12.0));
-
-            let in_dock_zone = self.mouse_x >= dock_x && self.mouse_x < dock_x + total_dock_w && self.mouse_y >= dock_y && self.mouse_y < dock_y + dock_h;
-
-            if in_dock_zone {
-                let mut cur_x = dock_x + gap;
-                let mut found_hover = None;
-                for (idx, _) in self.dock_items.iter().enumerate() {
-                    if self.mouse_x >= cur_x && self.mouse_x < cur_x + base_item_w {
-                        found_hover = Some(idx);
-                        if self.mouse_clicked && !last_click_state {
-                            let title = self.dock_items[idx].0;
-                            self.spawn_app(title);
-                        }
-                        break;
-                    }
-                    cur_x += base_item_w + gap;
-                }
-                if self.dock_hovered != found_hover {
-                    self.dock_hovered = found_hover;
-                    self.needs_redraw = true;
-                }
-            } else if self.dock_hovered.is_some() {
-                self.dock_hovered = None;
-                self.needs_redraw = true;
-            }
-
-            // Window Focus & Event Handling
-            let mut brought_to_front = None;
-            for (idx, w) in self.root_widgets.iter_mut().enumerate().rev() {
-                if w.handle_mouse(self.mouse_x, self.mouse_y, self.mouse_clicked) {
-                    if self.mouse_clicked && !last_click_state {
-                        brought_to_front = Some(idx);
-                    }
-                    self.needs_redraw = true;
-                    break;
+            {
+                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                for w in &self.root_widgets {
+                    w.paint(&mut canvas);
                 }
             }
 
-            if let Some(idx) = brought_to_front {
-                if idx < self.root_widgets.len() - 1 {
-                    let top_win = self.root_widgets.remove(idx);
-                    if let Some(frame) = top_win.as_any().downcast_ref::<WindowFrame>() {
-                        f_info!("WINDOW", "Focus shifted to front window: '{}'", frame.title);
-                        self.active_app_title = frame.title.clone();
-                    }
-                    self.root_widgets.push(top_win);
+            let dock_h = theme.pt(54.0);
+            let dock_w = (self.dock_items.len() as i32) * theme.pt(52.0) + theme.pt(20.0);
+            let dock_x = ((self.width as i32) - dock_w) / 2;
+            let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
+
+            {
+                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                canvas.draw_rect(dock_x, dock_y, dock_w, dock_h, theme.bg_dock, theme.pt(16.0) as usize);
+                canvas.draw_rect_outline(dock_x, dock_y, dock_w, dock_h, theme.border_dock, theme.pt(16.0) as usize);
+
+                for (i, item) in self.dock_items.iter().enumerate() {
+                    let ix = dock_x + theme.pt(12.0) + (i as i32 * theme.pt(52.0));
+                    let iy = dock_y + theme.pt(7.0);
+                    canvas.draw_rect(ix, iy, theme.pt(40.0), theme.pt(40.0), theme.accent, theme.pt(8.0) as usize);
+                    let initial = item.chars().next().unwrap_or('A').to_string();
+                    let (tw, th) = canvas.measure_text(&initial, theme.font_title());
+                    canvas.draw_text(ix + ((theme.pt(40.0) - tw as i32) / 2), iy + ((theme.pt(40.0) - th as i32) / 2), &initial, 0xFFFFFFFF, theme.font_title());
                 }
+
+                self.menubar.paint(&mut canvas);
+                canvas.draw_linux_cursor(self.mouse_x, self.mouse_y);
             }
 
-            last_click_state = self.mouse_clicked;
-
-            if self.needs_redraw {
-                self.render_frame();
-                self.needs_redraw = false;
-            }
-
-            std::thread::sleep(std::time::Duration::from_millis(16));
+            sys_present(self.buffer.as_ptr(), self.width, self.height);
         }
+    }
+}
+### END
+
+### FILE: userspace/src/apps/browser.rs
+use crate::framework::*;
+use crate::net_manager::{NET, poll_network, TcpState};
+
+#[derive(Clone, Debug)]
+pub struct SearchResultItem {
+    pub title: String,
+    pub snippet: String,
+    pub url: String,
+}
+
+pub struct BrowserApp {
+    bounds: Rect,
+    url_input: String,
+    input_active: bool,
+    results: Vec<SearchResultItem>,
+    status_text: String,
+    scroll_y: i32,
+    active_sock: Option<u16>,
+    loading: bool,
+}
+
+impl BrowserApp {
+    pub fn new() -> Self {
+        let mut app = Self {
+            bounds: Rect::default(),
+            url_input: "google: rust programming".to_string(),
+            input_active: false,
+            results: Vec::new(),
+            status_text: "Ready. Enter a search query and press Enter.".to_string(),
+            scroll_y: 0,
+            active_sock: None,
+            loading: false,
+        };
+        app.results.push(SearchResultItem {
+            title: "Google Search on EOS".to_string(),
+            snippet: "Experimental lightweight web browser running on Ring 3 Userspace.".to_string(),
+            url: "http://www.google.com".to_string(),
+        });
+        app
+    }
+
+    fn perform_search(&mut self) {
+        let query = self.url_input.trim().to_string();
+        if query.is_empty() { return; }
+
+        self.loading = true;
+        self.scroll_y = 0;
+        self.results.clear();
+        self.status_text = format!("Searching for '{}' via network gateway...", query);
+
+        let clean_q = query.strip_prefix("google:").unwrap_or(&query).trim();
+        let path = format!("/search?q={}", clean_q.replace(' ', "+"));
+
+        let target_ip = [10, 0, 2, 2];
+        let host = "10.0.2.2";
+
+        let sock_port = {
+            let mut lock = NET.lock().unwrap();
+            if let Some(net) = lock.as_mut() {
+                net.http_get(target_ip, host, &path)
+            } else {
+                0
+            }
+        };
+
+        if sock_port != 0 {
+            self.active_sock = Some(sock_port);
+        } else {
+            self.loading = false;
+            self.status_text = "Network subsystem unavailable.".to_string();
+        }
+    }
+
+    fn parse_html_results(&mut self, raw_html: &str) {
+        self.results.clear();
+        let mut in_title = false;
+        let mut cur_title = String::new();
+
+        for line in raw_html.lines() {
+            let trimmed = line.trim();
+            if trimmed.contains("<h3>") || trimmed.contains("<title>") {
+                in_title = true;
+                cur_title = trimmed.replace("<h3>", "").replace("</h3>", "")
+                                   .replace("<title>", "").replace("</title>", "");
+            } else if in_title && (trimmed.contains("<p>") || trimmed.contains("<span>")) {
+                let cur_snippet = trimmed.replace("<p>", "").replace("</p>", "")
+                                         .replace("<span>", "").replace("</span>", "");
+                self.results.push(SearchResultItem {
+                    title: cur_title.clone(),
+                    snippet: cur_snippet,
+                    url: format!("http://google.com/search?q={}", cur_title.replace(' ', "+")),
+                });
+                in_title = false;
+            }
+        }
+
+        if self.results.is_empty() {
+            let non_empty: Vec<&str> = raw_html.lines().map(|l| l.trim()).filter(|l| !l.is_empty()).collect();
+            for chunk in non_empty.chunks(2) {
+                let title = chunk[0].to_string();
+                let snippet = if chunk.len() > 1 { chunk[1].to_string() } else { "No description available.".to_string() };
+                self.results.push(SearchResultItem {
+                    title,
+                    snippet,
+                    url: "http://google.com".to_string(),
+                });
+            }
+        }
+
+        if self.results.is_empty() {
+            self.results.push(SearchResultItem {
+                title: "No Results Found".to_string(),
+                snippet: "Check network connection or try a different search keyword.".to_string(),
+                url: "".to_string(),
+            });
+        }
+    }
+
+    fn check_network_response(&mut self) {
+        if !self.loading { return; }
+        if let Some(port) = self.active_sock {
+            poll_network();
+            let mut lock = NET.lock().unwrap();
+            if let Some(net) = lock.as_mut() {
+                if let Some(sock) = net.tcp_sockets.get_mut(&port) {
+                    if !sock.rx_buffer.is_empty() {
+                        let content = String::from_utf8_lossy(&sock.rx_buffer).to_string();
+                        drop(lock);
+                        self.parse_html_results(&content);
+                        self.loading = false;
+                        self.status_text = format!("Search completed. Found {} items.", self.results.len());
+                        return;
+                    }
+                    if sock.state == TcpState::Closed {
+                        self.loading = false;
+                        self.status_text = "Connection closed by peer.".to_string();
+                    }
+                }
+            }
+        }
+    }
+}
+
+impl Widget for BrowserApp {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect::new(x, y, w, h);
+        self.bounds
+    }
+
+    fn paint(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        let tb_h = theme.pt(46.0);
+        let status_h = theme.pt(26.0);
+
+        unsafe {
+            let app_mut = self as *const Self as *mut Self;
+            (*app_mut).check_network_response();
+        }
+
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFFFFFFFF, 0);
+
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, 0xFFF1F3F4, 0);
+        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, 0xFFDADCE0);
+
+        let bar_x = self.bounds.x + theme.pt(84.0);
+        let bar_y = self.bounds.y + theme.pt(7.0);
+        let bar_w = (self.bounds.w - theme.pt(170.0)).max(100);
+        let bar_h = theme.pt(32.0);
+
+        canvas.draw_rect(bar_x, bar_y, bar_w, bar_h, 0xFFFFFFFF, theme.pt(8.0) as usize);
+        let border_col = if self.input_active { theme.accent } else { 0xFFDADCE0 };
+        canvas.draw_rect_outline(bar_x, bar_y, bar_w, bar_h, border_col, theme.pt(8.0) as usize);
+
+        let text_col = if self.url_input.is_empty() { 0xFF9AA0A6 } else { 0xFF202124 };
+        let display_input = if self.url_input.is_empty() { "Search Google or type a URL" } else { &self.url_input };
+        canvas.draw_text_clipped(bar_x + theme.pt(14.0), bar_y + theme.pt(7.0), bar_w - theme.pt(28.0), display_input, text_col, theme.font_body());
+
+        let btn_x = bar_x + bar_w + theme.pt(10.0);
+        let btn_w = theme.pt(68.0);
+        canvas.draw_rect(btn_x, bar_y, btn_w, bar_h, theme.accent, theme.pt(8.0) as usize);
+        canvas.draw_text(btn_x + theme.pt(12.0), bar_y + theme.pt(7.0), "Search", 0xFFFFFFFF, theme.font_body());
+
+        let content_y = self.bounds.y + tb_h + 1;
+        let content_h = (self.bounds.h - tb_h - status_h - 1).max(0);
+        let mut cur_y = content_y + theme.pt(16.0) - self.scroll_y;
+
+        if self.loading {
+            canvas.draw_text(self.bounds.x + theme.pt(32.0), content_y + theme.pt(30.0), "🔍 Sending HTTP request & querying index...", 0xFF5F6368, theme.font_body());
+        } else {
+            for (idx, res) in self.results.iter().enumerate() {
+                if cur_y + theme.pt(60.0) > content_y && cur_y < content_y + content_h {
+                    canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y, self.bounds.w - theme.pt(64.0), &res.url, 0xFF202124, theme.font_caption());
+                    canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y + theme.pt(16.0), self.bounds.w - theme.pt(64.0), &format!("{}. {}", idx + 1, res.title), 0xFF1A0DAB, theme.font_title());
+                    canvas.draw_text_clipped(self.bounds.x + theme.pt(32.0), cur_y + theme.pt(40.0), self.bounds.w - theme.pt(64.0), &res.snippet, 0xFF4D5156, theme.font_body());
+                }
+                cur_y += theme.pt(70.0);
+            }
+        }
+
+        let sb_y = self.bounds.y + self.bounds.h - status_h;
+        canvas.draw_rect(self.bounds.x, sb_y, self.bounds.w, status_h, 0xFFF8FAFC, 0);
+        canvas.draw_line_h(self.bounds.x, sb_y, self.bounds.w, 0xFFE2E8F0);
+        canvas.draw_text(self.bounds.x + theme.pt(16.0), sb_y + theme.pt(5.0), &self.status_text, 0xFF64748B, theme.font_caption());
+    }
+
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        let theme = get_theme();
+        let bar_x = self.bounds.x + theme.pt(84.0);
+        let bar_h = theme.pt(32.0);
+        let bar_w = (self.bounds.w - theme.pt(170.0)).max(100);
+        let bar_y = self.bounds.y + theme.pt(7.0);
+        let btn_x = bar_x + bar_w + theme.pt(10.0);
+        let btn_w = theme.pt(68.0);
+
+        if pressed {
+            if mx >= bar_x && mx <= bar_x + bar_w && my >= bar_y && my <= bar_y + bar_h {
+                self.input_active = true;
+                return true;
+            } else {
+                self.input_active = false;
+            }
+
+            if mx >= btn_x && mx <= btn_x + btn_w && my >= bar_y && my <= bar_y + bar_h {
+                self.perform_search();
+                return true;
+            }
+        }
+        true
+    }
+
+    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        if dy < 0 {
+            self.scroll_y = (self.scroll_y + 30).min(2000);
+        } else {
+            self.scroll_y = (self.scroll_y - 30).max(0);
+        }
+        true
+    }
+
+    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
+        if !self.input_active { return false; }
+        if keycode == 0x1C {
+            self.perform_search();
+            return true;
+        }
+        false
+    }
+
+    fn handle_char(&mut self, c: char) -> bool {
+        if !self.input_active { return false; }
+        if c == '\x08' {
+            self.url_input.pop();
+            return true;
+        } else if c >= ' ' && c <= '~' {
+            self.url_input.push(c);
+            return true;
+        }
+        false
     }
 }
 ### END

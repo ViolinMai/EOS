@@ -144,7 +144,7 @@ fn fill_stat_buffer(statbuf: u64, size: u64, mode: u32) -> Result<(), ()> {
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
+pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
     let frame = unsafe { &mut *frame_ptr };
     match frame.rax {
         0 => { // read
@@ -563,20 +563,105 @@ pub extern "C" fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             frame.rax = 0;
         }
         503 => { // sys_poll_event
-            let tail = USER_EVENT_TAIL.load(Ordering::Acquire);
-            let head = USER_EVENT_HEAD.load(Ordering::Acquire);
-            if head != tail {
-                if let Some(ev) = unsafe { USERSPACE_EVENTS[tail] } {
-                    match ev {
-                        InputEvent::MouseMove { x, y } => { frame.rax = 1; frame.rdi = ((x as u32) as u64) | (((y as u32) as u64) << 32); },
-                        InputEvent::MouseButton { button, pressed } => { frame.rax = 2; frame.rdi = (button as u64) | (if pressed { 1 << 8 } else { 0 }); },
-                        InputEvent::KeyDown { keycode, mods } => { frame.rax = 3; frame.rdi = (keycode as u64) | ((mods as u64) << 8); },
-                        InputEvent::Char(c) => { frame.rax = 4; frame.rdi = c as u64; },
-                        _ => { frame.rax = 0; }
+            if let Some(ev) = pop_user_event() {
+                match ev {
+                    InputEvent::MouseMove { x, y } => {
+                        frame.rax = 1;
+                        frame.rdi = ((x as u32) as u64) | (((y as u32) as u64) << 32);
+                        frame.rsi = 0;
+                    },
+                    InputEvent::MouseButton { button, pressed } => {
+                        frame.rax = 2;
+                        frame.rdi = (button as u64) | (if pressed { 1 << 8 } else { 0 });
+                        frame.rsi = 0;
+                    },
+                    InputEvent::KeyDown { keycode, mods } => {
+                        frame.rax = 3;
+                        frame.rdi = (keycode as u64) | ((mods as u64) << 8);
+                        frame.rsi = 0;
+                    },
+                    InputEvent::Char(c) => {
+                        frame.rax = 4;
+                        frame.rdi = c as u32 as u64;
+                        frame.rsi = 0;
+                    },
+                    InputEvent::Scroll { dy } => {
+                        frame.rax = 5;
+                        frame.rdi = dy as i64 as u64;
+                        frame.rsi = 0;
+                    },
+                    _ => {
+                        frame.rax = 0;
+                        frame.rdi = 0;
+                        frame.rsi = 0;
                     }
-                    USER_EVENT_TAIL.store((tail + 1) % 128, Ordering::Release);
-                } else { frame.rax = 0; }
-            } else { frame.rax = 0; }
+                }
+            } else {
+                frame.rax = 0;
+                frame.rdi = 0;
+                frame.rsi = 0;
+            }
+        }
+        505 => { // sys_wait_event(timeout_ms: rdi)
+            let timeout_ms = frame.rdi;
+            let start_ticks = crate::arch::x86_64::pit::get_ticks();
+            let mut got_event = false;
+
+            loop {
+                if let Some(ev) = pop_user_event() {
+                    match ev {
+                        InputEvent::MouseMove { x, y } => {
+                            frame.rax = 1;
+                            frame.rdi = ((x as u32) as u64) | (((y as u32) as u64) << 32);
+                            frame.rsi = 0;
+                        },
+                        InputEvent::MouseButton { button, pressed } => {
+                            frame.rax = 2;
+                            frame.rdi = (button as u64) | (if pressed { 1 << 8 } else { 0 });
+                            frame.rsi = 0;
+                        },
+                        InputEvent::KeyDown { keycode, mods } => {
+                            frame.rax = 3;
+                            frame.rdi = (keycode as u64) | ((mods as u64) << 8);
+                            frame.rsi = 0;
+                        },
+                        InputEvent::Char(c) => {
+                            frame.rax = 4;
+                            frame.rdi = c as u32 as u64;
+                            frame.rsi = 0;
+                        },
+                        InputEvent::Scroll { dy } => {
+                            frame.rax = 5;
+                            frame.rdi = dy as i64 as u64;
+                            frame.rsi = 0;
+                        },
+                        _ => {
+                            frame.rax = 0;
+                            frame.rdi = 0;
+                            frame.rsi = 0;
+                        }
+                    }
+                    got_event = true;
+                    break;
+                }
+
+                if timeout_ms == 0 {
+                    break;
+                }
+
+                let elapsed = crate::arch::x86_64::pit::get_ticks().saturating_sub(start_ticks);
+                if timeout_ms != u64::MAX && elapsed >= timeout_ms {
+                    break;
+                }
+
+                core::hint::spin_loop();
+            }
+
+            if !got_event {
+                frame.rax = 0;
+                frame.rdi = 0;
+                frame.rsi = 0;
+            }
         }
         510 => { // sys_start_async_decode(src_user_ptr: rdi, src_len: rsi)
             let src_ptr = frame.rdi;
@@ -672,5 +757,17 @@ pub fn get_current_process() -> &'static mut ProcessState {
             });
         }
         PROCESS_TABLE[pid].as_mut().unwrap()
+    }
+}
+
+pub fn pop_user_event() -> Option<InputEvent> {
+    let tail = USER_EVENT_TAIL.load(Ordering::Acquire);
+    let head = USER_EVENT_HEAD.load(Ordering::Acquire);
+    if head != tail {
+        let ev = unsafe { USERSPACE_EVENTS[tail].take() };
+        USER_EVENT_TAIL.store((tail + 1) % 128, Ordering::Release);
+        ev
+    } else {
+        None
     }
 }
