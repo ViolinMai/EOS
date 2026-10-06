@@ -169,7 +169,7 @@ impl Widget for TextInputWidget {
         let border_color = if self.is_focused { theme.accent } else { theme.border_window };
         canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, border_color, theme.pt(6.0) as usize);
 
-        let pad_x = self.bounds.x + (theme.pt(8.0) as i32);
+        let pad_x = self.bounds.x + theme.pt(8.0);
         let (_, th) = canvas.measure_text("A", theme.font_body());
         let text_y = self.bounds.y + ((self.bounds.h - th as i32) / 2);
 
@@ -238,6 +238,106 @@ impl Widget for TextInputWidget {
             return true;
         }
         false
+    }
+}
+
+pub struct CheckBoxWidget {
+    pub bounds: Rect,
+    pub label: String,
+    pub checked: bool,
+    pub on_toggle: Option<Box<dyn FnMut(bool)>>,
+}
+
+impl CheckBoxWidget {
+    pub fn new(label: impl Into<String>, checked: bool) -> Self {
+        Self {
+            bounds: Rect::default(),
+            label: label.into(),
+            checked,
+            on_toggle: None,
+        }
+    }
+
+    pub fn on_toggle<F: FnMut(bool) + 'static>(mut self, cb: F) -> Self {
+        self.on_toggle = Some(Box::new(cb));
+        self
+    }
+}
+
+impl Widget for CheckBoxWidget {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect { x, y, w, h };
+        self.bounds
+    }
+
+    fn paint(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        let box_sz = theme.pt(18.0);
+        let box_y = self.bounds.y + ((self.bounds.h - box_sz) / 2);
+
+        if self.checked {
+            canvas.draw_rect(self.bounds.x, box_y, box_sz, box_sz, theme.accent, theme.pt(4.0) as usize);
+            canvas.draw_rect(self.bounds.x + theme.pt(4.0), box_y + theme.pt(4.0), (box_sz - theme.pt(8.0)).max(0), (box_sz - theme.pt(8.0)).max(0), 0xFFFFFFFF, theme.pt(2.0) as usize);
+        } else {
+            canvas.draw_rect_outline(self.bounds.x, box_y, box_sz, box_sz, theme.border_window, theme.pt(4.0) as usize);
+        }
+
+        let (_, th) = canvas.measure_text(&self.label, theme.font_body());
+        let text_y = self.bounds.y + ((self.bounds.h - th as i32) / 2);
+        canvas.draw_text(self.bounds.x + box_sz + theme.pt(8.0), text_y, &self.label, theme.text_primary, theme.font_body());
+    }
+
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        if self.bounds.contains(mx, my) {
+            if pressed {
+                self.checked = !self.checked;
+                if let Some(cb) = &mut self.on_toggle {
+                    cb(self.checked);
+                }
+            }
+            return true;
+        }
+        false
+    }
+}
+
+pub struct ProgressBarWidget {
+    pub bounds: Rect,
+    pub progress: f32,
+}
+
+impl ProgressBarWidget {
+    pub fn new(progress: f32) -> Self {
+        Self {
+            bounds: Rect::default(),
+            progress: progress.clamp(0.0, 1.0),
+        }
+    }
+
+    pub fn set_progress(&mut self, progress: f32) {
+        self.progress = progress.clamp(0.0, 1.0);
+    }
+}
+
+impl Widget for ProgressBarWidget {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect { x, y, w, h };
+        self.bounds
+    }
+
+    fn paint(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF141E2E, theme.pt(4.0) as usize);
+        let fill_w = ((self.bounds.w as f32) * self.progress).round() as i32;
+        if fill_w > 0 {
+            canvas.draw_rect(self.bounds.x, self.bounds.y, fill_w, self.bounds.h, theme.accent, theme.pt(4.0) as usize);
+        }
     }
 }
 

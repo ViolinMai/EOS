@@ -1,4 +1,5 @@
 use crate::framework::canvas::Canvas;
+use crate::framework::theme::get_theme;
 use std::any::Any;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -10,12 +11,18 @@ pub struct Rect {
 }
 
 impl Rect {
-    pub const fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
+    pub fn new(x: i32, y: i32, w: i32, h: i32) -> Self {
         Self { x, y, w, h }
     }
 
     pub fn contains(&self, px: i32, py: i32) -> bool {
         px >= self.x && px < self.x + self.w && py >= self.y && py < self.y + self.h
+    }
+
+    pub fn contains_rect(&self, other: &Rect) -> bool {
+        other.x >= self.x && other.y >= self.y
+            && other.x + other.w <= self.x + self.w
+            && other.y + other.h <= self.y + self.h
     }
 
     pub fn intersects(&self, other: &Rect) -> bool {
@@ -24,13 +31,67 @@ impl Rect {
             && self.y < other.y + other.h
             && self.y + self.h > other.y
     }
+
+    pub fn union(&self, other: &Rect) -> Rect {
+        let x1 = self.x.min(other.x);
+        let y1 = self.y.min(other.y);
+        let x2 = (self.x + self.w).max(other.x + other.w);
+        let y2 = (self.y + self.h).max(other.y + other.h);
+        Rect {
+            x: x1,
+            y: y1,
+            w: (x2 - x1).max(0),
+            h: (y2 - y1).max(0),
+        }
+    }
+}
+
+#[derive(Default, Clone, Debug)]
+pub struct DamageTracker {
+    pub rects: Vec<Rect>,
+}
+
+impl DamageTracker {
+    pub fn new() -> Self {
+        Self { rects: Vec::with_capacity(32) }
+    }
+
+    pub fn add(&mut self, rect: Rect) {
+        if rect.w <= 0 || rect.h <= 0 { return; }
+        for r in &mut self.rects {
+            if r.intersects(&rect) {
+                *r = r.union(&rect);
+                return;
+            }
+        }
+        if self.rects.len() < 24 {
+            self.rects.push(rect);
+        } else {
+            self.rects[0] = self.rects[0].union(&rect);
+        }
+    }
+
+    pub fn add_full(&mut self, w: usize, h: usize) {
+        self.rects.clear();
+        self.rects.push(Rect::new(0, 0, w as i32, h as i32));
+    }
+
+    pub fn clear(&mut self) {
+        self.rects.clear();
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.rects.is_empty()
+    }
 }
 
 pub trait Widget: Any {
     fn as_any(&self) -> &dyn Any;
     fn as_any_mut(&mut self) -> &mut dyn Any;
+
     fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect;
     fn paint(&self, canvas: &mut Canvas);
+
     fn handle_mouse(&mut self, _mx: i32, _my: i32, _pressed: bool) -> bool { false }
     fn handle_scroll(&mut self, _mx: i32, _my: i32, _dy: i32) -> bool { false }
     fn handle_key(&mut self, _keycode: u8, _mods: u8) -> bool { false }
@@ -38,22 +99,37 @@ pub trait Widget: Any {
     fn is_focusable(&self) -> bool { false }
 }
 
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ResizeEdge {
+    None,
+    Left,
+    Right,
+    Top,
+    Bottom,
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
 pub struct WindowFrame {
     pub title: String,
     pub bounds: Rect,
+    pub prev_bounds: Rect,
     pub content: Box<dyn Widget>,
-    pub is_closed: bool,
     pub is_active: bool,
-    pub is_minimized: bool,
-    pub is_maximized: bool,
-    pub saved_bounds: Rect,
     pub is_dragging: bool,
+    pub is_resizing: bool,
     pub drag_offset_x: i32,
     pub drag_offset_y: i32,
-    pub last_title_click_tick: u64,
-    pub hover_close: bool,
-    pub hover_min: bool,
-    pub hover_max: bool,
+    pub resize_edge: ResizeEdge,
+    pub is_closed: bool,
+    pub is_minimized: bool,
+    pub is_maximized: bool,
+    pub tile_state: WindowTileState,
+    pub min_w: i32,
+    pub min_h: i32,
+    pub hover_btn: Option<usize>,
 }
 
 impl WindowFrame {
@@ -63,187 +139,229 @@ impl WindowFrame {
         y: i32,
         w: i32,
         h: i32,
-        mut content: Box<dyn Widget>,
+        content: Box<dyn Widget>,
     ) -> Self {
-        let bounds = Rect::new(x, y, w, h);
-        let theme = crate::framework::get_theme();
-        let tb_h = theme.pt(32.0);
-        let content_y = y + tb_h + 1;
-        let content_h = (h - tb_h - 1).max(0);
-        content.layout(x, content_y, w, content_h);
-
-        Self {
+        let mut frame = Self {
             title: title.into(),
-            bounds,
+            bounds: Rect { x, y, w, h },
+            prev_bounds: Rect { x, y, w, h },
             content,
-            is_closed: false,
             is_active: true,
-            is_minimized: false,
-            is_maximized: false,
-            saved_bounds: bounds,
             is_dragging: false,
+            is_resizing: false,
             drag_offset_x: 0,
             drag_offset_y: 0,
-            last_title_click_tick: 0,
-            hover_close: false,
-            hover_min: false,
-            hover_max: false,
+            resize_edge: ResizeEdge::None,
+            is_closed: false,
+            is_minimized: false,
+            is_maximized: false,
+            tile_state: WindowTileState::None,
+            min_w: 240,
+            min_h: 160,
+            hover_btn: None,
+        };
+        frame.layout(x, y, w, h);
+        frame
+    }
+
+    pub fn title_bar_height(&self) -> i32 {
+        get_theme().pt(32.0)
+    }
+
+    pub fn toggle_maximize(&mut self, work_area: &Rect) {
+        if self.is_maximized || self.tile_state == WindowTileState::Maximized {
+            self.layout(self.prev_bounds.x, self.prev_bounds.y, self.prev_bounds.w, self.prev_bounds.h);
+            self.is_maximized = false;
+            self.tile_state = WindowTileState::None;
+        } else {
+            self.prev_bounds = self.bounds;
+            self.layout(work_area.x, work_area.y, work_area.w, work_area.h);
+            self.is_maximized = true;
+            self.tile_state = WindowTileState::Maximized;
         }
     }
 
-    pub fn toggle_maximize(&mut self) {
-        let theme = crate::framework::get_theme();
-        if self.is_maximized {
-            self.layout(self.saved_bounds.x, self.saved_bounds.y, self.saved_bounds.w, self.saved_bounds.h);
-            self.is_maximized = false;
+    pub fn tile_left(&mut self, work_area: &Rect) {
+        if self.tile_state == WindowTileState::LeftHalf {
+            self.layout(self.prev_bounds.x, self.prev_bounds.y, self.prev_bounds.w, self.prev_bounds.h);
+            self.tile_state = WindowTileState::None;
         } else {
-            self.saved_bounds = self.bounds;
-            self.layout(0, theme.pt(32.0), 1920, 1080 - theme.pt(32.0) - theme.pt(70.0));
-            self.is_maximized = true;
+            if self.tile_state == WindowTileState::None {
+                self.prev_bounds = self.bounds;
+            }
+            self.layout(work_area.x, work_area.y, work_area.w / 2, work_area.h);
+            self.tile_state = WindowTileState::LeftHalf;
+            self.is_maximized = false;
+        }
+    }
+
+    pub fn tile_right(&mut self, work_area: &Rect) {
+        if self.tile_state == WindowTileState::RightHalf {
+            self.layout(self.prev_bounds.x, self.prev_bounds.y, self.prev_bounds.w, self.prev_bounds.h);
+            self.tile_state = WindowTileState::None;
+        } else {
+            if self.tile_state == WindowTileState::None {
+                self.prev_bounds = self.bounds;
+            }
+            let half_w = work_area.w / 2;
+            self.layout(work_area.x + half_w, work_area.y, work_area.w - half_w, work_area.h);
+            self.tile_state = WindowTileState::RightHalf;
+            self.is_maximized = false;
         }
     }
 }
 
 impl Widget for WindowFrame {
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
 
     fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
-        self.bounds = Rect::new(x, y, w, h);
-        let theme = crate::framework::get_theme();
-        let tb_h = theme.pt(32.0);
-        let content_y = self.bounds.y + tb_h + 1;
-        let content_h = (self.bounds.h - tb_h - 1).max(0);
-        self.content.layout(self.bounds.x, content_y, self.bounds.w, content_h);
+        self.bounds = Rect { x, y, w, h };
+        let tb_h = self.title_bar_height();
+        self.content.layout(x, y + tb_h, w, (h - tb_h).max(0));
         self.bounds
     }
 
     fn paint(&self, canvas: &mut Canvas) {
         if self.is_closed || self.is_minimized { return; }
+        let theme = get_theme();
+        let r = theme.pt(8.0) as usize;
 
-        let theme = crate::framework::get_theme();
-        let tb_h = theme.pt(32.0);
-        let cr = if self.is_maximized { 0 } else { theme.pt(10.0) };
+        // رسم خلفية وإطار النافذة الأساسي
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, r);
 
-        // جسم النافذة وشريط العنوان الشفاف الزجاجي
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, cr as usize);
-        canvas.draw_frosted_glass_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, 0xDD1E293B, cr as usize);
-        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
+        let tb_h = self.title_bar_height();
+        let tb_color = if self.is_active { theme.bg_titlebar } else { 0xFF1E293B };
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, tb_color, r);
+        canvas.draw_rect(self.bounds.x, self.bounds.y + tb_h - 4, self.bounds.w, 4, tb_color, 0);
+        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h - 1, self.bounds.w, theme.border_window);
 
-        let border_col = if self.is_active { theme.accent } else { theme.border_window };
-        if !self.is_maximized {
-            canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, border_col, cr as usize);
-        }
+        // أزرار التحكم التقليدية للنافذة (إغلاق / تصغير / تكبير)
+        let btn_w = theme.pt(28.0);
+        let btn_h = tb_h;
+        let right_x = self.bounds.x + self.bounds.w;
 
-        let btn_sz = theme.pt(14.0);
-        let by = self.bounds.y + (tb_h - btn_sz) / 2;
+        // 0: Close, 1: Maximize, 2: Minimize
+        let close_rect = Rect::new(right_x - btn_w, self.bounds.y, btn_w, btn_h);
+        let max_rect = Rect::new(right_x - (btn_w * 2), self.bounds.y, btn_w, btn_h);
+        let min_rect = Rect::new(right_x - (btn_w * 3), self.bounds.y, btn_w, btn_h);
 
-        // 1. زر الإغلاق: دائري بلون رمادي/داكن، وعند الـ Hover يتحول للأحمر
-        let close_c = if self.hover_close { 0xFFEF4444 } else { 0x6694A3B8 };
-        canvas.draw_rect(self.bounds.x + theme.pt(14.0), by, btn_sz, btn_sz, close_c, (btn_sz / 2) as usize);
+        // زر التصغير Minimize (-)
+        let min_bg = if self.hover_btn == Some(2) { 0xFF334155 } else { tb_color };
+        canvas.draw_rect(min_rect.x, min_rect.y, min_rect.w, min_rect.h, min_bg, 0);
+        canvas.draw_line_h(min_rect.x + theme.pt(9.0), min_rect.y + (btn_h / 2), theme.pt(10.0), theme.text_primary);
 
-        // 2. زر التصغير: علامة '-'
-        let min_c = if self.hover_min { 0xFFE2E8F0 } else { 0xFF94A3B8 };
-        let min_bx = self.bounds.x + theme.pt(36.0);
-        canvas.draw_rect(min_bx, by, btn_sz, btn_sz, 0x44334155, theme.pt(3.0) as usize);
-        let my_mid = by + (btn_sz / 2);
-        canvas.draw_line_h(min_bx + theme.pt(3.0), my_mid, btn_sz - theme.pt(6.0), min_c);
+        // زر التكبير/الاستعادة Maximize (□)
+        let max_bg = if self.hover_btn == Some(1) { 0xFF334155 } else { tb_color };
+        canvas.draw_rect(max_rect.x, max_rect.y, max_rect.w, max_rect.h, max_bg, 0);
+        let box_sz = theme.pt(9.0);
+        canvas.draw_rect_outline(max_rect.x + (btn_w - box_sz) / 2, max_rect.y + (btn_h - box_sz) / 2, box_sz, box_sz, theme.text_primary, 0);
 
-        // 3. زر التكبير/الشاشة الكاملة: علامة '+'
-        let max_c = if self.hover_max { 0xFFE2E8F0 } else { 0xFF94A3B8 };
-        let max_bx = self.bounds.x + theme.pt(58.0);
-        canvas.draw_rect(max_bx, by, btn_sz, btn_sz, 0x44334155, theme.pt(3.0) as usize);
-        let mx_mid = max_bx + (btn_sz / 2);
-        canvas.draw_line_h(max_bx + theme.pt(3.0), my_mid, btn_sz - theme.pt(6.0), max_c);
-        canvas.draw_line_v(mx_mid, by + theme.pt(3.0), btn_sz - theme.pt(6.0), max_c);
+        // زر الإغلاق Close (X)
+        let close_bg = if self.hover_btn == Some(0) { 0xFFE11D48 } else { tb_color };
+        canvas.draw_rect(close_rect.x, close_rect.y, close_rect.w, close_rect.h, close_bg, 0);
+        let (cw, ch) = canvas.measure_text("✕", theme.font_caption());
+        canvas.draw_text(close_rect.x + (btn_w - cw as i32) / 2, close_rect.y + (btn_h - ch as i32) / 2, "✕", theme.text_primary, theme.font_caption());
 
-        let tx = self.bounds.x + theme.pt(84.0);
-        let (_, th) = canvas.measure_text(&self.title, theme.font_title());
-        let ty = self.bounds.y + (tb_h - (th as i32)) / 2;
-        canvas.draw_text_clipped(tx, ty, (self.bounds.w - theme.pt(170.0)).max(0), &self.title, theme.text_primary, theme.font_title());
+        // عنوان النافذة
+        let (tw, th) = canvas.measure_text(&self.title, theme.font_title());
+        let title_x = self.bounds.x + theme.pt(14.0);
+        let title_y = self.bounds.y + ((tb_h - th as i32) / 2);
+        let title_col = if self.is_active { theme.text_primary } else { theme.text_muted };
+        canvas.draw_text_clipped(title_x, title_y, self.bounds.w - (btn_w * 3) - theme.pt(28.0), &self.title, title_col, theme.font_title());
 
-        let content_rect = Rect {
-            x: self.bounds.x,
-            y: self.bounds.y + tb_h + 1,
-            w: self.bounds.w,
-            h: (self.bounds.h - tb_h - 1).max(0),
-        };
-
-        canvas.push_clip(content_rect);
+        // رسم محتوى النافذة الداخلي
         self.content.paint(canvas);
-        canvas.pop_clip();
+
+        // إطار حدود النافذة الخارجي
+        let border_col = if self.is_active { theme.accent } else { theme.border_window };
+        canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, border_col, r);
     }
 
     fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
         if self.is_closed || self.is_minimized { return false; }
-        let theme = crate::framework::get_theme();
-        let tb_h = theme.pt(32.0);
-        let btn_sz = theme.pt(14.0);
-        let by = self.bounds.y + (tb_h - btn_sz) / 2;
+        let theme = get_theme();
+        let tb_h = self.title_bar_height();
+        let btn_w = theme.pt(28.0);
+        let right_x = self.bounds.x + self.bounds.w;
 
-        let in_close = mx >= self.bounds.x + theme.pt(14.0) && mx <= self.bounds.x + theme.pt(14.0) + btn_sz && my >= by && my <= by + btn_sz;
-        let in_min = mx >= self.bounds.x + theme.pt(36.0) && mx <= self.bounds.x + theme.pt(36.0) + btn_sz && my >= by && my <= by + btn_sz;
-        let in_max = mx >= self.bounds.x + theme.pt(58.0) && mx <= self.bounds.x + theme.pt(58.0) + btn_sz && my >= by && my <= by + btn_sz;
+        let prev_hover = self.hover_btn;
+        self.hover_btn = None;
 
-        self.hover_close = in_close;
-        self.hover_min = in_min;
-        self.hover_max = in_max;
+        if my >= self.bounds.y && my <= self.bounds.y + tb_h {
+            if mx >= right_x - btn_w && mx <= right_x {
+                self.hover_btn = Some(0); // Close
+            } else if mx >= right_x - (btn_w * 2) && mx < right_x - btn_w {
+                self.hover_btn = Some(1); // Maximize
+            } else if mx >= right_x - (btn_w * 3) && mx < right_x - (btn_w * 2) {
+                self.hover_btn = Some(2); // Minimize
+            }
+        }
 
         if pressed {
-            if in_close {
-                self.is_closed = true;
-                return true;
-            }
-            if in_min {
-                self.is_minimized = true;
-                return true;
-            }
-            if in_max {
-                self.toggle_maximize();
-                return true;
-            }
-
-            if mx >= self.bounds.x && mx <= self.bounds.x + self.bounds.w && my >= self.bounds.y && my < self.bounds.y + tb_h {
-                let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
-                if now.saturating_sub(self.last_title_click_tick) < 350 {
-                    self.toggle_maximize();
-                    self.last_title_click_tick = 0;
-                    self.is_dragging = false;
-                    return true;
+            if let Some(btn) = self.hover_btn {
+                match btn {
+                    0 => self.is_closed = true,
+                    2 => self.is_minimized = true,
+                    _ => {}
                 }
-                self.last_title_click_tick = now;
+                return true;
+            }
 
-                if !self.is_maximized {
+            if self.bounds.contains(mx, my) {
+                if my <= self.bounds.y + tb_h {
                     self.is_dragging = true;
                     self.drag_offset_x = mx - self.bounds.x;
                     self.drag_offset_y = my - self.bounds.y;
+                } else {
+                    let border_margin = 8;
+                    let on_right = mx >= self.bounds.x + self.bounds.w - border_margin;
+                    let on_bottom = my >= self.bounds.y + self.bounds.h - border_margin;
+                    if on_right && on_bottom {
+                        self.is_resizing = true;
+                        self.resize_edge = ResizeEdge::BottomRight;
+                    } else if on_right {
+                        self.is_resizing = true;
+                        self.resize_edge = ResizeEdge::Right;
+                    } else if on_bottom {
+                        self.is_resizing = true;
+                        self.resize_edge = ResizeEdge::Bottom;
+                    }
                 }
+                let _ = self.content.handle_mouse(mx, my, true);
+                return true;
+            }
+        } else {
+            if self.bounds.contains(mx, my) {
+                let _ = self.content.handle_mouse(mx, my, false);
                 return true;
             }
         }
 
-        if self.bounds.contains(mx, my) {
-            let _ = self.content.handle_mouse(mx, my, pressed);
-            return true;
-        }
-
-        false
+        self.bounds.contains(mx, my) || prev_hover != self.hover_btn
     }
 
     fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
-        if self.is_closed || self.is_minimized { return false; }
-        if !self.bounds.contains(mx, my) { return false; }
-        self.content.handle_scroll(mx, my, dy);
-        true
+        if self.bounds.contains(mx, my) {
+            self.content.handle_scroll(mx, my, dy)
+        } else {
+            false
+        }
     }
 
     fn handle_key(&mut self, keycode: u8, mods: u8) -> bool {
-        if self.is_closed || self.is_minimized { return false; }
         self.content.handle_key(keycode, mods)
     }
 
     fn handle_char(&mut self, c: char) -> bool {
-        if self.is_closed || self.is_minimized { return false; }
         self.content.handle_char(c)
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowTileState {
+    None,
+    LeftHalf,
+    RightHalf,
+    Maximized,
 }

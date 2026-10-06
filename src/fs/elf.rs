@@ -32,7 +32,7 @@ pub struct Elf64ProgramHeader {
 }
 
 #[unsafe(naked)]
-extern "C" fn jump_to_ring3(entry: u64, rsp: u64, user_cs: u64, user_ds: u64, spawn_rsp_ptr: *mut u64, new_cr3: u64) {
+pub extern "C" fn jump_to_ring3(entry: u64, rsp: u64, user_cs: u64, user_ds: u64, spawn_rsp_ptr: *mut u64, new_cr3: u64) {
     naked_asm!(
         "push rbp", "push rbx", "push r12", "push r13", "push r14", "push r15",
         "mov [r8], rsp",

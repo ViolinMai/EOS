@@ -2,7 +2,7 @@
 use crate::arch::x86_64::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::arch::x86_64::keyboard::clear_keyboard_buffer;
 use crate::arch::x86_64::syscall::{ELF_EXIT_REQUESTED, reset_core2_process};
-use crate::{log_info, log_error};
+use crate::log_info;
 use crate::mm::paging::{read_cr3, free_user_pages, PageTable};
 use crate::mm::paging::VMM;
 use alloc::vec::Vec;

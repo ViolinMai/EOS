@@ -17,4 +17,10 @@ pub use input::{InputManager, PointerButton, PointerEvent, PointerState};
 pub use layout::{Alignment, ContainerWidget, Direction, LayoutItem};
 pub use menu::MenuBarWidget;
 pub use theme::{get_theme, set_theme_scale, Theme};
-pub use widget::{Rect, Widget, WindowFrame};
+pub use widget::{DamageTracker, Rect, ResizeEdge, Widget, WindowFrame, WindowTileState};
+pub use damage::DamageRegion;
+pub use surface::WindowSurface;
+
+pub mod damage;
+
+pub mod surface;

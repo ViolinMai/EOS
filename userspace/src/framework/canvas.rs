@@ -54,131 +54,113 @@ impl<'a> Canvas<'a> {
     }
 
     #[inline(always)]
-    fn is_clipped(&self, x: i32, y: i32) -> bool {
-        if x < 0 || y < 0 || x >= self.width as i32 || y >= self.height as i32 {
-            return true;
-        }
-        if let Some(clip) = self.clip_stack.last() {
-            !clip.contains(x, y)
-        } else {
-            false
-        }
+    pub fn current_clip(&self) -> Rect {
+        self.clip_stack.last().copied().unwrap_or(Rect {
+            x: 0,
+            y: 0,
+            w: self.width as i32,
+            h: self.height as i32,
+        })
     }
 
     #[inline(always)]
     pub fn blend(bg: u32, fg: u32, alpha: u32) -> u32 {
         if alpha >= 255 { return fg | 0xFF000000; }
-        if alpha == 0 { return bg | 0xFF000000; }
+        if alpha == 0 { return bg; }
         let inv = 255 - alpha;
-        let rb = (((fg & 0x00FF00FF) * alpha + (bg & 0x00FF00FF) * inv) >> 8) & 0x00FF00FF;
-        let g = (((fg & 0x0000FF00) * alpha + (bg & 0x0000FF00) * inv) >> 8) & 0x0000FF00;
+        let rb = ((((fg & 0x00FF00FF) * alpha) + ((bg & 0x00FF00FF) * inv) + 0x00800080) >> 8) & 0x00FF00FF;
+        let g  = ((((fg & 0x0000FF00) * alpha) + ((bg & 0x0000FF00) * inv) + 0x00008000) >> 8) & 0x0000FF00;
         0xFF000000 | rb | g
     }
 
-    /// تطبيق تأثير Blur ضبابي شفاف (Frosted Glass Blur) على مساحة محددة
-    pub fn apply_blur_rect(&mut self, x: i32, y: i32, w: i32, h: i32, radius: usize) {
-        let sx = x.max(0) as usize;
-        let sy = y.max(0) as usize;
-        let ex = ((x + w).min(self.width as i32)).max(0) as usize;
-        let ey = ((y + h).min(self.height as i32)).max(0) as usize;
-        if sx >= ex || sy >= ey || radius == 0 { return; }
+    pub fn draw_frosted_glass_rect(&mut self, x: i32, y: i32, w: i32, h: i32, tint: u32, radius: usize) {
+        let clip = self.current_clip();
+        let sx = x.max(clip.x).max(0);
+        let sy = y.max(clip.y).max(0);
+        let ex = (x + w).min(clip.x + clip.w).min(self.width as i32);
+        let ey = (y + h).min(clip.y + clip.h).min(self.height as i32);
+        if sx >= ex || sy >= ey { return; }
 
-        let r = radius.min(12);
-        let rw = ex - sx;
-        let rh = ey - sy;
-        let mut temp = vec![0u32; rw * rh];
+        let tint_alpha = (tint >> 24) & 0xFF;
+        let r = radius as i32;
 
-        // تمرير أفقي (Horizontal Pass)
-        for cy in 0..rh {
-            let row_idx = (sy + cy) * self.width;
-            for cx in 0..rw {
-                let px_start = cx.saturating_sub(r);
-                let px_end = (cx + r).min(rw - 1);
-                let count = (px_end - px_start + 1) as u32;
-
-                let mut sum_r = 0u32;
-                let mut sum_g = 0u32;
-                let mut sum_b = 0u32;
-
-                for kx in px_start..=px_end {
-                    let pixel = self.buffer[row_idx + (sx + kx)];
-                    sum_r += (pixel >> 16) & 0xFF;
-                    sum_g += (pixel >> 8) & 0xFF;
-                    sum_b += pixel & 0xFF;
+        if r <= 0 {
+            let row_w = (ex - sx) as usize;
+            for cy in sy..ey {
+                let idx = (cy as usize) * self.width + (sx as usize);
+                let row = &mut self.buffer[idx..idx + row_w];
+                for px in row.iter_mut() {
+                    *px = Self::blend(*px, tint, tint_alpha);
                 }
-
-                temp[cy * rw + cx] = (0xFF << 24)
-                    | ((sum_r / count) << 16)
-                    | ((sum_g / count) << 8)
-                    | (sum_b / count);
             }
+        } else {
+            self.draw_rect(x, y, w, h, tint, radius);
         }
-
-        // تمرير رأسي (Vertical Pass) وتطبيق النتيجة مباشرة على الـ Buffer
-        for cx in 0..rw {
-            for cy in 0..rh {
-                let py_start = cy.saturating_sub(r);
-                let py_end = (cy + r).min(rh - 1);
-                let count = (py_end - py_start + 1) as u32;
-
-                let mut sum_r = 0u32;
-                let mut sum_g = 0u32;
-                let mut sum_b = 0u32;
-
-                for ky in py_start..=py_end {
-                    let pixel = temp[ky * rw + cx];
-                    sum_r += (pixel >> 16) & 0xFF;
-                    sum_g += (pixel >> 8) & 0xFF;
-                    sum_b += pixel & 0xFF;
-                }
-
-                let idx = (sy + cy) * self.width + (sx + cx);
-                self.buffer[idx] = (0xFF << 24)
-                    | ((sum_r / count) << 16)
-                    | ((sum_g / count) << 8)
-                    | (sum_b / count);
-            }
-        }
-    }
-
-    /// رسم مستطيل شفاف مع تأثير Blur زجاجي مدمج
-    pub fn draw_frosted_glass_rect(&mut self, x: i32, y: i32, w: i32, h: i32, tint: u32, corner_r: usize) {
-        self.apply_blur_rect(x, y, w, h, 6);
-        self.draw_rect(x, y, w, h, tint, corner_r);
     }
 
     pub fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, radius: usize) {
-        let ex = (x + w).min(self.width as i32);
-        let ey = (y + h).min(self.height as i32);
-        let sx = x.max(0);
-        let sy = y.max(0);
+        let clip = self.current_clip();
+        let sx = x.max(clip.x).max(0);
+        let sy = y.max(clip.y).max(0);
+        let ex = (x + w).min(clip.x + clip.w).min(self.width as i32);
+        let ey = (y + h).min(clip.y + clip.h).min(self.height as i32);
         if sx >= ex || sy >= ey { return; }
 
+        let alpha = (color >> 24) & 0xFF;
         let r = radius as i32;
-        let r_sq = r * r;
 
-        for cy in sy..ey {
-            for cx in sx..ex {
-                if self.is_clipped(cx, cy) { continue; }
-
-                if r > 0 {
-                    let is_top = cy < y + r;
-                    let is_bottom = cy >= ey - r;
-                    let is_left = cx < x + r;
-                    let is_right = cx >= ex - r;
-
-                    if (is_top || is_bottom) && (is_left || is_right) {
-                        let dx = if is_left { (x + r) - cx - 1 } else { cx - (ex - r) };
-                        let dy = if is_top { (y + r) - cy - 1 } else { cy - (ey - r) };
-                        if dx * dx + dy * dy >= r_sq {
-                            continue;
-                        }
+        if r <= 0 {
+            let row_w = (ex - sx) as usize;
+            if alpha == 255 {
+                let fill_c = color | 0xFF000000;
+                for cy in sy..ey {
+                    let idx = (cy as usize) * self.width + (sx as usize);
+                    self.buffer[idx..idx + row_w].fill(fill_c);
+                }
+            } else if alpha > 0 {
+                for cy in sy..ey {
+                    let idx = (cy as usize) * self.width + (sx as usize);
+                    let row = &mut self.buffer[idx..idx + row_w];
+                    for px in row.iter_mut() {
+                        *px = Self::blend(*px, color, alpha);
                     }
                 }
+            }
+            return;
+        }
 
-                let idx = (cy as usize) * self.width + (cx as usize);
-                let alpha = (color >> 24) & 0xFF;
-                self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
+        let r_sq = r * r;
+        let inner_r = (r - 1).max(0);
+        let inner_r_sq = inner_r * inner_r;
+        let rx1 = x + r;
+        let rx2 = x + w - r;
+        let ry1 = y + r;
+        let ry2 = y + h - r;
+
+        for cy in sy..ey {
+            let is_y_edge = cy < ry1 || cy >= ry2;
+            let dy = if cy < ry1 { ry1 - cy - 1 } else if cy >= ry2 { cy - ry2 } else { 0 };
+            let dy_sq = dy * dy;
+
+            for cx in sx..ex {
+                let is_x_edge = cx < rx1 || cx >= rx2;
+                if is_y_edge && is_x_edge {
+                    let dx = if cx < rx1 { rx1 - cx - 1 } else { cx - rx2 };
+                    let dist_sq = dx * dx + dy_sq;
+                    if dist_sq >= r_sq {
+                        continue;
+                    }
+                    let p_alpha = if dist_sq > inner_r_sq {
+                        (alpha * (r_sq - dist_sq) as u32) / (r_sq - inner_r_sq).max(1) as u32
+                    } else {
+                        alpha
+                    };
+                    let idx = (cy as usize) * self.width + (cx as usize);
+                    self.buffer[idx] = Self::blend(self.buffer[idx], color, p_alpha);
+                } else {
+                    let idx = (cy as usize) * self.width + (cx as usize);
+                    self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
+                }
             }
         }
     }
@@ -189,77 +171,93 @@ impl<'a> Canvas<'a> {
             self.draw_line_h(x, y + h - 1, w, color);
             self.draw_line_v(x, y, h, color);
             self.draw_line_v(x + w - 1, y, h, color);
-        } else {
-            let r = radius as i32;
-            let ex = (x + w).min(self.width as i32);
-            let ey = (y + h).min(self.height as i32);
-            let sx = x.max(0);
-            let sy = y.max(0);
-            let r_sq = r * r;
-            let inner_r = (r - 1).max(0);
-            let inner_r_sq = inner_r * inner_r;
+            return;
+        }
 
-            for cy in sy..ey {
-                for cx in sx..ex {
-                    if self.is_clipped(cx, cy) { continue; }
-                    let is_top = cy < y + r;
-                    let is_bottom = cy >= ey - r;
-                    let is_left = cx < x + r;
-                    let is_right = cx >= ex - r;
+        let clip = self.current_clip();
+        let sx = x.max(clip.x).max(0);
+        let sy = y.max(clip.y).max(0);
+        let ex = (x + w).min(clip.x + clip.w).min(self.width as i32);
+        let ey = (y + h).min(clip.y + clip.h).min(self.height as i32);
+        if sx >= ex || sy >= ey { return; }
 
-                    let mut draw_px = false;
-                    if (is_top || is_bottom) && (is_left || is_right) {
-                        let dx = if is_left { (x + r) - cx - 1 } else { cx - (ex - r) };
-                        let dy = if is_top { (y + r) - cy - 1 } else { cy - (ey - r) };
-                        let d_sq = dx * dx + dy * dy;
-                        if d_sq < r_sq && d_sq >= inner_r_sq { draw_px = true; }
-                    } else if cx == x || cx == ex - 1 || cy == y || cy == ey - 1 {
-                        draw_px = true;
-                    }
+        let r = radius as i32;
+        let r_sq = r * r;
+        let inner_r = (r - 1).max(0);
+        let inner_r_sq = inner_r * inner_r;
+        let alpha = (color >> 24) & 0xFF;
 
-                    if draw_px {
-                        let idx = (cy as usize) * self.width + (cx as usize);
-                        let alpha = (color >> 24) & 0xFF;
-                        self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
-                    }
+        for cy in sy..ey {
+            for cx in sx..ex {
+                let is_top = cy < y + r;
+                let is_bottom = cy >= y + h - r;
+                let is_left = cx < x + r;
+                let is_right = cx >= x + w - r;
+
+                let draw = if (is_top || is_bottom) && (is_left || is_right) {
+                    let dx = if is_left { (x + r) - cx - 1 } else { cx - (x + w - r) };
+                    let dy = if is_top { (y + r) - cy - 1 } else { cy - (y + h - r) };
+                    let dist = dx * dx + dy * dy;
+                    dist < r_sq && dist >= inner_r_sq
+                } else {
+                    cx == x || cx == x + w - 1 || cy == y || cy == y + h - 1
+                };
+
+                if draw {
+                    let idx = (cy as usize) * self.width + (cx as usize);
+                    self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
                 }
             }
         }
     }
 
     pub fn draw_line_h(&mut self, x: i32, y: i32, w: i32, color: u32) {
-        let ex = (x + w).min(self.width as i32);
-        let sx = x.max(0);
-        if y < 0 || y >= self.height as i32 || sx >= ex { return; }
-        for cx in sx..ex {
-            if !self.is_clipped(cx, y) {
-                let idx = (y as usize) * self.width + (cx as usize);
-                let alpha = (color >> 24) & 0xFF;
-                self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
+        let clip = self.current_clip();
+        if y < clip.y || y >= clip.y + clip.h || y < 0 || y >= self.height as i32 { return; }
+        let sx = x.max(clip.x).max(0);
+        let ex = (x + w).min(clip.x + clip.w).min(self.width as i32);
+        if sx >= ex { return; }
+
+        let alpha = (color >> 24) & 0xFF;
+        let idx = (y as usize) * self.width + (sx as usize);
+        let len = (ex - sx) as usize;
+        if alpha == 255 {
+            self.buffer[idx..idx + len].fill(color | 0xFF000000);
+        } else {
+            for px in &mut self.buffer[idx..idx + len] {
+                *px = Self::blend(*px, color, alpha);
             }
         }
     }
 
     pub fn draw_line_v(&mut self, x: i32, y: i32, h: i32, color: u32) {
-        let ey = (y + h).min(self.height as i32);
-        let sy = y.max(0);
-        if x < 0 || x >= self.width as i32 || sy >= ey { return; }
+        let clip = self.current_clip();
+        if x < clip.x || x >= clip.x + clip.w || x < 0 || x >= self.width as i32 { return; }
+        let sy = y.max(clip.y).max(0);
+        let ey = (y + h).min(clip.y + clip.h).min(self.height as i32);
+        if sy >= ey { return; }
+
+        let alpha = (color >> 24) & 0xFF;
         for cy in sy..ey {
-            if !self.is_clipped(x, cy) {
-                let idx = (cy as usize) * self.width + (x as usize);
-                let alpha = (color >> 24) & 0xFF;
-                self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
-            }
+            let idx = (cy as usize) * self.width + (x as usize);
+            self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
         }
     }
 
-    pub fn measure_text(&self, text: &str, size_px: usize) -> (usize, usize) {
+    pub fn measure_text(&mut self, text: &str, size_px: usize) -> (usize, usize) {
         if let Some(font) = self.font {
             let scale = Scale::uniform(size_px as f32);
             let v_metrics = font.v_metrics(scale);
             let h = (v_metrics.ascent - v_metrics.descent).ceil() as usize;
             let mut w = 0.0;
             for c in text.chars() {
+                let key = (size_px, c);
+                if let Some(cache) = self.font_cache.as_ref() {
+                    if let Some((_, _, _, _, adv, _)) = cache.get(&key) {
+                        w += *adv as f32;
+                        continue;
+                    }
+                }
                 let g = font.glyph(c).scaled(scale);
                 w += g.h_metrics().advance_width;
             }
@@ -275,27 +273,51 @@ impl<'a> Canvas<'a> {
             None => return,
         };
 
+        let clip = self.current_clip();
         let scale = Scale::uniform(size_px as f32);
         let v_metrics = font.v_metrics(scale);
-        let mut cur_x = x as f32;
+        let mut cur_x = x;
 
         for c in text.chars() {
             if c == '\n' { continue; }
-            let glyph = font.glyph(c).scaled(scale).positioned(point(cur_x, y as f32 + v_metrics.ascent));
-            if let Some(bb) = glyph.pixel_bounding_box() {
-                glyph.draw(|gx, gy, v| {
-                    let px = bb.min.x + gx as i32;
-                    let py = bb.min.y + gy as i32;
-                    if !self.is_clipped(px, py) {
-                        let alpha = ((v * 255.0) as u32).min(255);
-                        if alpha > 0 {
-                            let idx = (py as usize) * self.width + (px as usize);
-                            self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
+            let key = (size_px, c);
+
+            let has_entry = self.font_cache.as_ref().map(|map| map.contains_key(&key)).unwrap_or(false);
+            if !has_entry {
+                let glyph = font.glyph(c).scaled(scale).positioned(point(0.0, v_metrics.ascent));
+                let adv = glyph.unpositioned().h_metrics().advance_width.round() as usize;
+                if let Some(bb) = glyph.pixel_bounding_box() {
+                    let mut cov = vec![0u8; bb.width() as usize * bb.height() as usize];
+                    glyph.draw(|gx, gy, v| cov[gy as usize * bb.width() as usize + gx as usize] = (v * 255.0) as u8);
+                    if let Some(map) = self.font_cache.as_mut() {
+                        map.insert(key, (bb.width() as usize, bb.height() as usize, bb.min.x as isize, bb.min.y as isize, adv.max(1), cov));
+                    }
+                } else if let Some(map) = self.font_cache.as_mut() {
+                    map.insert(key, (0, 0, 0, 0, adv.max(size_px / 3), Vec::new()));
+                }
+            }
+
+            if let Some(map) = self.font_cache.as_ref() {
+                if let Some((gw, gh, bx, by, adv, cov)) = map.get(&key) {
+                    let gx = cur_x + *bx as i32;
+                    let gy = y + *by as i32;
+
+                    for row in 0..*gh {
+                        let py = gy + row as i32;
+                        if py < clip.y || py >= clip.y + clip.h || py < 0 || py >= self.height as i32 { continue; }
+                        for col in 0..*gw {
+                            let px = gx + col as i32;
+                            if px < clip.x || px >= clip.x + clip.w || px < 0 || px >= self.width as i32 { continue; }
+                            let cov_val = cov[row * gw + col] as u32;
+                            if cov_val > 0 {
+                                let idx = (py as usize) * self.width + (px as usize);
+                                self.buffer[idx] = Self::blend(self.buffer[idx], color, cov_val);
+                            }
                         }
                     }
-                });
+                    cur_x += *adv as i32;
+                }
             }
-            cur_x += glyph.unpositioned().h_metrics().advance_width;
         }
     }
 
@@ -328,12 +350,13 @@ impl<'a> Canvas<'a> {
             [0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0],
         ];
 
+        let clip = self.current_clip();
         for (r, row) in LINUX_CURSOR_BITMAP.iter().enumerate() {
             let py = my + r as i32;
-            if py < 0 || py >= self.height as i32 { continue; }
+            if py < clip.y || py >= clip.y + clip.h || py < 0 || py >= self.height as i32 { continue; }
             for (c, &val) in row.iter().enumerate() {
                 let px = mx + c as i32;
-                if px < 0 || px >= self.width as i32 { continue; }
+                if px < clip.x || px >= clip.x + clip.w || px < 0 || px >= self.width as i32 { continue; }
                 let color = match val {
                     1 => 0xFF000000,
                     2 => 0xFFFFFFFF,

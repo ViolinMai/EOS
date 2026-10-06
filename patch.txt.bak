@@ -1,713 +1,617 @@
-### FILE: userspace/src/framework/mod.rs
-#![allow(unused_imports)]
+### ITEM FIX: src/arch/x86_64/syscall.rs
+#[unsafe(no_mangle)]
+pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
+    let frame = unsafe { &mut *frame_ptr };
+    let cur_core = crate::profiler::get_core_id();
 
-pub mod app;
-pub mod canvas;
-pub mod controls;
-pub mod input;
-pub mod layout;
-pub mod log;
-pub mod menu;
-pub mod theme;
-pub mod widget;
-
-pub use app::FrameworkApp;
-pub use canvas::Canvas;
-pub use controls::{ButtonWidget, CheckBoxWidget, LabelWidget, ProgressBarWidget, ScrollViewWidget, TextInputWidget};
-pub use input::{InputManager, PointerButton, PointerEvent, PointerState};
-pub use layout::{Alignment, ContainerWidget, Direction, LayoutItem};
-pub use menu::MenuBarWidget;
-pub use theme::{get_theme, set_theme_scale, Theme};
-pub use widget::{Rect, Widget, WindowFrame};
-### END
-
-### FILE: userspace/src/framework/app.rs
-use std::collections::BTreeMap;
-use std::fs;
-use rusttype::Font;
-use crate::framework::canvas::Canvas;
-use crate::framework::menu::MenuBarWidget;
-use crate::framework::theme::{get_theme, set_theme_scale, DESKTOP_WALLPAPER};
-use crate::framework::widget::{Widget, WindowFrame, Rect};
-use crate::framework::layout::ContainerWidget;
-use crate::apps::finder::FinderApp;
-use crate::apps::settings::SettingsApp;
-use crate::apps::terminal::TerminalApp;
-use crate::apps::activity_monitor::ActivityMonitorApp;
-use crate::apps::textedit::TextEditApp;
-use crate::apps::browser::BrowserApp;
-use crate::apps::preview::PreviewApp;
-use crate::syscall::{sys_present, sys_wait_event, sys_poll_event};
-
-pub struct FrameworkApp<'a> {
-    pub buffer: Vec<u32>,
-    pub width: usize,
-    pub height: usize,
-    pub font: Option<Font<'a>>,
-    pub font_cache: BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>,
-    pub root_widgets: Vec<Box<dyn Widget>>,
-    pub menubar_widget: MenuBarWidget,
-    pub dock_items: Vec<String>,
-    pub mouse_x: i32,
-    pub mouse_y: i32,
-    pub dragging_window_idx: Option<usize>,
-    pub dock_handler: Option<Box<dyn FnMut(usize)>>,
-}
-
-impl<'a> FrameworkApp<'a> {
-    pub fn new(font_bytes: &'a [u8], width: usize, height: usize) -> Self {
-        let font = if !font_bytes.is_empty() {
-            Font::try_from_bytes(font_bytes)
-        } else {
-            None
-        };
-
-        let mut menubar = MenuBarWidget::new();
-        menubar.layout(0, 0, width as i32, get_theme().pt(32.0));
-
-        let mut app = Self {
-            buffer: vec![0; width * height],
-            width,
-            height,
-            font,
-            font_cache: BTreeMap::new(),
-            root_widgets: Vec::new(),
-            menubar_widget: menubar,
-            dock_items: vec![
-                "Finder".into(),
-                "Settings".into(),
-                "Terminal".into(),
-                "Activity Monitor".into(),
-                "TextEdit".into(),
-                "Browser".into(),
-            ],
-            mouse_x: (width / 2) as i32,
-            mouse_y: (height / 2) as i32,
-            dragging_window_idx: None,
-            dock_handler: None,
-        };
-
-        app.load_persisted_wallpaper();
-        app
-    }
-
-    pub fn set_dock_handler<F: FnMut(usize) + 'static>(&mut self, handler: F) {
-        self.dock_handler = Some(Box::new(handler));
-    }
-
-    fn load_persisted_wallpaper(&mut self) {
-        if let Ok(content) = fs::read_to_string("settings.ini") {
-            for line in content.lines() {
-                if let Some(val) = line.strip_prefix("wallpaper=") {
-                    let path = val.trim();
-                    if !path.is_empty() {
-                        if let Ok(data) = fs::read(path) {
-                            if data.len() >= 8 && &data[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
-                                if let Ok((px, w, h)) = crate::png::decode_png(&data) {
-                                    unsafe { DESKTOP_WALLPAPER = Some((px, w, h)); }
-                                    return;
-                                }
-                            }
-                            if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
-                                let mut dec = zune_jpeg::JpegDecoder::new(&data);
-                                if let Ok(raw) = dec.decode() {
-                                    if let Some(info) = dec.info() {
-                                        let w = info.width as usize;
-                                        let h = info.height as usize;
-                                        let mut px = vec![0u32; w * h];
-                                        for i in 0..(w * h) {
-                                            let o = i * 3;
-                                            if o + 2 < raw.len() {
-                                                px[i] = (0xFF << 24) | ((raw[o] as u32) << 16) | ((raw[o+1] as u32) << 8) | (raw[o+2] as u32);
-                                            }
-                                        }
-                                        unsafe { DESKTOP_WALLPAPER = Some((px, w, h)); }
-                                        return;
-                                    }
-                                }
-                            }
-                        }
+    match frame.rax {
+        0 => { // read
+            let fd = frame.rdi as usize;
+            if fd < 64 {
+                let proc = get_current_process();
+                if let Some(file) = &mut proc.fd_table[fd] {
+                    match &file.source {
+                        crate::task::FileSource::Memory(bytes) => {
+                            let remain = bytes.len().saturating_sub(file.offset);
+                            let to_copy = remain.min(frame.rdx as usize);
+                            if to_copy > 0 {
+                                if copy_to_user(frame.rsi, &bytes[file.offset..file.offset+to_copy]).is_ok() {
+                                    file.offset += to_copy; frame.rax = to_copy as u64;
+                                } else { frame.rax = -14i64 as u64; }
+                            } else { frame.rax = 0; }
+                        },
+                        _ => { frame.rax = -38i64 as u64; }
                     }
-                }
-            }
+                } else { frame.rax = -9i64 as u64; }
+            } else { frame.rax = -9i64 as u64; }
         }
-    }
-
-    pub fn spawn_app(&mut self, name: &str) {
-        let theme = get_theme();
-        for w in &mut self.root_widgets {
-            if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
-                if frame.title.contains(name) {
-                    frame.is_closed = false;
-                    frame.is_minimized = false;
-                    frame.is_active = true;
-                    return;
-                }
-            }
+        1 => { // write
+            let fd = frame.rdi as usize;
+            if fd == 1 || fd == 2 {
+                let mut buf = alloc::vec![0u8; frame.rdx as usize];
+                if copy_from_user(&mut buf, frame.rsi, frame.rdx as usize).is_ok() {
+                    if let Ok(s) = core::str::from_utf8(&buf) { crate::serial_print!("{}", s); }
+                    frame.rax = frame.rdx;
+                } else { frame.rax = -14i64 as u64; }
+            } else if fd < 64 {
+                let proc = get_current_process();
+                if let Some(file) = &mut proc.fd_table[fd] {
+                    if !file.is_writable {
+                        crate::log_warn!("SYSCALL", "sys_write: fd {} ({}) is NOT writable", fd, file.path);
+                        frame.rax = -9i64 as u64;
+                        return;
+                    }
+                    if let crate::task::FileSource::Memory(ref mut bytes) = file.source {
+                        let mut buf = alloc::vec![0u8; frame.rdx as usize];
+                        if copy_from_user(&mut buf, frame.rsi, frame.rdx as usize).is_ok() {
+                            if file.offset + buf.len() > bytes.len() { bytes.resize(file.offset + buf.len(), 0); }
+                            bytes[file.offset..file.offset+buf.len()].copy_from_slice(&buf);
+                            file.offset += buf.len();
+                            file.is_dirty = true;
+                            crate::log_info!("SYSCALL", "sys_write: wrote {} bytes to fd {} ({})", buf.len(), fd, file.path);
+                            frame.rax = buf.len() as u64;
+                        } else { frame.rax = -14i64 as u64; }
+                    } else { frame.rax = -9i64 as u64; }
+                } else { frame.rax = -9i64 as u64; }
+            } else { frame.rax = -9i64 as u64; }
         }
+        2 | 257 => { // open, openat
+            let (path_ptr, flags) = if frame.rax == 2 { (frame.rdi, frame.rsi) } else { (frame.rsi, frame.rdx) };
+            let mut buf = [0u8; 512];
+            let mut len = 0;
+            while len < 511 {
+                let mut b = [0u8; 1];
+                if copy_from_user(&mut b, path_ptr + len, 1).is_err() || b[0] == 0 { break; }
+                buf[len as usize] = b[0]; len += 1;
+            }
+            let path = core::str::from_utf8(&buf[..len as usize]).unwrap_or("").trim();
 
-        let content: Box<dyn Widget> = match name {
-            "Finder" => Box::new(FinderApp::new()),
-            "Settings" => Box::new(SettingsApp::new()),
-            "Terminal" => Box::new(TerminalApp::new()),
-            "Activity Monitor" => Box::new(ActivityMonitorApp::new()),
-            "Browser" => Box::new(BrowserApp::new()),
-            _ => Box::new(ContainerWidget::vbox()),
-        };
+            let o_accmode = flags & 3;
+            let o_wronly = o_accmode == 1;
+            let o_rdwr = o_accmode == 2;
+            let is_writable = o_wronly || o_rdwr;
+            let o_creat = (flags & 0o100) != 0;
+            let o_trunc = (flags & 0o1000) != 0;
+            let o_append = (flags & 0o2000) != 0;
+            let is_dir_req = (flags & 65536) != 0;
 
-        let win = Box::new(WindowFrame::new(
-            name,
-            theme.pt(80.0) + (self.root_widgets.len() as i32 * theme.pt(25.0)),
-            theme.pt(60.0) + (self.root_widgets.len() as i32 * theme.pt(25.0)),
-            theme.pt(620.0),
-            theme.pt(420.0),
-            content,
-        ));
-        self.root_widgets.push(win);
-    }
+            let mut opened = false;
+            let mut src = crate::task::FileSource::Memory(alloc::vec![]);
+            let mut init_offset = 0usize;
 
-    pub fn run_loop(&mut self) {
-        loop {
-            let theme = get_theme();
-
-            let mut first_ev = sys_wait_event(16);
-            while let Some(ev) = first_ev {
-                let ev_type = ev[0];
-                let dock_h = theme.pt(54.0);
-                let dock_w = (self.dock_items.len() as i32) * theme.pt(52.0) + theme.pt(20.0);
-                let dock_x = ((self.width as i32) - dock_w) / 2;
-                let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
-
-                match ev_type {
-                    1 => {
-                        let dx = (ev[1] as u32) as i32;
-                        let dy = ((ev[1] >> 32) as u32) as i32;
-
-                        self.mouse_x = (self.mouse_x + dx).clamp(0, self.width as i32 - 1);
-                        self.mouse_y = (self.mouse_y + dy).clamp(0, self.height as i32 - 1);
-
-                        if let Some(drag_idx) = self.dragging_window_idx {
-                            if drag_idx < self.root_widgets.len() {
-                                if let Some(frame) = self.root_widgets[drag_idx].as_any_mut().downcast_mut::<WindowFrame>() {
-                                    if frame.is_dragging {
-                                        let new_x = (self.mouse_x - frame.drag_offset_x).clamp(0, self.width as i32 - 100);
-                                        let new_y = (self.mouse_y - frame.drag_offset_y).clamp(theme.pt(32.0), self.height as i32 - 60);
-                                        frame.layout(new_x, new_y, frame.bounds.w, frame.bounds.h);
-                                    }
-                                }
-                            }
-                        } else {
-                            for w in self.root_widgets.iter_mut().rev() {
-                                if w.handle_mouse(self.mouse_x, self.mouse_y, false) {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    2 => {
-                        let btn = (ev[1] & 0xFF) as u8;
-                        let pressed = ((ev[1] >> 8) & 0xFF) != 0;
-
-                        if btn == 0 && !pressed {
-                            self.dragging_window_idx = None;
-                            for w in &mut self.root_widgets {
-                                if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
-                                    f.is_dragging = false;
-                                }
-                            }
-                        }
-
-                        if btn == 0 && pressed {
-                            if self.mouse_y >= dock_y && self.mouse_y <= dock_y + dock_h && self.mouse_x >= dock_x && self.mouse_x <= dock_x + dock_w {
-                                let idx = ((self.mouse_x - dock_x - theme.pt(12.0)) / theme.pt(52.0)) as usize;
-                                if idx < self.dock_items.len() {
-                                    if let Some(ref mut handler) = self.dock_handler {
-                                        handler(idx);
-                                    }
-                                    let app_name = self.dock_items[idx].clone();
-                                    self.spawn_app(&app_name);
-                                    first_ev = sys_poll_event();
-                                    continue;
-                                }
-                            }
-                        }
-
-                        let mut hit_idx = None;
-                        for (idx, w) in self.root_widgets.iter_mut().enumerate().rev() {
-                            if w.handle_mouse(self.mouse_x, self.mouse_y, pressed) {
-                                hit_idx = Some(idx);
-                                break;
-                            }
-                        }
-
-                        if let Some(idx) = hit_idx {
-                            if pressed {
-                                for (i, w) in self.root_widgets.iter_mut().enumerate() {
-                                    if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
-                                        f.is_active = i == idx;
-                                    }
-                                }
-                                let win = self.root_widgets.remove(idx);
-                                self.root_widgets.push(win);
-                                let last_idx = self.root_widgets.len() - 1;
-                                if let Some(f) = self.root_widgets[last_idx].as_any_mut().downcast_mut::<WindowFrame>() {
-                                    if f.is_dragging {
-                                        self.dragging_window_idx = Some(last_idx);
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    3 => {
-                        let keycode = (ev[1] & 0xFF) as u8;
-                        let mods = ((ev[1] >> 8) & 0xFF) as u8;
-                        if let Some(active_win) = self.root_widgets.last_mut() {
-                            active_win.handle_key(keycode, mods);
-                        }
-                    }
-                    4 => {
-                        let c_code = ev[1] as u32;
-                        if let Some(c) = char::from_u32(c_code) {
-                            if let Some(active_win) = self.root_widgets.last_mut() {
-                                active_win.handle_char(c);
-                            }
-                        }
-                    }
-                    5 => {
-                        let dy = (ev[1] as u32) as i32;
-                        for w in self.root_widgets.iter_mut().rev() {
-                            if w.handle_scroll(self.mouse_x, self.mouse_y, dy) {
-                                break;
-                            }
-                        }
-                    }
-                    _ => {}
+            if is_dir_req {
+                if let Ok(items) = crate::fs::vfs_list_dir(path) {
+                    src = crate::task::FileSource::Directory(items, 0);
+                    opened = true;
                 }
-
-                first_ev = sys_poll_event();
+            } else if let Ok(bytes) = crate::fs::vfs_read_bytes(path) {
+                init_offset = if o_append { bytes.len() } else { 0 };
+                src = crate::task::FileSource::Memory(if o_trunc { alloc::vec![] } else { bytes });
+                opened = true;
+            } else if let Ok(items) = crate::fs::vfs_list_dir(path) {
+                src = crate::task::FileSource::Directory(items, 0);
+                opened = true;
+            } else if o_creat {
+                src = crate::task::FileSource::Memory(alloc::vec![]);
+                opened = true;
             }
 
-            // فحص فتح الصور من Finder
-            let mut image_to_open = None;
-            for w in &mut self.root_widgets {
-                if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
-                    if let Some(finder) = frame.content.as_any_mut().downcast_mut::<FinderApp>() {
-                        if let Some(req) = finder.pending_open_image.take() {
-                            image_to_open = Some(req);
-                            break;
-                        }
+            if opened {
+                let proc = get_current_process();
+                let mut fd_allocated = false;
+                for (i, f) in proc.fd_table.iter_mut().enumerate().skip(3) {
+                    if f.is_none() {
+                        crate::log_info!("SYSCALL", "sys_open: '{}' -> fd {} (writable={}, flags={:#o})", path, i, is_writable, flags);
+                        *f = Some(crate::task::FileDescriptor {
+                            path: alloc::string::String::from(path),
+                            source: src,
+                            offset: init_offset,
+                            is_writable,
+                            is_dirty: o_trunc,
+                        });
+                        frame.rax = i as u64;
+                        fd_allocated = true;
+                        break;
                     }
                 }
-            }
-
-            if let Some((name, path)) = image_to_open {
-                let prev_app = Box::new(PreviewApp::new(name.clone(), path));
-                let win = Box::new(WindowFrame::new(
-                    format!("Preview - {}", name),
-                    theme.pt(100.0),
-                    theme.pt(60.0),
-                    theme.pt(680.0),
-                    theme.pt(480.0),
-                    prev_app,
-                ));
-                self.root_widgets.push(win);
-            }
-
-            // رسم خلفية سطح المكتب مع Aspect-Fill و Center-Crop
-            unsafe {
-                if let Some((ref wp_px, wp_w, wp_h)) = DESKTOP_WALLPAPER {
-                    let scale_x = self.width as f32 / wp_w as f32;
-                    let scale_y = self.height as f32 / wp_h as f32;
-                    let scale = scale_x.max(scale_y);
-
-                    let crop_w = (self.width as f32 / scale) as usize;
-                    let crop_h = (self.height as f32 / scale) as usize;
-                    let start_x = (wp_w.saturating_sub(crop_w)) / 2;
-                    let start_y = (wp_h.saturating_sub(crop_h)) / 2;
-
-                    for y in 0..self.height {
-                        let sy = (start_y + ((y as f32 / scale) as usize)).min(wp_h - 1);
-                        let row_idx = y * self.width;
-                        let src_row = sy * wp_w;
-                        for x in 0..self.width {
-                            let sx = (start_x + ((x as f32 / scale) as usize)).min(wp_w - 1);
-                            self.buffer[row_idx + x] = wp_px[src_row + sx];
-                        }
-                    }
-                } else {
-                    for p in &mut self.buffer {
-                        *p = theme.bg_desktop;
-                    }
-                }
-            }
-
-            // رسم النوافذ والتطبيقات
-            {
-                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-                for w in &self.root_widgets {
-                    w.paint(&mut canvas);
-                }
-            }
-
-            let dock_h = theme.pt(54.0);
-            let dock_w = (self.dock_items.len() as i32) * theme.pt(52.0) + theme.pt(20.0);
-            let dock_x = ((self.width as i32) - dock_w) / 2;
-            let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
-
-            {
-                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-
-                // رسم الـ Dock الشفاف مع Frosted Glass Blur
-                canvas.draw_frosted_glass_rect(dock_x, dock_y, dock_w, dock_h, 0xCC0F172A, theme.pt(16.0) as usize);
-                canvas.draw_rect_outline(dock_x, dock_y, dock_w, dock_h, 0x44FFFFFF, theme.pt(16.0) as usize);
-
-                for (i, item) in self.dock_items.iter().enumerate() {
-                    let ix = dock_x + theme.pt(12.0) + (i as i32 * theme.pt(52.0));
-                    let iy = dock_y + theme.pt(7.0);
-                    canvas.draw_rect(ix, iy, theme.pt(40.0), theme.pt(40.0), theme.accent, theme.pt(8.0) as usize);
-                    let initial = item.chars().next().unwrap_or('A').to_string();
-                    let (tw, th) = canvas.measure_text(&initial, theme.font_title());
-                    canvas.draw_text(ix + ((theme.pt(40.0) - tw as i32) / 2), iy + ((theme.pt(40.0) - th as i32) / 2), &initial, 0xFFFFFFFF, theme.font_title());
-                }
-
-                // رسم شريط الـ MenuBar كـ Widget
-                self.menubar_widget.paint(&mut canvas);
-
-                canvas.draw_linux_cursor(self.mouse_x, self.mouse_y);
-            }
-
-            sys_present(self.buffer.as_ptr(), self.width, self.height);
-        }
-    }
-}
-### END
-
-### FILE: userspace/src/apps/finder.rs
-use crate::framework::*;
-use std::fs;
-
-#[derive(Clone, Debug)]
-pub struct FinderEntry {
-    pub name: String,
-    pub is_dir: bool,
-    pub size: usize,
-}
-
-pub struct FinderApp {
-    pub bounds: Rect,
-    pub current_path: String,
-    pub entries: Vec<FinderEntry>,
-    pub selected_idx: Option<usize>,
-    pub scroll_y: i32,
-    pub status_label: String,
-    pub pending_open_image: Option<(String, String)>,
-}
-
-impl FinderApp {
-    pub fn new() -> Self {
-        let mut app = Self {
-            bounds: Rect::default(),
-            current_path: String::from("EOS SHARE"),
-            entries: Vec::new(),
-            selected_idx: None,
-            scroll_y: 0,
-            status_label: String::from("Ready"),
-            pending_open_image: None,
-        };
-        app.load_directory("EOS SHARE");
-        app
-    }
-
-    pub fn load_directory(&mut self, path: &str) {
-        let clean = path.trim().trim_matches('/');
-        let target_path = if clean.is_empty() {
-            String::from("EOS SHARE")
-        } else {
-            clean.to_string()
-        };
-
-        crate::f_info!("FINDER", "load_directory requested for: '{}'", target_path);
-
-        self.entries.clear();
-        self.selected_idx = None;
-        self.scroll_y = 0;
-
-        let mut read_success = false;
-
-        let candidates = [
-            format!("/{}", target_path),
-            target_path.clone(),
-        ];
-
-        for p in &candidates {
-            if let Ok(read_dir) = fs::read_dir(p) {
-                let mut count = 0;
-                for entry in read_dir.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
-                    if name == "." || name == ".." { continue; }
-                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-
-                    let size = if is_dir {
-                        0
-                    } else {
-                        let full_file_path = format!("{}/{}", p.trim_end_matches('/'), name);
-                        fs::metadata(&full_file_path)
-                            .map(|m| m.len() as usize)
-                            .unwrap_or_else(|_| {
-                                fs::read(&full_file_path).map(|b| b.len()).unwrap_or(0)
-                            })
-                    };
-
-                    self.entries.push(FinderEntry { name, is_dir, size });
-                    count += 1;
-                }
-                crate::f_info!("FINDER", "fs::read_dir('{}') successful: read {} entries", p, count);
-                read_success = true;
-                break;
-            }
-        }
-
-        self.current_path = target_path;
-
-        if self.current_path.contains('/') || (self.current_path != "EOS SHARE" && self.current_path != "RootFS" && self.current_path != "Initrd") {
-            self.entries.insert(0, FinderEntry {
-                name: String::from(".."),
-                is_dir: true,
-                size: 0,
-            });
-        }
-
-        self.entries.sort_by(|a, b| {
-            if a.name == ".." {
-                std::cmp::Ordering::Less
-            } else if b.name == ".." {
-                std::cmp::Ordering::Greater
-            } else {
-                b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            }
-        });
-
-        self.status_label = if read_success {
-            format!("{} items in /{}", self.entries.len(), self.current_path)
-        } else {
-            format!("Empty or unavailable folder (/{}).", self.current_path)
-        };
-    }
-
-    fn open_entry(&mut self, idx: usize) {
-        if idx >= self.entries.len() { return; }
-        let entry = self.entries[idx].clone();
-        crate::f_info!("FINDER", "User activated entry: '{}' (is_dir: {})", entry.name, entry.is_dir);
-
-        if entry.is_dir {
-            if entry.name == ".." {
-                if let Some(pos) = self.current_path.rfind('/') {
-                    let parent = self.current_path[..pos].to_string();
-                    self.load_directory(&parent);
-                } else {
-                    self.load_directory("EOS SHARE");
+                if !fd_allocated {
+                    crate::log_error!("SYSCALL", "sys_open: fd table full for '{}'", path);
+                    frame.rax = -24i64 as u64;
                 }
             } else {
-                let next_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
-                self.load_directory(&next_path);
-            }
-        } else {
-            let lower = entry.name.to_lowercase();
-            if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-                let full_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
-                self.pending_open_image = Some((entry.name.clone(), full_path));
+                crate::log_warn!("SYSCALL", "sys_open: failed to open/create '{}' (flags={:#o})", path, flags);
+                frame.rax = -2i64 as u64;
             }
         }
-    }
-}
-
-impl Widget for FinderApp {
-    fn as_any(&self) -> &dyn std::any::Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
-
-    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
-        self.bounds = Rect::new(x, y, w, h);
-        self.bounds
-    }
-
-    fn paint(&self, canvas: &mut Canvas) {
-        let theme = get_theme();
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, 0);
-
-        let tb_h = theme.pt(40.0);
-        let sb_h = theme.pt(26.0);
-
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, 0);
-        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
-
-        let favorites = [("Root", "EOS SHARE"), ("RootFS", "RootFS"), ("Initrd", "Initrd")];
-        let mut fav_x = self.bounds.x + theme.pt(12.0);
-        for &(label, target) in &favorites {
-            let btn_w = theme.pt(54.0);
-            let is_cur = self.current_path == target || (target == "EOS SHARE" && self.current_path.starts_with("EOS SHARE/"));
-            let bg_c = if is_cur { theme.accent } else { 0xFF243044 };
-            canvas.draw_rect(fav_x, self.bounds.y + theme.pt(7.0), btn_w, theme.pt(26.0), bg_c, theme.pt(5.0) as usize);
-            let (tw, th) = canvas.measure_text(label, theme.font_caption());
-            canvas.draw_text(fav_x + (btn_w - tw as i32) / 2, self.bounds.y + theme.pt(7.0) + (theme.pt(26.0) - th as i32) / 2, label, 0xFFFFFFFF, theme.font_caption());
-            fav_x += btn_w + theme.pt(8.0);
-        }
-
-        let path_text = format!("Location: /{}", self.current_path);
-        canvas.draw_text_clipped(fav_x + theme.pt(8.0), self.bounds.y + theme.pt(11.0), self.bounds.w - (fav_x - self.bounds.x) - theme.pt(16.0), &path_text, theme.text_primary, theme.font_body());
-
-        let list_y = self.bounds.y + tb_h + 1;
-        let list_h = (self.bounds.h - tb_h - sb_h - 1).max(0);
-        canvas.push_clip(Rect::new(self.bounds.x, list_y, self.bounds.w, list_h));
-
-        let row_h = theme.pt(34.0);
-        let mut cur_y = list_y + theme.pt(4.0) - self.scroll_y;
-
-        for (idx, entry) in self.entries.iter().enumerate() {
-            if cur_y + row_h >= list_y && cur_y <= list_y + list_h {
-                let is_sel = self.selected_idx == Some(idx);
-                let bg = if is_sel {
-                    theme.accent
-                } else if idx % 2 == 0 {
-                    theme.bg_window
-                } else {
-                    0xFF141E2E
-                };
-
-                canvas.draw_rect(self.bounds.x + theme.pt(4.0), cur_y, self.bounds.w - theme.pt(8.0), row_h, bg, theme.pt(4.0) as usize);
-
-                let icon = if entry.name == ".." {
-                    "⤴️"
-                } else if entry.is_dir {
-                    "📁"
-                } else if entry.name.ends_with(".elf") {
-                    "⚙️"
-                } else if entry.name.ends_with(".png") || entry.name.ends_with(".jpg") || entry.name.ends_with(".jpeg") {
-                    "🖼️"
-                } else {
-                    "📄"
-                };
-
-                let label = if entry.is_dir {
-                    format!("{}  {}", icon, entry.name)
-                } else {
-                    let sz_str = if entry.size >= 1024 * 1024 {
-                        format!("{:.2} MB", (entry.size as f64) / (1024.0 * 1024.0))
-                    } else if entry.size >= 1024 {
-                        format!("{} KB", entry.size / 1024)
-                    } else {
-                        format!("{} B", entry.size)
-                    };
-                    format!("{}  {} ({})", icon, entry.name, sz_str)
-                };
-
-                let txt_c = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
-                canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), cur_y + theme.pt(8.0), self.bounds.w - theme.pt(28.0), &label, txt_c, theme.font_body());
-            }
-            cur_y += row_h;
-        }
-
-        canvas.pop_clip();
-
-        let sb_y = self.bounds.y + self.bounds.h - sb_h;
-        canvas.draw_rect(self.bounds.x, sb_y, self.bounds.w, sb_h, theme.bg_titlebar, 0);
-        canvas.draw_line_h(self.bounds.x, sb_y, self.bounds.w, theme.border_window);
-        canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), sb_y + theme.pt(5.0), self.bounds.w - theme.pt(28.0), &self.status_label, theme.text_muted, theme.font_caption());
-    }
-
-    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
-        if !self.bounds.contains(mx, my) { return false; }
-        let theme = get_theme();
-        let tb_h = theme.pt(40.0);
-        let sb_h = theme.pt(26.0);
-
-        if pressed {
-            if my >= self.bounds.y && my <= self.bounds.y + tb_h {
-                let favorites = ["EOS SHARE", "RootFS", "Initrd"];
-                let mut fav_x = self.bounds.x + theme.pt(12.0);
-                for target in favorites {
-                    let btn_w = theme.pt(54.0);
-                    if mx >= fav_x && mx <= fav_x + btn_w {
-                        self.load_directory(target);
-                        return true;
-                    }
-                    fav_x += btn_w + theme.pt(8.0);
-                }
-                return true;
-            }
-
-            let list_y = self.bounds.y + tb_h + 1;
-            let list_h = self.bounds.h - tb_h - sb_h;
-            if my >= list_y && my <= list_y + list_h {
-                let row_h = theme.pt(34.0);
-                let rel_y = (my - (list_y + theme.pt(4.0))) + self.scroll_y;
-                if rel_y >= 0 {
-                    let clicked_idx = (rel_y / row_h) as usize;
-                    if clicked_idx < self.entries.len() {
-                        if self.selected_idx == Some(clicked_idx) {
-                            self.open_entry(clicked_idx);
-                        } else {
-                            self.selected_idx = Some(clicked_idx);
+        3 | 6 => { // close
+            let fd = frame.rdi as usize;
+            if fd < 64 {
+                let proc = get_current_process();
+                if let Some(file) = proc.fd_table[fd].take() {
+                    crate::log_info!("SYSCALL", "sys_close: fd {} ('{}', is_writable={}, is_dirty={})", fd, file.path, file.is_writable, file.is_dirty);
+                    if file.is_writable && file.is_dirty {
+                        if let crate::task::FileSource::Memory(ref bytes) = file.source {
+                            crate::log_info!("SYSCALL", "sys_close: Flushing {} bytes to disk for '{}'", bytes.len(), file.path);
+                            let _ = crate::fs::vfs_save_text_file(&file.path, bytes);
                         }
-                        return true;
+                    }
+                }
+                frame.rax = 0;
+            } else { frame.rax = -9i64 as u64; }
+        }
+        4 => { // stat
+            let path_ptr = frame.rdi;
+            let statbuf = frame.rsi;
+            let mut buf = [0u8; 512];
+            let mut len = 0;
+            while len < 511 {
+                let mut b = [0u8; 1];
+                if copy_from_user(&mut b, path_ptr + len, 1).is_err() || b[0] == 0 { break; }
+                buf[len as usize] = b[0]; len += 1;
+            }
+            let path = core::str::from_utf8(&buf[..len as usize]).unwrap_or("").trim();
+            if let Ok((sz, kind)) = crate::fs::vfs_stat(path) {
+                if fill_stat_buffer(statbuf, sz, kind).is_ok() { frame.rax = 0; } else { frame.rax = -14i64 as u64; }
+            } else { frame.rax = -2i64 as u64; }
+        }
+        5 | 262 => { // fstat, newfstatat
+            let (fd, path_ptr, statbuf) = if frame.rax == 5 { (frame.rdi as usize, 0, frame.rsi) } else { (frame.rdi as usize, frame.rsi, frame.rdx) };
+            let mut is_ok = false;
+            let mut mode = 0o100644u32;
+            let mut size = 0u64;
+
+            if frame.rax == 262 && path_ptr != 0 {
+                let mut buf = [0u8; 512];
+                let mut len = 0;
+                while len < 511 {
+                    let mut b = [0u8; 1];
+                    if copy_from_user(&mut b, path_ptr + len, 1).is_err() || b[0] == 0 { break; }
+                    buf[len as usize] = b[0]; len += 1;
+                }
+                let path = core::str::from_utf8(&buf[..len as usize]).unwrap_or("").trim();
+                if let Ok((sz, kind)) = crate::fs::vfs_stat(path) {
+                    size = sz; mode = kind; is_ok = true;
+                }
+            } else if fd < 64 {
+                let proc = get_current_process();
+                if let Some(file) = &proc.fd_table[fd] {
+                    match &file.source {
+                        crate::task::FileSource::Memory(b) => { size = b.len() as u64; mode = 0o100644; is_ok = true; },
+                        crate::task::FileSource::Directory(_,_) => { size = 0; mode = 0o040755; is_ok = true; },
+                        crate::task::FileSource::AtaDisk { size: s, .. } => { size = *s as u64; mode = 0o100644; is_ok = true; },
                     }
                 }
             }
+            if is_ok {
+                if fill_stat_buffer(statbuf, size, mode).is_ok() { frame.rax = 0; } else { frame.rax = -14i64 as u64; }
+            } else { frame.rax = -2i64 as u64; }
         }
-        true
-    }
-
-    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
-        if !self.bounds.contains(mx, my) { return false; }
-        let theme = get_theme();
-        let row_h = theme.pt(34.0);
-        let total_h = (self.entries.len() as i32) * row_h;
-        let view_h = self.bounds.h - theme.pt(66.0);
-        let max_scroll = (total_h - view_h).max(0);
-
-        if dy < 0 {
-            self.scroll_y = (self.scroll_y + theme.pt(28.0)).min(max_scroll);
-        } else {
-            self.scroll_y = (self.scroll_y - theme.pt(28.0)).max(0);
+        7 | 271 => { // poll, ppoll
+            let fds = frame.rdi; let n = frame.rsi as usize;
+            if n <= 64 && validate_user_range(fds, n * 8) {
+                for i in 0..n { let _ = copy_to_user(fds + (i as u64) * 8 + 6, &[0u8, 0u8]); }
+                frame.rax = 0;
+            } else { frame.rax = -14i64 as u64; }
         }
-        true
-    }
-
-    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
-        match keycode {
-            0x1C => {
-                if let Some(idx) = self.selected_idx {
-                    self.open_entry(idx);
-                    return true;
+        8 => { // lseek
+            let fd = frame.rdi as usize;
+            if fd < 64 {
+                let proc = get_current_process();
+                if let Some(file) = &mut proc.fd_table[fd] {
+                    let offset = frame.rsi as i64; let whence = frame.rdx;
+                    let size = match &file.source { crate::task::FileSource::Memory(b) => b.len(), _ => 0 };
+                    let new_off = match whence { 0 => offset, 1 => file.offset as i64 + offset, 2 => size as i64 + offset, _ => -1 };
+                    if new_off >= 0 { file.offset = new_off as usize; frame.rax = new_off as u64; } else { frame.rax = -22i64 as u64; }
+                } else { frame.rax = -9i64 as u64; }
+            } else { frame.rax = -9i64 as u64; }
+        }
+        9 => { // mmap
+            let len = frame.rsi as usize; let flags = frame.r10;
+            if (flags & 0x20) != 0 {
+                let pages = (len + 0xFFF) / 4096;
+                let proc = get_current_process();
+                let vaddr = proc.mmap_bump;
+                proc.mmap_bump += (pages * 4096) as u64;
+                let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
+                if crate::mm::paging::map_user_pages(cur_pml4, vaddr, pages).is_err() { frame.rax = -12i64 as u64; } else { frame.rax = vaddr; }
+            } else { frame.rax = -38i64 as u64; }
+        }
+        11 => { // munmap
+            frame.rax = 0;
+        }
+        12 => { // brk
+            let addr = frame.rdi;
+            let proc = get_current_process();
+            if addr == 0 { frame.rax = proc.mmap_bump; } else {
+                let current = proc.mmap_bump;
+                if addr > current {
+                    let pages = ((addr - current) as usize + 0xFFF) / 4096;
+                    let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
+                    if crate::mm::paging::map_user_pages(cur_pml4, current, pages).is_err() {
+                        frame.rax = current; return;
+                    }
+                    proc.mmap_bump = (addr + 0xFFF) & !0xFFF;
                 }
+                frame.rax = addr;
             }
-            0x48 => {
-                if let Some(idx) = self.selected_idx {
-                    if idx > 0 { self.selected_idx = Some(idx - 1); return true; }
-                } else if !self.entries.is_empty() {
-                    self.selected_idx = Some(0);
-                    return true;
+        }
+        16 => { frame.rax = 0; }
+        20 => { // writev
+            let fd = frame.rdi; let iov_ptr = frame.rsi as *const [u64; 2]; let iovcnt = frame.rdx as usize;
+            if fd == 1 || fd == 2 {
+                let mut written = 0;
+                for i in 0..iovcnt {
+                    let mut iov = [0u64; 2];
+                    if copy_from_user(unsafe { core::slice::from_raw_parts_mut(iov.as_mut_ptr() as *mut u8, 16) }, iov_ptr as u64 + (i * 16) as u64, 16).is_ok() {
+                        let mut buf = alloc::vec![0u8; iov[1] as usize];
+                        if copy_from_user(&mut buf, iov[0], iov[1] as usize).is_ok() {
+                            if let Ok(s) = core::str::from_utf8(&buf) { crate::serial_print!("{}", s); }
+                            written += iov[1];
+                        }
+                    }
                 }
-            }
-            0x50 => {
-                if let Some(idx) = self.selected_idx {
-                    if idx + 1 < self.entries.len() { self.selected_idx = Some(idx + 1); return true; }
-                } else if !self.entries.is_empty() {
-                    self.selected_idx = Some(0);
-                    return true;
-                }
-            }
-            0x0E => {
-                if let Some(pos) = self.current_path.rfind('/') {
-                    let parent = self.current_path[..pos].to_string();
-                    self.load_directory(&parent);
+                frame.rax = written;
+            } else { frame.rax = -9i64 as u64; }
+        }
+        24 => { // sched_yield
+            for _ in 0..32 { core::hint::spin_loop(); }
+            frame.rax = 0;
+        }
+        25 => { // mremap
+            let old_addr = frame.rdi;
+            let old_size = frame.rsi as usize;
+            let new_size = frame.rdx as usize;
+            if new_size > old_size {
+                let additional_bytes = new_size - old_size;
+                let additional_pages = (additional_bytes + 0xFFF) / 4096;
+                let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
+                let append_vaddr = (old_addr + old_size as u64 + 0xFFF) & !0xFFF;
+                if crate::mm::paging::map_user_pages(cur_pml4, append_vaddr, additional_pages).is_ok() {
+                    frame.rax = old_addr;
                 } else {
-                    self.load_directory("EOS SHARE");
+                    let proc = get_current_process();
+                    let new_vaddr = proc.mmap_bump;
+                    let total_pages = (new_size + 0xFFF) / 4096;
+                    proc.mmap_bump += (total_pages * 4096) as u64;
+                    if crate::mm::paging::map_user_pages(cur_pml4, new_vaddr, total_pages).is_ok() {
+                        let mut copy_buf = alloc::vec![0u8; old_size];
+                        if copy_from_user(&mut copy_buf, old_addr, old_size).is_ok() {
+                            let _ = copy_to_user(new_vaddr, &copy_buf);
+                        }
+                        frame.rax = new_vaddr;
+                    } else {
+                        frame.rax = -12i64 as u64;
+                    }
                 }
-                return true;
+            } else {
+                frame.rax = old_addr;
             }
-            _ => {}
         }
-        false
+        35 | 226 | 230 => { // nanosleep & clock_nanosleep
+            let req = if frame.rax == 230 { frame.rdx } else { frame.rdi } as *const [u64; 2];
+            if validate_user_range(req as u64, 16) {
+                let mut times = [0u64; 2];
+                if copy_from_user(unsafe { core::slice::from_raw_parts_mut(times.as_mut_ptr() as *mut u8, 16) }, req as u64, 16).is_ok() {
+                    let ms = times[0].saturating_mul(1000).saturating_add(times[1] / 1_000_000);
+                    crate::arch::x86_64::pit::sleep_ms(ms.max(1));
+                }
+            }
+            frame.rax = 0;
+        }
+        56 => { // clone
+            let flags = frame.rdi;
+            let stack = frame.rsi;
+            let ptid = frame.rdx;
+            let ctid = frame.r10;
+            let tls = frame.r8;
+
+            crate::log_info!("CLONE", "sys_clone invoked with flags {:#x}, stack {:#x}, tls {:#x}", flags, stack, tls);
+
+            let mut target_core = None;
+            for c in 3..8 {
+                if crate::CORE_READY[c].load(Ordering::Acquire) && !THREAD_ACTIVE[c].load(Ordering::Acquire) {
+                    target_core = Some(c);
+                    break;
+                }
+            }
+
+            if let Some(core_id) = target_core {
+                let mut entry_ip = frame.rcx;
+                if stack != 0 && validate_user_range(stack.saturating_sub(8), 8) {
+                    let mut ret_buf = [0u8; 8];
+                    if copy_from_user(&mut ret_buf, stack.saturating_sub(8), 8).is_ok() {
+                        let potential = u64::from_le_bytes(ret_buf);
+                        if potential != 0 { entry_ip = potential; }
+                    }
+                }
+
+                let cur_cr3 = read_cr3();
+                spawn_thread_on_core(core_id, ThreadSpawnContext {
+                    entry: entry_ip,
+                    user_rsp: stack,
+                    tls,
+                    ctid,
+                    cr3: cur_cr3,
+                });
+
+                if ptid != 0 && validate_user_range(ptid, 4) {
+                    let tid_val = core_id as u32;
+                    let _ = copy_to_user(ptid, &tid_val.to_ne_bytes());
+                }
+
+                frame.rax = core_id as u64;
+            } else {
+                frame.rax = -11i64 as u64;
+            }
+        }
+        60 => { // exit
+            if cur_core == 2 {
+                ELF_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+            } else {
+                let ctid_addr = THREAD_CLEAR_TID[cur_core].swap(0, Ordering::SeqCst);
+                if ctid_addr != 0 {
+                    let zero = 0u32;
+                    let _ = copy_to_user(ctid_addr, &zero.to_ne_bytes());
+                }
+                THREAD_ACTIVE[cur_core].store(false, Ordering::SeqCst);
+                crate::task::force_exit_user_process();
+            }
+            frame.rax = 0;
+        }
+        63 => { // uname
+            let buf = frame.rdi;
+            if validate_user_range(buf, 390) {
+                let mut uts = [0u8; 390];
+                uts[0..4].copy_from_slice(b"EOS\0");
+                uts[65..71].copy_from_slice(b"0.1.0\0");
+                uts[130..135].copy_from_slice(b"2026\0");
+                uts[260..267].copy_from_slice(b"x86_64\0");
+                let _ = copy_to_user(buf, &uts);
+                frame.rax = 0;
+            } else { frame.rax = -14i64 as u64; }
+        }
+        72 => { frame.rax = 0; }
+        74 => { // fsync
+            let fd = frame.rdi as usize;
+            if fd < 64 {
+                let proc = get_current_process();
+                if let Some(file) = &mut proc.fd_table[fd] {
+                    if file.is_writable && file.is_dirty {
+                        if let crate::task::FileSource::Memory(ref bytes) = file.source {
+                            crate::log_info!("SYSCALL", "sys_fsync: Flushing {} bytes to disk for '{}'", bytes.len(), file.path);
+                            let _ = crate::fs::vfs_save_text_file(&file.path, bytes);
+                            file.is_dirty = false;
+                        }
+                    }
+                }
+                frame.rax = 0;
+            } else { frame.rax = -9i64 as u64; }
+        }
+        79 => { // getcwd
+            let buf = frame.rdi; let size = frame.rsi as usize; let cwd = b"/\0";
+            if size >= cwd.len() && copy_to_user(buf, cwd).is_ok() { frame.rax = buf; } else { frame.rax = -34i64 as u64; }
+        }
+        80 => { frame.rax = 0; }
+        96 => { // gettimeofday
+            let tv_ptr = frame.rdi;
+            if validate_user_range(tv_ptr, 16) {
+                let s = pit::get_uptime_seconds(); let ms = (pit::get_ticks() % 1000) * 1000; let tv = [s as u64, ms as u64];
+                let _ = copy_to_user(tv_ptr, unsafe { core::slice::from_raw_parts(tv.as_ptr() as *const u8, 16) }); frame.rax = 0;
+            } else { frame.rax = -14i64 as u64; }
+        }
+        158 => { // arch_prctl
+            match frame.rdi {
+                0x1002 => { unsafe { wrmsr(0xC0000100, frame.rsi); } frame.rax = 0; }
+                0x1001 => { unsafe { wrmsr(0xC0000102, frame.rsi); } frame.rax = 0; }
+                _ => frame.rax = -38i64 as u64,
+            }
+        }
+        186 => { // gettid
+            frame.rax = cur_core as u64;
+        }
+        202 => { // futex
+            let uaddr = frame.rdi;
+            let op = frame.rsi & 0x7F;
+            let val = frame.rdx as u32;
+
+            match op {
+                0 => {
+                    if validate_user_range(uaddr, 4) {
+                        let mut current_val_buf = [0u8; 4];
+                        if copy_from_user(&mut current_val_buf, uaddr, 4).is_ok() {
+                            let cur_val = u32::from_ne_bytes(current_val_buf);
+                            if cur_val != val {
+                                frame.rax = -11i64 as u64;
+                            } else {
+                                for _ in 0..128 { core::hint::spin_loop(); }
+                                frame.rax = 0;
+                            }
+                        } else { frame.rax = -14i64 as u64; }
+                    } else { frame.rax = -14i64 as u64; }
+                }
+                1 => {
+                    frame.rax = 1;
+                }
+                _ => { frame.rax = 0; }
+            }
+        }
+        204 => { // sched_getaffinity
+            let cpusetsize = frame.rsi as usize;
+            let mask_ptr = frame.rdx;
+            if cpusetsize >= 8 && validate_user_range(mask_ptr, cpusetsize) {
+                let affinity_mask: u64 = 0x1F;
+                let _ = copy_to_user(mask_ptr, &affinity_mask.to_ne_bytes());
+                frame.rax = 8;
+            } else { frame.rax = -14i64 as u64; }
+        }
+        217 => { // getdents64
+            let fd = frame.rdi as usize; let dirp = frame.rsi; let count = frame.rdx as usize;
+            if fd < 64 {
+                let proc = get_current_process();
+                if let Some(file) = &mut proc.fd_table[fd] {
+                    match &mut file.source {
+                        crate::task::FileSource::Directory(items, off) => {
+                            let mut written = 0;
+                            let mut out_buf = alloc::vec![0u8; count];
+                            while *off < items.len() {
+                                let item = &items[*off];
+                                let name = match item { crate::fs::FsItem::Directory(n,_) => n, crate::fs::FsItem::File(n,_,_) => n };
+                                let d_type = match item { crate::fs::FsItem::Directory(_,_) => 4, _ => 8 };
+                                let name_bytes = name.as_bytes();
+                                let rec_len = (19 + name_bytes.len() + 8) & !7;
+                                if written + rec_len > count { break; }
+                                unsafe {
+                                    let out_ptr = out_buf.as_mut_ptr().add(written);
+                                    core::ptr::write_unaligned(out_ptr as *mut u64, *off as u64 + 1);
+                                    core::ptr::write_unaligned(out_ptr.add(8) as *mut i64, *off as i64 + 1);
+                                    core::ptr::write_unaligned(out_ptr.add(16) as *mut u16, rec_len as u16);
+                                    core::ptr::write_unaligned(out_ptr.add(18) as *mut u8, d_type);
+                                    core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), out_ptr.add(19), name_bytes.len());
+                                    core::ptr::write_unaligned(out_ptr.add(19 + name_bytes.len()), 0);
+                                }
+                                written += rec_len;
+                                *off += 1;
+                            }
+                            if copy_to_user(dirp, &out_buf[..written]).is_ok() { frame.rax = written as u64; } else { frame.rax = -14i64 as u64; }
+                        }
+                        _ => frame.rax = -20i64 as u64,
+                    }
+                } else { frame.rax = -9i64 as u64; }
+            } else { frame.rax = -9i64 as u64; }
+        }
+        218 => { // set_tid_address
+            let tidptr = frame.rdi;
+            THREAD_CLEAR_TID[cur_core].store(tidptr, Ordering::SeqCst);
+            frame.rax = cur_core as u64;
+        }
+        228 => { // clock_gettime
+            let tp_ptr = frame.rsi;
+            if validate_user_range(tp_ptr, 16) {
+                let s = pit::get_uptime_seconds(); let ns = (pit::get_ticks() % 1000) * 1_000_000; let tp = [s as u64, ns as u64];
+                let _ = copy_to_user(tp_ptr, unsafe { core::slice::from_raw_parts(tp.as_ptr() as *const u8, 16) }); frame.rax = 0;
+            } else { frame.rax = -14i64 as u64; }
+        }
+        231 => { // exit_group
+            ELF_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+            frame.rax = 0;
+        }
+        318 => { // getrandom
+            let mut buf = alloc::vec![0u8; frame.rsi as usize]; let mut r = pit::read_tsc();
+            for b in buf.iter_mut() { *b = (r & 0xFF) as u8; r >>= 3; }
+            if copy_to_user(frame.rdi, &buf).is_ok() { frame.rax = frame.rsi; } else { frame.rax = -14i64 as u64; }
+        }
+        502 | 504 => { // sys_present & sys_present_rects
+            let target_w = core::cmp::min(frame.r10 as usize, 1920);
+            let target_h = core::cmp::min(frame.r8 as usize, 1080);
+            let total_bytes = target_w * target_h * 4;
+            if target_w > 0 && target_h > 0 && validate_user_range(frame.rdi, total_bytes) {
+                unsafe {
+                    if let Some(writer) = &mut *core::ptr::addr_of_mut!(crate::writer::WRITER) {
+                        let src = frame.rdi as *const u8;
+                        let dst = writer.buffer;
+                        let line_bytes = target_w.min(writer.width) * 4;
+
+                        if frame.rax == 502 || frame.rdx == 0 {
+                            for y in 0..target_h.min(writer.height) {
+                                core::ptr::copy_nonoverlapping(src.add(y * target_w * 4), dst.add(y * writer.pitch), line_bytes);
+                            }
+                        } else if validate_user_range(frame.rsi, frame.rdx as usize * 16) {
+                            let rects_ptr = frame.rsi as *const u32;
+                            for i in 0..frame.rdx as usize {
+                                let rx = (*rects_ptr.add(i * 4) as usize).min(writer.width);
+                                let ry = (*rects_ptr.add(i * 4 + 1) as usize).min(writer.height);
+                                let rw = (*rects_ptr.add(i * 4 + 2) as usize).min(writer.width.saturating_sub(rx));
+                                let rh = (*rects_ptr.add(i * 4 + 3) as usize).min(writer.height.saturating_sub(ry));
+                                if rw > 0 && rh > 0 {
+                                    for cy in ry..(ry + rh) {
+                                        let s_idx = (cy * target_w + rx) * 4;
+                                        let d_idx = cy * writer.pitch + rx * 4;
+                                        core::ptr::copy_nonoverlapping(src.add(s_idx), dst.add(d_idx), rw * 4);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            frame.rax = 0;
+        }
+        503 => { // sys_poll_event
+            if let Some(ev) = pop_user_event() {
+                match ev {
+                    InputEvent::MouseMove { x, y } => { frame.rax = 1; frame.rdi = ((x as u32) as u64) | (((y as u32) as u64) << 32); },
+                    InputEvent::MouseButton { button, pressed } => { frame.rax = 2; frame.rdi = (button as u64) | (if pressed { 1 << 8 } else { 0 }); },
+                    InputEvent::KeyDown { keycode, mods } => { frame.rax = 3; frame.rdi = (keycode as u64) | ((mods as u64) << 8); },
+                    InputEvent::Char(c) => { frame.rax = 4; frame.rdi = c as u32 as u64; },
+                    InputEvent::Scroll { dy } => { frame.rax = 5; frame.rdi = dy as i64 as u64; },
+                    _ => { frame.rax = 0; frame.rdi = 0; }
+                }
+                frame.rsi = 0;
+            } else { frame.rax = 0; frame.rdi = 0; frame.rsi = 0; }
+        }
+        505 => { // sys_wait_event
+            let timeout_ms = frame.rdi;
+            let start_ticks = crate::arch::x86_64::pit::get_ticks();
+            let mut got_event = false;
+
+            for _ in 0..10_000 {
+                if let Some(ev) = pop_user_event() {
+                    match ev {
+                        InputEvent::MouseMove { x, y } => { frame.rax = 1; frame.rdi = ((x as u32) as u64) | (((y as u32) as u64) << 32); },
+                        InputEvent::MouseButton { button, pressed } => { frame.rax = 2; frame.rdi = (button as u64) | (if pressed { 1 << 8 } else { 0 }); },
+                        InputEvent::KeyDown { keycode, mods } => { frame.rax = 3; frame.rdi = (keycode as u64) | ((mods as u64) << 8); },
+                        InputEvent::Char(c) => { frame.rax = 4; frame.rdi = c as u32 as u64; },
+                        InputEvent::Scroll { dy } => { frame.rax = 5; frame.rdi = dy as i64 as u64; },
+                        _ => { frame.rax = 0; frame.rdi = 0; }
+                    }
+                    frame.rsi = 0;
+                    got_event = true;
+                    break;
+                }
+
+                if timeout_ms == 0 { break; }
+                let elapsed = crate::arch::x86_64::pit::get_ticks().saturating_sub(start_ticks);
+                if timeout_ms != u64::MAX && elapsed >= timeout_ms { break; }
+
+                for _ in 0..64 {
+                    core::hint::spin_loop();
+                }
+            }
+
+            if !got_event { frame.rax = 0; frame.rdi = 0; frame.rsi = 0; }
+        }
+        512 => { // sys_net_tx
+            if validate_user_range(frame.rdi, frame.rsi as usize) {
+                let mut buf = alloc::vec![0u8; frame.rsi as usize];
+                if copy_from_user(&mut buf, frame.rdi, frame.rsi as usize).is_ok() {
+                    crate::net::enqueue_tx(buf);
+                    frame.rax = frame.rsi;
+                } else { frame.rax = -14i64 as u64; }
+            } else { frame.rax = -14i64 as u64; }
+        }
+        513 => { // sys_net_rx
+            if validate_user_range(frame.rdi, frame.rsi as usize) {
+                if let Some(packet) = crate::net::dequeue_rx() {
+                    let len = core::cmp::min(packet.len(), frame.rsi as usize);
+                    if copy_to_user(frame.rdi, &packet[..len]).is_ok() {
+                        frame.rax = len as u64;
+                    } else { frame.rax = -14i64 as u64; }
+                } else {
+                    frame.rax = 0;
+                }
+            } else { frame.rax = -14i64 as u64; }
+        }
+        514 => { // sys_net_mac
+            if validate_user_range(frame.rdi, 6) {
+                let mac = crate::net::get_mac();
+                if copy_to_user(frame.rdi, &mac).is_ok() {
+                    frame.rax = 0;
+                } else { frame.rax = -14i64 as u64; }
+            } else { frame.rax = -14i64 as u64; }
+        }
+        10 | 13 | 14 | 28 | 131 | 273 | 334 => { frame.rax = 0; }
+        39 => { frame.rax = 1; }
+        _ => { crate::log_warn!("SYSCALL", "Unimplemented syscall {}", frame.rax); frame.rax = -38i64 as u64; }
     }
 }
 ### END

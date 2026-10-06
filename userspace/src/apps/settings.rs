@@ -32,53 +32,131 @@ impl SettingsApp {
 
     fn scan_wallpapers(&mut self) {
         self.available_wallpapers.clear();
-        if let Ok(entries) = fs::read_dir("/EOS SHARE") {
-            for e in entries.flatten() {
-                let name = e.file_name().to_string_lossy().to_string();
-                let lower = name.to_lowercase();
-                if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-                    self.available_wallpapers.push(name);
+        let dirs = ["/EOS SHARE", "EOS SHARE", "."];
+        for d in &dirs {
+            if let Ok(entries) = fs::read_dir(d) {
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let lower = name.to_lowercase();
+                    if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
+                        if !self.available_wallpapers.contains(&name) {
+                            self.available_wallpapers.push(name);
+                        }
+                    }
                 }
+                if !self.available_wallpapers.is_empty() { break; }
             }
         }
     }
 
     fn apply_wallpaper(&mut self, idx: usize) {
         if idx >= self.available_wallpapers.len() { return; }
-        let fname = &self.available_wallpapers[idx];
-        let path = format!("/EOS SHARE/{}", fname);
+        let fname = self.available_wallpapers[idx].clone();
 
-        if let Ok(data) = fs::read(&path) {
-            if data.len() >= 8 && &data[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
-                if let Ok((px, w, h)) = crate::png::decode_png(&data) {
-                    unsafe { crate::framework::theme::DESKTOP_WALLPAPER = Some((px, w, h)); }
-                    self.status = format!("Wallpaper applied: {}", fname);
-                    self.selected_wp = Some(idx);
-                    return;
+        println!("[APP-SETTINGS] apply_wallpaper triggered for index {} -> '{}'", idx, fname);
+
+        let candidates = [
+            format!("EOS SHARE/{}", fname),
+            format!("/EOS SHARE/{}", fname),
+            fname.clone(),
+        ];
+
+        let mut read_bytes = Vec::new();
+        for p in &candidates {
+            match fs::read(p) {
+                Ok(b) if !b.is_empty() => {
+                    println!("[APP-SETTINGS] Successfully read {} bytes from '{}'", b.len(), p);
+                    read_bytes = b;
+                    break;
                 }
-            }
-            if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
-                let mut dec = zune_jpeg::JpegDecoder::new(&data);
-                if let Ok(raw) = dec.decode() {
-                    if let Some(info) = dec.info() {
-                        let w = info.width as usize;
-                        let h = info.height as usize;
-                        let mut px = vec![0u32; w * h];
-                        for i in 0..(w * h) {
-                            let o = i * 3;
-                            if o + 2 < raw.len() {
-                                px[i] = (0xFF << 24) | ((raw[o] as u32) << 16) | ((raw[o+1] as u32) << 8) | (raw[o+2] as u32);
-                            }
-                        }
-                        unsafe { crate::framework::theme::DESKTOP_WALLPAPER = Some((px, w, h)); }
-                        self.status = format!("Wallpaper applied: {}", fname);
-                        self.selected_wp = Some(idx);
-                        return;
-                    }
+                Ok(_) => {
+                    println!("[APP-SETTINGS] Path '{}' returned 0 bytes", p);
+                }
+                Err(e) => {
+                    println!("[APP-SETTINGS] Failed reading path '{}': {:?}", p, e);
                 }
             }
         }
-        self.status = format!("Failed to apply: {}", fname);
+
+        if !read_bytes.is_empty() {
+            let mut decoded: Option<(Vec<u32>, usize, usize)> = None;
+
+            if read_bytes.len() >= 8 && &read_bytes[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+                println!("[APP-SETTINGS] Attempting PNG decode...");
+                if let Ok((px, w, h)) = crate::png::decode_png(&read_bytes) {
+                    println!("[APP-SETTINGS] PNG decode SUCCESS: {}x{}", w, h);
+                    decoded = Some((px, w, h));
+                } else {
+                    println!("[APP-SETTINGS] PNG decode FAILED");
+                }
+            } else if read_bytes.len() >= 3 && read_bytes[0] == 0xFF && read_bytes[1] == 0xD8 && read_bytes[2] == 0xFF {
+                println!("[APP-SETTINGS] Attempting JPEG decode...");
+                let mut dec = zune_jpeg::JpegDecoder::new(&read_bytes);
+                if let Ok(raw) = dec.decode() {
+                    if let Some(info) = dec.info() {
+                        let orig_w = info.width as usize;
+                        let orig_h = info.height as usize;
+                        let step = ((orig_w + 1919) / 1920).max((orig_h + 1079) / 1080).max(1);
+                        let out_w = orig_w / step;
+                        let out_h = orig_h / step;
+                        let mut px = vec![0u32; out_w * out_h];
+
+                        for dy in 0..out_h {
+                            let sy = dy * step;
+                            let src_row = sy * orig_w * 3;
+                            let dst_row = dy * out_w;
+                            for dx in 0..out_w {
+                                let sx = dx * step;
+                                let o = src_row + (sx * 3);
+                                if o + 2 < raw.len() {
+                                    px[dst_row + dx] = (0xFF << 24)
+                                        | ((raw[o] as u32) << 16)
+                                        | ((raw[o+1] as u32) << 8)
+                                        | (raw[o+2] as u32);
+                                }
+                            }
+                        }
+                        println!("[APP-SETTINGS] JPEG decode SUCCESS: scaled to {}x{}", out_w, out_h);
+                        decoded = Some((px, out_w, out_h));
+                    }
+                } else {
+                    println!("[APP-SETTINGS] JPEG decode FAILED");
+                }
+            } else {
+                println!("[APP-SETTINGS] Unknown image format magic: {:02X?}", &read_bytes[..read_bytes.len().min(8)]);
+            }
+
+            if let Some((px, w, h)) = decoded {
+                unsafe {
+                    crate::framework::theme::DESKTOP_WALLPAPER = Some((px, w, h));
+                }
+                crate::framework::theme::notify_wallpaper_changed();
+
+                let mut lines = Vec::new();
+                if let Ok(existing) = fs::read_to_string("settings.ini") {
+                    for line in existing.lines() {
+                        if !line.starts_with("wallpaper=") && !line.trim().is_empty() {
+                            lines.push(line.to_string());
+                        }
+                    }
+                }
+
+                lines.push(format!("wallpaper={}", fname));
+                let new_payload = lines.join("\n") + "\n";
+
+                println!("[APP-SETTINGS] Writing new settings payload ({} bytes) to 'settings.ini'...", new_payload.len());
+                match fs::write("settings.ini", new_payload.as_bytes()) {
+                    Ok(_) => println!("[APP-SETTINGS] fs::write to 'settings.ini' returned OK!"),
+                    Err(e) => println!("[APP-SETTINGS] fs::write to 'settings.ini' returned ERROR: {:?}", e),
+                }
+
+                self.status = format!("Active: {}", fname);
+                self.selected_wp = Some(idx);
+                return;
+            }
+        }
+
+        self.status = format!("Failed to read {}", fname);
     }
 }
 

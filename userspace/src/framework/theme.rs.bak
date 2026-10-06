@@ -1,39 +1,37 @@
-#[derive(Clone, Copy)]
+use std::sync::Mutex;
+
+pub static mut DESKTOP_WALLPAPER: Option<(Vec<u32>, usize, usize)> = None;
+
+#[derive(Clone, Copy, Debug)]
 pub struct Theme {
     pub scale: f32,
     pub bg_desktop: u32,
-    pub bg_menubar: u32,
-    pub border_menubar: u32,
-    pub bg_dock: u32,
-    pub border_dock: u32,
     pub bg_window: u32,
-    pub border_window: u32,
     pub bg_titlebar: u32,
+    pub border_window: u32,
+    pub accent: u32,
+    pub accent_hover: u32,
     pub text_primary: u32,
     pub text_secondary: u32,
     pub text_muted: u32,
-    pub accent: u32,
-    pub accent_hover: u32,
-    pub accent_active: u32,
 }
 
-pub static mut CURRENT_THEME: Theme = Theme {
-    scale: 1.35, // مقياس مريح ومناسب لشاشات Full HD افتراضياً
-    bg_desktop: 0xFF1E293B,
-    bg_menubar: 0xEE1E293B,
-    border_menubar: 0x33FFFFFF,
-    bg_dock: 0xCC0F172A,
-    border_dock: 0x44FFFFFF,
-    bg_window: 0xFF0F172A,
-    border_window: 0x33FFFFFF,
-    bg_titlebar: 0xFF1E293B,
-    text_primary: 0xFFF8FAFC,
-    text_secondary: 0xFF94A3B8,
-    text_muted: 0xFF64748B,
-    accent: 0xFF0284C7,
-    accent_hover: 0xFF0369A1,
-    accent_active: 0xFF075985,
-};
+impl Default for Theme {
+    fn default() -> Self {
+        Self {
+            scale: 2.0, // إرجاع الـ UI Scale إلى 2.0x السابق
+            bg_desktop: 0xFF0F172A,
+            bg_window: 0xFF1E293B,
+            bg_titlebar: 0xFF334155,
+            border_window: 0xFF475569,
+            accent: 0xFF0284C7,
+            accent_hover: 0xFF0369A1,
+            text_primary: 0xFFF8FAFC,
+            text_secondary: 0xFF94A3B8,
+            text_muted: 0xFF64748B,
+        }
+    }
+}
 
 impl Theme {
     #[inline(always)]
@@ -60,20 +58,26 @@ impl Theme {
     pub fn font_large(&self) -> usize {
         (22.0 * self.scale).round().max(18.0) as usize
     }
-
-    #[inline(always)]
-    pub fn font_heading(&self) -> usize {
-        (28.0 * self.scale).round().max(22.0) as usize
-    }
 }
 
-pub fn get_theme() -> &'static Theme {
-    unsafe { &*core::ptr::addr_of!(CURRENT_THEME) }
+static CURRENT_THEME: Mutex<Theme> = Mutex::new(Theme {
+    scale: 2.0,
+    bg_desktop: 0xFF0F172A,
+    bg_window: 0xFF1E293B,
+    bg_titlebar: 0xFF334155,
+    border_window: 0xFF475569,
+    accent: 0xFF0284C7,
+    accent_hover: 0xFF0369A1,
+    text_primary: 0xFFF8FAFC,
+    text_secondary: 0xFF94A3B8,
+    text_muted: 0xFF64748B,
+});
+
+pub fn get_theme() -> Theme {
+    *CURRENT_THEME.lock().unwrap()
 }
 
 pub fn set_theme_scale(scale: f32) {
-    unsafe {
-        let t = &mut *core::ptr::addr_of_mut!(CURRENT_THEME);
-        t.scale = scale.clamp(0.8, 3.0);
-    }
+    let mut t = CURRENT_THEME.lock().unwrap();
+    t.scale = scale.clamp(1.0, 4.0);
 }

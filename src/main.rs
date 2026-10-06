@@ -183,7 +183,9 @@ extern "C" fn ap_startup_entry(info: &limine::mp::MpInfo) -> ! {
         if core_id < 8 { CORE_HEARTBEAT[core_id].fetch_add(1, Ordering::Relaxed); }
         let did_work = task::core_poll_and_execute(core_id);
         if !did_work {
-            core::hint::spin_loop();
+            for _ in 0..64 {
+                core::hint::spin_loop();
+            }
         }
     }
 }

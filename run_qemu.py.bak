@@ -64,9 +64,18 @@ def create_demo_tar(user_elf_data):
         add_file("readme.txt", b"Welcome to EOS Kernel!\r\nThis file is read from TarFS.\r\n")
         if user_elf_data: add_file("user_app.elf", user_elf_data)
 
-        # Dynamic font scan in EOS_SHARE directory
+        share_dir = r"C:\EOS_SHARE"
+        settings_file = os.path.join(share_dir, "settings.ini")
+        if os.path.exists(settings_file):
+            try:
+                with open(settings_file, "rb") as sf:
+                    sdata = sf.read()
+                    add_file("settings.ini", sdata)
+            except Exception:
+                pass
+
         share_fonts_dir = r"C:\EOS_SHARE\fonts"
-        scan_dirs = [share_fonts_dir, r"C:\EOS_SHARE"]
+        scan_dirs = [share_fonts_dir, share_dir]
         for sdir in scan_dirs:
             if os.path.exists(sdir):
                 for fname in os.listdir(sdir):
@@ -266,6 +275,27 @@ def prepare_and_run():
 
     ext2_img_path = os.path.join(target_dir, "rootfs.ext2"); make_ext2_disk(ext2_img_path)
 
+    settings_img_path = os.path.join(target_dir, "settings.img")
+    if not os.path.exists(settings_img_path) or os.path.getsize(settings_img_path) == 0:
+        default_payload = b"dark_mode=false\nui_scale=2\nwallpaper=\n"
+        crc = 0xFFFFFFFF
+        for b in default_payload:
+            crc ^= b
+            for _ in range(8):
+                crc = (crc >> 1) ^ 0xEDB88320 if (crc & 1) else (crc >> 1)
+        crc = (~crc) & 0xFFFFFFFF
+
+        sec0 = bytearray(512)
+        sec0[0:4] = b"EOSS"
+        struct.pack_into("<H", sec0, 4, 1) # version
+        struct.pack_into("<H", sec0, 6, len(default_payload)) # length
+        struct.pack_into("<I", sec0, 8, crc) # checksum
+        sec0[20:20 + len(default_payload)] = default_payload
+
+        with open(settings_img_path, "wb") as f:
+            f.write(sec0)
+            f.write(bytearray((1024 * 1024) - 512))
+
     qemu_share = os.path.join(os.path.dirname(QEMU_EXE), "share")
     if not os.path.exists(qemu_share): qemu_share = r"C:\Program Files\qemu\share"
     code_fd = os.path.join(qemu_share, "edk2-x86_64-code.fd")
@@ -285,14 +315,17 @@ def prepare_and_run():
     bridge_proc = subprocess.Popen([sys.executable, "gamepad_bridge.py"]); time.sleep(0.3)
 
     qemu_cmd = [
-        QEMU_EXE, "-M", "q35", "-m", "8192M", "-smp", "8",
+        QEMU_EXE, "-M", "q35", "-m", "8192M", "-smp", "5",
+        "-accel", "tcg,thread=multi",
         "-drive", f"if=pflash,format=raw,readonly=on,file={code_fd}",
     ] + pflash_vars_args + [
         "-device", "piix3-ide,id=ide",
         "-drive", f"id=disk0,file={img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=0,drive=disk0",
+        "-drive", f"id=disk1,file=fat:rw:{share_dir},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
         "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",
+        "-drive", f"id=disk3,file={settings_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=1,drive=disk3",
         "-netdev", "user,id=n0,hostfwd=udp::68-:68", "-device", "e1000,netdev=n0",
-        "-serial", "stdio", "-d", "cpu_reset,guest_errors", "-no-reboot", "-no-shutdown"
+        "-serial", "stdio", "-d", "guest_errors", "-no-reboot", "-no-shutdown"
     ]
     try: subprocess.run(qemu_cmd)
     finally: bridge_proc.terminate()

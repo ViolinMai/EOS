@@ -373,6 +373,18 @@ impl Widget for ScrollViewWidget {
     fn paint(&self, canvas: &mut Canvas) {
         canvas.push_clip(self.bounds);
         self.child.paint(canvas);
+
+        if self.content_height > self.bounds.h && self.bounds.h > 0 {
+            let track_h = self.bounds.h as f32;
+            let thumb_h = ((track_h / self.content_height as f32) * track_h).max(20.0);
+            let max_scroll = (self.content_height - self.bounds.h).max(1) as f32;
+            let thumb_y = self.bounds.y as f32 + ((self.scroll_y as f32 / max_scroll) * (track_h - thumb_h));
+
+            let bar_w = 4;
+            let bar_x = self.bounds.x + self.bounds.w - bar_w - 3;
+            canvas.draw_rect(bar_x, thumb_y as i32, bar_w, thumb_h as i32, 0x8894A3B8, 2);
+        }
+
         canvas.pop_clip();
     }
 
@@ -384,10 +396,10 @@ impl Widget for ScrollViewWidget {
     fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
         if !self.bounds.contains(mx, my) { return false; }
         let max_scroll = (self.content_height - self.bounds.h).max(0);
-        if dy < 0 {
-            self.scroll_y = (self.scroll_y + 28).min(max_scroll);
+        if dy > 0 {
+            self.scroll_y = (self.scroll_y + 32).min(max_scroll);
         } else {
-            self.scroll_y = (self.scroll_y - 28).max(0);
+            self.scroll_y = (self.scroll_y - 32).max(0);
         }
         self.layout(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h);
         true

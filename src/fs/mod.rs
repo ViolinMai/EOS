@@ -25,7 +25,9 @@ pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
     let p = resolve_path(path);
     crate::log_info!("VFS", "vfs_list_dir requested for path: '{}'", p);
 
-    if p.is_empty() || p == "/" || p == "." {
+    let clean = p.trim_matches('/');
+
+    if clean.is_empty() || clean == "." {
         crate::log_info!("VFS", "Listing Root Virtual Mounts (EOS SHARE, RootFS, Initrd)");
         return Ok(alloc::vec![
             FsItem::Directory(String::from("EOS SHARE"), 0),
@@ -34,31 +36,29 @@ pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
         ]);
     }
 
-    if p == "EOS SHARE" {
+    if clean.eq_ignore_ascii_case("EOS SHARE") {
         crate::log_info!("VFS", "Scanning FAT root on Drive 1...");
         let res = FAT_FS.list_dir("");
         if let Ok(ref items) = res {
             crate::log_info!("VFS", "FAT Root enumeration succeeded: found {} items", items.len());
-        } else if let Err(e) = res {
-            crate::log_error!("VFS", "FAT Root enumeration failed on Drive 1: {}", e);
         }
         return res;
     }
 
-    if p.starts_with("EOS SHARE/") {
-        let sub = p.strip_prefix("EOS SHARE/").unwrap().trim_matches('/');
-        crate::log_info!("VFS", "Scanning FAT subfolder: '{}'", sub);
-        let res = FAT_FS.list_dir(sub);
-        if let Ok(ref items) = res {
-            crate::log_info!("VFS", "FAT Subfolder '{}' found {} items", sub, items.len());
-        } else if let Err(e) = res {
-            crate::log_error!("VFS", "FAT Subfolder '{}' error: {}", sub, e);
+    if clean.to_ascii_uppercase().starts_with("EOS SHARE/") {
+        let sub = clean[10..].trim_matches('/');
+        if sub.is_empty() {
+            return FAT_FS.list_dir("");
         }
-        return res;
+        let lower = sub.to_ascii_lowercase();
+        if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".ini") || lower.ends_with(".ttf") || lower.ends_with(".otf") || lower.ends_with(".txt") {
+            return Err("Path is a regular file");
+        }
+        return FAT_FS.list_dir(sub);
     }
 
     let mut items = Vec::new();
-    if p == "RootFS" || p.starts_with("RootFS/") {
+    if clean.eq_ignore_ascii_case("RootFS") || clean.to_ascii_uppercase().starts_with("ROOTFS/") {
         crate::log_info!("VFS", "Scanning EXT2 RootFS on Drive 2...");
         unsafe {
             if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
@@ -74,7 +74,7 @@ pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
             }
         }
         return Ok(items);
-    } else if p == "Initrd" || p.starts_with("Initrd/") {
+    } else if clean.eq_ignore_ascii_case("Initrd") || clean.to_ascii_uppercase().starts_with("INITRD/") {
         crate::log_info!("VFS", "Scanning Initrd ramdisk...");
         unsafe {
             if let Some(archive) = &*core::ptr::addr_of_mut!(crate::fs::tar::INITRD) {
@@ -86,12 +86,24 @@ pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
         return Ok(items);
     }
 
-    crate::log_warn!("VFS", "Falling back to direct FAT search for: '{}'", p);
-    FAT_FS.list_dir(&p)
+    let lower = clean.to_ascii_lowercase();
+    if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".ini") || lower.ends_with(".ttf") || lower.ends_with(".otf") || lower.ends_with(".txt") {
+        return Err("Path is a regular file");
+    }
+
+    FAT_FS.list_dir(clean)
 }
 
 pub fn vfs_stat(path: &str) -> Result<(u64, u32), &'static str> {
     let p = resolve_path(path);
+    if is_settings_file(&p) {
+        if let Ok(bytes) = settings_store::load_raw_settings() {
+            return Ok((bytes.len() as u64, 0o100644));
+        } else {
+            return Ok((0, 0o100644));
+        }
+    }
+
     if p.is_empty() || p == "EOS SHARE" || p == "RootFS" || p == "Initrd" || p == "/" || p == "." {
         return Ok((0, 0o040755));
     }
@@ -112,32 +124,75 @@ pub fn vfs_stat(path: &str) -> Result<(u64, u32), &'static str> {
 
 pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
     let p = resolve_path(path);
-    unsafe {
-        if let Some(fs) = &*addr_of_mut!(crate::fs::ext2::EXT2_FS) {
-            if let Ok(entries) = fs.list_directory(2) {
-                if let Some((_, ino)) = entries.iter().find(|(n, _)| n.eq_ignore_ascii_case(&p)) {
-                    if let Ok(inode) = fs.read_inode(*ino) { return fs.read_file_data(&inode); }
+    let clean = p.trim_matches('/');
+
+    // 1. فحص ملف الإعدادات المباشر على قرص EXT2 (Inode 11)
+    if is_settings_file(&p) {
+        unsafe {
+            if let Some(fs) = &*addr_of_mut!(crate::fs::ext2::EXT2_FS) {
+                if let Ok(inode) = fs.read_inode(11) {
+                    if let Ok(bytes) = fs.read_file_data(&inode) {
+                        crate::log_info!("VFS", "Read {} bytes from persistent settings (Inode 11)", bytes.len());
+                        return Ok(bytes);
+                    }
                 }
             }
         }
     }
-    if p.starts_with("EOS SHARE") || !p.starts_with('/') {
-        let clean = p.strip_prefix("EOS SHARE").unwrap_or(&p).trim_matches('/');
-        if let Ok(bytes) = FAT_FS.read_bytes(clean) {
+
+    // 2. فحص RootFS (قرص EXT2 الدائم)
+    unsafe {
+        if let Some(fs) = &*addr_of_mut!(crate::fs::ext2::EXT2_FS) {
+            if let Ok(entries) = fs.list_directory(2) {
+                let check_name = clean.strip_prefix("RootFS/").unwrap_or(clean);
+                if let Some((_, ino)) = entries.iter().find(|(n, _)| n.eq_ignore_ascii_case(check_name)) {
+                    if let Ok(inode) = fs.read_inode(*ino) {
+                        return fs.read_file_data(&inode);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. فحص EOS SHARE (Drive 1 FAT)
+    if clean.to_ascii_uppercase().starts_with("EOS SHARE/") || clean.eq_ignore_ascii_case("EOS SHARE") || !clean.contains('/') {
+        let fat_path = clean.strip_prefix("EOS SHARE/").unwrap_or(clean);
+        if let Ok(bytes) = FAT_FS.read_bytes(fat_path) {
             return Ok(bytes);
         }
     }
+
+    // 4. فحص Initrd
     unsafe {
         if let Some(archive) = &*addr_of_mut!(crate::fs::tar::INITRD) {
-            if let Some(f) = archive.files.iter().find(|x| x.name.eq_ignore_ascii_case(&p)) {
+            let tar_name = clean.strip_prefix("Initrd/").unwrap_or(clean);
+            if let Some(f) = archive.files.iter().find(|x| x.name.eq_ignore_ascii_case(tar_name)) {
                 return Ok(core::slice::from_raw_parts(f.data_ptr, f.size).to_vec());
             }
         }
     }
+
     Err("File not found")
 }
 
 pub fn vfs_save_text_file(filename: &str, content: &[u8]) -> Result<(), &'static str> {
+    let p = resolve_path(filename);
+    crate::log_info!("VFS", "vfs_save_text_file invoked for '{}' ({} bytes)", p, content.len());
+
+    if is_settings_file(&p) {
+        unsafe {
+            if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
+                crate::log_info!("EXT2", "Persisting settings ({} bytes) to Inode 11...", content.len());
+                if let Err(e) = fs.write_file_data(11, content) {
+                    crate::log_error!("EXT2", "Failed writing to Inode 11: {}", e);
+                    return Err("EXT2 write error");
+                }
+                crate::log_info!("EXT2", "Settings successfully written to Inode 11!");
+                return Ok(());
+            }
+        }
+    }
+
     write_file_content(1, filename, content)
 }
 
@@ -219,3 +274,15 @@ impl FileSystem for FatFileSystem {
 }
 
 pub static FAT_FS: FatFileSystem = FatFileSystem { drive: 1 };
+
+pub mod settings_store;
+
+pub fn is_settings_file(path: &str) -> bool {
+    let p = resolve_path(path);
+    let clean = p.trim_matches('/');
+    clean.eq_ignore_ascii_case("settings.ini")
+        || clean.eq_ignore_ascii_case("RootFS/settings.ini")
+        || clean.eq_ignore_ascii_case("EOS SHARE/settings.ini")
+        || clean.ends_with("/settings.ini")
+        || clean.ends_with("settings.ini")
+}

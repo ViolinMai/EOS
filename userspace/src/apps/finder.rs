@@ -1,5 +1,6 @@
 use crate::framework::*;
 use std::fs;
+use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
 pub struct FinderEntry {
@@ -16,6 +17,7 @@ pub struct FinderApp {
     pub scroll_y: i32,
     pub status_label: String,
     pub pending_open_image: Option<(String, String)>,
+    pub thumb_cache: HashMap<String, (Vec<u32>, usize, usize)>,
 }
 
 impl FinderApp {
@@ -28,6 +30,7 @@ impl FinderApp {
             scroll_y: 0,
             status_label: String::from("Ready"),
             pending_open_image: None,
+            thumb_cache: HashMap::new(),
         };
         app.load_directory("EOS SHARE");
         app
@@ -41,22 +44,19 @@ impl FinderApp {
             clean.to_string()
         };
 
-        crate::f_info!("FINDER", "load_directory requested for: '{}'", target_path);
-
         self.entries.clear();
         self.selected_idx = None;
         self.scroll_y = 0;
 
         let mut read_success = false;
-
         let candidates = [
-            format!("/{}", target_path),
             target_path.clone(),
+            format!("/{}", target_path),
+            format!("{}/", target_path),
         ];
 
         for p in &candidates {
             if let Ok(read_dir) = fs::read_dir(p) {
-                let mut count = 0;
                 for entry in read_dir.flatten() {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if name == "." || name == ".." { continue; }
@@ -68,15 +68,11 @@ impl FinderApp {
                         let full_file_path = format!("{}/{}", p.trim_end_matches('/'), name);
                         fs::metadata(&full_file_path)
                             .map(|m| m.len() as usize)
-                            .unwrap_or_else(|_| {
-                                fs::read(&full_file_path).map(|b| b.len()).unwrap_or(0)
-                            })
+                            .unwrap_or(0)
                     };
 
                     self.entries.push(FinderEntry { name, is_dir, size });
-                    count += 1;
                 }
-                crate::f_info!("FINDER", "fs::read_dir('{}') successful: read {} entries", p, count);
                 read_success = true;
                 break;
             }
@@ -112,7 +108,6 @@ impl FinderApp {
     fn open_entry(&mut self, idx: usize) {
         if idx >= self.entries.len() { return; }
         let entry = self.entries[idx].clone();
-        crate::f_info!("FINDER", "User activated entry: '{}' (is_dir: {})", entry.name, entry.is_dir);
 
         if entry.is_dir {
             if entry.name == ".." {
@@ -221,6 +216,14 @@ impl Widget for FinderApp {
             cur_y += row_h;
         }
 
+        let total_items_h = (self.entries.len() as i32) * row_h;
+        if total_items_h > list_h && list_h > 0 {
+            let thumb_h = ((list_h as f32 / total_items_h as f32) * list_h as f32).max(20.0);
+            let max_sc = (total_items_h - list_h).max(1) as f32;
+            let thumb_y = list_y as f32 + ((self.scroll_y as f32 / max_sc) * (list_h as f32 - thumb_h));
+            canvas.draw_rect(self.bounds.x + self.bounds.w - 6, thumb_y as i32, 4, thumb_h as i32, 0x8894A3B8, 2);
+        }
+
         canvas.pop_clip();
 
         let sb_y = self.bounds.y + self.bounds.h - sb_h;
@@ -279,7 +282,7 @@ impl Widget for FinderApp {
         let view_h = self.bounds.h - theme.pt(66.0);
         let max_scroll = (total_h - view_h).max(0);
 
-        if dy < 0 {
+        if dy > 0 {
             self.scroll_y = (self.scroll_y + theme.pt(28.0)).min(max_scroll);
         } else {
             self.scroll_y = (self.scroll_y - theme.pt(28.0)).max(0);

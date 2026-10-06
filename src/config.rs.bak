@@ -35,7 +35,8 @@ impl KernelConfig {
         if let Ok(bytes) = crate::fs::vfs_read_bytes("settings.ini") {
             if let Ok(content) = core::str::from_utf8(&bytes) {
                 for line in content.lines() {
-                    if let Some((k, v)) = line.split_once('=') {
+                    let mut parts = line.split('=');
+                    if let (Some(k), Some(v)) = (parts.next(), parts.next()) {
                         let key = k.trim();
                         let val = v.trim();
                         if key == "dark_mode" {
@@ -47,32 +48,16 @@ impl KernelConfig {
                         }
                     }
                 }
-                crate::log_info!("CONFIG", "Kernel settings loaded from persistent disk.");
             }
         }
     }
 
     pub fn save_to_disk(&self) {
-        let mut wallpaper_line = alloc::string::String::new();
-        if let Ok(bytes) = crate::fs::vfs_read_bytes("settings.ini") {
-            if let Ok(content) = core::str::from_utf8(&bytes) {
-                for line in content.lines() {
-                    if line.starts_with("wallpaper=") {
-                        wallpaper_line = alloc::string::String::from(line);
-                        break;
-                    }
-                }
-            }
-        }
-
         let dark_str = if self.is_dark_mode() { "true" } else { "false" };
         let scale = self.get_ui_scale();
-        let payload = if wallpaper_line.is_empty() {
-            alloc::format!("dark_mode={}\nui_scale={}\n", dark_str, scale)
-        } else {
-            alloc::format!("dark_mode={}\nui_scale={}\n{}\n", dark_str, scale, wallpaper_line)
-        };
-
-        let _ = crate::fs::vfs_save_text_file("settings.ini", payload.as_bytes());
+        let payload = alloc::format!("dark_mode={}\nui_scale={}\n", dark_str, scale);
+        if let Err(e) = crate::fs::vfs_save_text_file("settings.ini", payload.as_bytes()) {
+            crate::log_error!("CONFIG", "Failed saving kernel config: {}", e);
+        }
     }
 }

@@ -64,9 +64,18 @@ def create_demo_tar(user_elf_data):
         add_file("readme.txt", b"Welcome to EOS Kernel!\r\nThis file is read from TarFS.\r\n")
         if user_elf_data: add_file("user_app.elf", user_elf_data)
 
-        # Dynamic font scan in EOS_SHARE directory
+        share_dir = r"C:\EOS_SHARE"
+        settings_file = os.path.join(share_dir, "settings.ini")
+        if os.path.exists(settings_file):
+            try:
+                with open(settings_file, "rb") as sf:
+                    sdata = sf.read()
+                    add_file("settings.ini", sdata)
+            except Exception:
+                pass
+
         share_fonts_dir = r"C:\EOS_SHARE\fonts"
-        scan_dirs = [share_fonts_dir, r"C:\EOS_SHARE"]
+        scan_dirs = [share_fonts_dir, share_dir]
         for sdir in scan_dirs:
             if os.path.exists(sdir):
                 for fname in os.listdir(sdir):
@@ -230,8 +239,114 @@ def make_uefi_fat32_disk(img_path, files):
         f.write(disk)
 
 def make_ext2_disk(img_path):
-    if not os.path.exists(img_path):
-        with open(img_path, "wb") as f: f.truncate(10 * 1024 * 1024)
+    if os.path.exists(img_path) and os.path.getsize(img_path) >= (10 * 1024 * 1024):
+        return
+
+    BLOCK_SIZE = 1024
+    TOTAL_BLOCKS = 10240  # 10 MB
+    INODES_COUNT = 256
+    BLOCKS_PER_GROUP = 8192
+    INODES_PER_GROUP = 256
+    INODE_SIZE = 128
+
+    disk = bytearray(TOTAL_BLOCKS * BLOCK_SIZE)
+
+    # 1. Superblock (Block 1, offset 1024)
+    sb_off = 1024
+    struct.pack_into("<I", disk, sb_off + 0, INODES_COUNT)      # s_inodes_count
+    struct.pack_into("<I", disk, sb_off + 4, TOTAL_BLOCKS)      # s_blocks_count
+    struct.pack_into("<I", disk, sb_off + 8, 0)                 # s_r_blocks_count
+    struct.pack_into("<I", disk, sb_off + 12, TOTAL_BLOCKS - 35) # s_free_blocks_count
+    struct.pack_into("<I", disk, sb_off + 16, INODES_COUNT - 12) # s_free_inodes_count
+    struct.pack_into("<I", disk, sb_off + 20, 1)                # s_first_data_block (1 for 1KB blocks)
+    struct.pack_into("<I", disk, sb_off + 24, 0)                # s_log_block_size (0 = 1024)
+    struct.pack_into("<I", disk, sb_off + 28, 0)                # s_log_frag_size
+    struct.pack_into("<I", disk, sb_off + 32, BLOCKS_PER_GROUP) # s_blocks_per_group
+    struct.pack_into("<I", disk, sb_off + 36, BLOCKS_PER_GROUP) # s_frags_per_group
+    struct.pack_into("<I", disk, sb_off + 40, INODES_PER_GROUP) # s_inodes_per_group
+    struct.pack_into("<H", disk, sb_off + 56, 0xEF53)           # s_magic
+    struct.pack_into("<H", disk, sb_off + 58, 1)                # s_state (Clean)
+    struct.pack_into("<H", disk, sb_off + 62, 0)                # s_minor_rev_level
+    struct.pack_into("<I", disk, sb_off + 76, 1)                # s_rev_level (Dynamic rev)
+    struct.pack_into("<H", disk, sb_off + 84, 11)               # s_first_ino
+    struct.pack_into("<H", disk, sb_off + 88, INODE_SIZE)       # s_inode_size
+
+    # 2. Block Group Descriptor (Block 2, offset 2048)
+    bgd_off = 2048
+    struct.pack_into("<I", disk, bgd_off + 0, 3)                # bg_block_bitmap
+    struct.pack_into("<I", disk, bgd_off + 4, 4)                # bg_inode_bitmap
+    struct.pack_into("<I", disk, bgd_off + 8, 5)                # bg_inode_table (Blocks 5..36)
+    struct.pack_into("<H", disk, bgd_off + 12, TOTAL_BLOCKS - 35) # bg_free_blocks_count
+    struct.pack_into("<H", disk, bgd_off + 14, INODES_COUNT - 12) # bg_free_inodes_count
+    struct.pack_into("<H", disk, bgd_off + 16, 2)               # bg_used_dirs_count
+
+    # 3. Bitmaps
+    # Block bitmap (Block 3): Mark blocks 0..36 as used
+    for b in range(37):
+        disk[(3 * BLOCK_SIZE) + (b // 8)] |= (1 << (b % 8))
+
+    # Inode bitmap (Block 4): Mark Inodes 1..12 as used
+    for ino in range(1, 13):
+        disk[(4 * BLOCK_SIZE) + ((ino - 1) // 8)] |= (1 << ((ino - 1) % 8))
+
+    # Helper: Inode Table offset
+    def get_inode_offset(ino):
+        return (5 * BLOCK_SIZE) + ((ino - 1) * INODE_SIZE)
+
+    # 4. Inode 2: Root Directory "/"
+    root_ino_off = get_inode_offset(2)
+    struct.pack_into("<H", disk, root_ino_off + 0, 0o040755)    # i_mode (Directory)
+    struct.pack_into("<I", disk, root_ino_off + 4, BLOCK_SIZE)  # i_size
+    struct.pack_into("<H", disk, root_ino_off + 26, 3)          # i_links_count
+    struct.pack_into("<I", disk, root_ino_off + 28, 2)          # i_blocks (512-byte units)
+    struct.pack_into("<I", disk, root_ino_off + 40, 37)         # i_block[0] = Block 37 (Dir contents)
+    disk[(3 * BLOCK_SIZE) + (37 // 8)] |= (1 << (37 % 8))
+
+    # 5. Inode 11: settings.ini (Pre-allocated regular file)
+    init_settings = b"dark_mode=false\nui_scale=2\nwallpaper=\n"
+    set_ino_off = get_inode_offset(11)
+    struct.pack_into("<H", disk, set_ino_off + 0, 0o100644)     # i_mode (Regular file)
+    struct.pack_into("<I", disk, set_ino_off + 4, len(init_settings)) # i_size
+    struct.pack_into("<H", disk, set_ino_off + 26, 1)          # i_links_count
+    struct.pack_into("<I", disk, set_ino_off + 28, 8)          # i_blocks (4 blocks allocated)
+    for b_idx in range(4):
+        struct.pack_into("<I", disk, set_ino_off + 40 + (b_idx * 4), 38 + b_idx)
+        disk[(3 * BLOCK_SIZE) + ((38 + b_idx) // 8)] |= (1 << ((38 + b_idx) % 8))
+    # Write initial settings payload
+    disk[38 * BLOCK_SIZE : (38 * BLOCK_SIZE) + len(init_settings)] = init_settings
+
+    # 6. Root Directory Data (Block 37)
+    # Entries: "." (ino 2), ".." (ino 2), "settings.ini" (ino 11)
+    dir_blk_off = 37 * BLOCK_SIZE
+    cur = dir_blk_off
+
+    # "."
+    struct.pack_into("<I", disk, cur + 0, 2)
+    struct.pack_into("<H", disk, cur + 4, 12)
+    disk[cur + 6] = 1
+    disk[cur + 7] = 2
+    disk[cur + 8 : cur + 9] = b"."
+    cur += 12
+
+    # ".."
+    struct.pack_into("<I", disk, cur + 0, 2)
+    struct.pack_into("<H", disk, cur + 4, 12)
+    disk[cur + 6] = 2
+    disk[cur + 7] = 2
+    disk[cur + 8 : cur + 10] = b".."
+    cur += 12
+
+    # "settings.ini"
+    name_bytes = b"settings.ini"
+    rec_len = BLOCK_SIZE - (cur - dir_blk_off)
+    struct.pack_into("<I", disk, cur + 0, 11)
+    struct.pack_into("<H", disk, cur + 4, rec_len)
+    disk[cur + 6] = len(name_bytes)
+    disk[cur + 7] = 1
+    disk[cur + 8 : cur + 8 + len(name_bytes)] = name_bytes
+
+    with open(img_path, "wb") as f:
+        f.write(disk)
 
 def prepare_and_run():
     share_dir = r"C:\EOS_SHARE"
@@ -266,6 +381,27 @@ def prepare_and_run():
 
     ext2_img_path = os.path.join(target_dir, "rootfs.ext2"); make_ext2_disk(ext2_img_path)
 
+    settings_img_path = os.path.join(target_dir, "settings.img")
+    if not os.path.exists(settings_img_path) or os.path.getsize(settings_img_path) == 0:
+        default_payload = b"dark_mode=false\nui_scale=2\nwallpaper=\n"
+        crc = 0xFFFFFFFF
+        for b in default_payload:
+            crc ^= b
+            for _ in range(8):
+                crc = (crc >> 1) ^ 0xEDB88320 if (crc & 1) else (crc >> 1)
+        crc = (~crc) & 0xFFFFFFFF
+
+        sec0 = bytearray(512)
+        sec0[0:4] = b"EOSS"
+        struct.pack_into("<H", sec0, 4, 1) # version
+        struct.pack_into("<H", sec0, 6, len(default_payload)) # length
+        struct.pack_into("<I", sec0, 8, crc) # checksum
+        sec0[20:20 + len(default_payload)] = default_payload
+
+        with open(settings_img_path, "wb") as f:
+            f.write(sec0)
+            f.write(bytearray((1024 * 1024) - 512))
+
     qemu_share = os.path.join(os.path.dirname(QEMU_EXE), "share")
     if not os.path.exists(qemu_share): qemu_share = r"C:\Program Files\qemu\share"
     code_fd = os.path.join(qemu_share, "edk2-x86_64-code.fd")
@@ -285,15 +421,17 @@ def prepare_and_run():
     bridge_proc = subprocess.Popen([sys.executable, "gamepad_bridge.py"]); time.sleep(0.3)
 
     qemu_cmd = [
-        QEMU_EXE, "-M", "q35", "-m", "8192M", "-smp", "8",
+        QEMU_EXE, "-M", "q35", "-m", "8192M", "-smp", "5",
+        "-accel", "tcg,thread=multi",
         "-drive", f"if=pflash,format=raw,readonly=on,file={code_fd}",
     ] + pflash_vars_args + [
         "-device", "piix3-ide,id=ide",
         "-drive", f"id=disk0,file={img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=0,drive=disk0",
         "-drive", f"id=disk1,file=fat:rw:{share_dir},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
         "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",
+        "-drive", f"id=disk3,file={settings_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=1,drive=disk3",
         "-netdev", "user,id=n0,hostfwd=udp::68-:68", "-device", "e1000,netdev=n0",
-        "-serial", "stdio", "-d", "cpu_reset,guest_errors", "-no-reboot", "-no-shutdown"
+        "-serial", "stdio", "-d", "guest_errors", "-no-reboot", "-no-shutdown"
     ]
     try: subprocess.run(qemu_cmd)
     finally: bridge_proc.terminate()
