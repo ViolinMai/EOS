@@ -33,7 +33,7 @@ pub fn init() {
         (*idt_ptr).entries[8].set_handler(double_fault_handler as *const () as usize, KERNEL_CODE_SELECTOR, 1, 0x8E);
         (*idt_ptr).entries[13].set_handler(general_protection_fault_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
         (*idt_ptr).entries[14].set_handler(page_fault_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
-        
+
         (*idt_ptr).entries[32].set_handler(timer_interrupt_preempt_entry as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
         (*idt_ptr).entries[33].set_handler(keyboard_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
         (*idt_ptr).entries[35].set_handler(com2_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
@@ -119,7 +119,7 @@ pub fn execute_command(cmd: &str) {
 
 pub extern "x86-interrupt" fn divide_by_zero_handler(stack_frame: InterruptStackFrame) {
     if (stack_frame.code_segment & 3) == 3 {
-        log_error!("CPU", "User Process Divide By Zero (#DE). Terminating.");
+        log_error!("CPU", "User Process Divide By Zero (#DE) at RIP {:#018x}. Terminating.", stack_frame.instruction_pointer);
         crate::task::force_exit_user_process();
     } else {
         log_fatal!("CPU", "KERNEL EXCEPTION: DIVIDE BY ZERO (#DE) at RIP {:#018x}", stack_frame.instruction_pointer);
@@ -133,7 +133,8 @@ pub extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFram
 
 pub extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     if (stack_frame.code_segment & 3) == 3 {
-        log_error!("CPU", "User Process Invalid Opcode (#UD). Terminating.");
+        log_error!("CPU", "User Process Invalid Opcode (#UD) at RIP {:#018x}, RSP: {:#018x}. Terminating.",
+            stack_frame.instruction_pointer, stack_frame.stack_pointer);
         crate::task::force_exit_user_process();
     } else {
         log_fatal!("CPU", "KERNEL EXCEPTION: INVALID OPCODE (#UD) at RIP {:#018x}", stack_frame.instruction_pointer);
@@ -148,10 +149,15 @@ pub extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFr
 
 pub extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: InterruptStackFrame, code: u64) {
     if (stack_frame.code_segment & 3) == 3 {
-        log_error!("CPU", "User Process #GP FAULT (Code: {:#x}). Terminating.", code);
+        log_error!("CPU", "=== [USER PROCESS #GP FAULT DIAGNOSTIC] ===");
+        log_error!("CPU", "  Fault Code : {:#x}", code);
+        log_error!("CPU", "  At RIP     : {:#018x}", stack_frame.instruction_pointer);
+        log_error!("CPU", "  At RSP     : {:#018x} (Aligned 16: {})", stack_frame.stack_pointer, (stack_frame.stack_pointer % 16) == 0);
+        log_error!("CPU", "  Code Seg CS: {:#x} | Flags: {:#x}", stack_frame.code_segment, stack_frame.cpu_flags);
+        log_error!("CPU", "============================================");
         crate::task::force_exit_user_process();
     } else {
-        log_fatal!("CPU", "KERNEL #GP FAULT at {:#018x} (Code: {:#x})", stack_frame.instruction_pointer, code);
+        log_fatal!("CPU", "KERNEL #GP FAULT at RIP {:#018x} (Code: {:#x})", stack_frame.instruction_pointer, code);
         loop { core::hint::spin_loop(); }
     }
 }
@@ -160,7 +166,8 @@ pub extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFram
     let cr2: u64;
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)); }
     if (stack_frame.code_segment & 3) == 3 {
-        log_error!("MMU", "USER PAGE FAULT on {:#018x} (Code: {:#b}). Terminating.", cr2, error_code);
+        log_error!("MMU", "USER PAGE FAULT on Address {:#018x} at RIP {:#018x} (Code: {:#b}). Terminating.",
+            cr2, stack_frame.instruction_pointer, error_code);
         crate::task::force_exit_user_process();
     } else {
         log_fatal!("MMU", "KERNEL PAGE FAULT on Address {:#018x} (Code: {:#b}) at RIP {:#018x}", cr2, error_code, stack_frame.instruction_pointer);

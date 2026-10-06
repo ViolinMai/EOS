@@ -1,0 +1,369 @@
+use std::collections::HashMap;
+use std::fs;
+use crate::framework::canvas::Canvas;
+use crate::framework::perf_log::SmartLogger;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum PathCommand {
+    MoveTo(f32, f32),
+    LineTo(f32, f32),
+    Rect(f32, f32, f32, f32, f32),
+    Circle(f32, f32, f32),
+}
+
+#[derive(Clone, Debug)]
+pub struct VectorGraphic {
+    pub name: String,
+    pub view_w: f32,
+    pub view_h: f32,
+    pub commands: Vec<PathCommand>,
+    pub fill_color: Option<u32>,
+    pub stroke_color: Option<u32>,
+    pub stroke_width: f32,
+}
+
+impl VectorGraphic {
+    pub fn new(name: &str, view_w: f32, view_h: f32) -> Self {
+        Self {
+            name: name.to_string(),
+            view_w,
+            view_h,
+            commands: Vec::new(),
+            fill_color: Some(0xFFFFFFFF),
+            stroke_color: None,
+            stroke_width: 1.0,
+        }
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut b = Vec::with_capacity(64);
+        b.extend_from_slice(b"VEC1");
+        b.extend_from_slice(&self.view_w.to_le_bytes());
+        b.extend_from_slice(&self.view_h.to_le_bytes());
+        b.extend_from_slice(&self.fill_color.unwrap_or(0).to_le_bytes());
+        b.extend_from_slice(&self.stroke_color.unwrap_or(0).to_le_bytes());
+        b.extend_from_slice(&self.stroke_width.to_le_bytes());
+        b.extend_from_slice(&(self.commands.len() as u32).to_le_bytes());
+
+        for cmd in &self.commands {
+            match *cmd {
+                PathCommand::MoveTo(x, y) => {
+                    b.push(0);
+                    b.extend_from_slice(&x.to_le_bytes());
+                    b.extend_from_slice(&y.to_le_bytes());
+                }
+                PathCommand::LineTo(x, y) => {
+                    b.push(1);
+                    b.extend_from_slice(&x.to_le_bytes());
+                    b.extend_from_slice(&y.to_le_bytes());
+                }
+                PathCommand::Rect(x, y, w, h, r) => {
+                    b.push(2);
+                    b.extend_from_slice(&x.to_le_bytes());
+                    b.extend_from_slice(&y.to_le_bytes());
+                    b.extend_from_slice(&w.to_le_bytes());
+                    b.extend_from_slice(&h.to_le_bytes());
+                    b.extend_from_slice(&r.to_le_bytes());
+                }
+                PathCommand::Circle(cx, cy, r) => {
+                    b.push(3);
+                    b.extend_from_slice(&cx.to_le_bytes());
+                    b.extend_from_slice(&cy.to_le_bytes());
+                    b.extend_from_slice(&r.to_le_bytes());
+                }
+            }
+        }
+        b
+    }
+
+    pub fn from_bytes(name: &str, data: &[u8]) -> Option<Self> {
+        if data.len() < 28 || &data[0..4] != b"VEC1" { return None; }
+        let view_w = f32::from_le_bytes(data[4..8].try_into().ok()?);
+        let view_h = f32::from_le_bytes(data[8..12].try_into().ok()?);
+        let fill = u32::from_le_bytes(data[12..16].try_into().ok()?);
+        let stroke = u32::from_le_bytes(data[16..20].try_into().ok()?);
+        let s_w = f32::from_le_bytes(data[20..24].try_into().ok()?);
+        let cmd_count = u32::from_le_bytes(data[24..28].try_into().ok()?) as usize;
+
+        let mut offset = 28;
+        let mut commands = Vec::with_capacity(cmd_count);
+        for _ in 0..cmd_count {
+            if offset >= data.len() { break; }
+            let tag = data[offset];
+            offset += 1;
+            match tag {
+                0 => {
+                    let x = f32::from_le_bytes(data[offset..offset+4].try_into().ok()?);
+                    let y = f32::from_le_bytes(data[offset+4..offset+8].try_into().ok()?);
+                    offset += 8;
+                    commands.push(PathCommand::MoveTo(x, y));
+                }
+                1 => {
+                    let x = f32::from_le_bytes(data[offset..offset+4].try_into().ok()?);
+                    let y = f32::from_le_bytes(data[offset+4..offset+8].try_into().ok()?);
+                    offset += 8;
+                    commands.push(PathCommand::LineTo(x, y));
+                }
+                2 => {
+                    let x = f32::from_le_bytes(data[offset..offset+4].try_into().ok()?);
+                    let y = f32::from_le_bytes(data[offset+4..offset+8].try_into().ok()?);
+                    let w = f32::from_le_bytes(data[offset+8..offset+12].try_into().ok()?);
+                    let h = f32::from_le_bytes(data[offset+12..offset+16].try_into().ok()?);
+                    let r = f32::from_le_bytes(data[offset+16..offset+20].try_into().ok()?);
+                    offset += 20;
+                    commands.push(PathCommand::Rect(x, y, w, h, r));
+                }
+                3 => {
+                    let cx = f32::from_le_bytes(data[offset..offset+4].try_into().ok()?);
+                    let cy = f32::from_le_bytes(data[offset+4..offset+8].try_into().ok()?);
+                    let r = f32::from_le_bytes(data[offset+8..offset+12].try_into().ok()?);
+                    offset += 12;
+                    commands.push(PathCommand::Circle(cx, cy, r));
+                }
+                _ => {}
+            }
+        }
+
+        Some(Self {
+            name: name.to_string(),
+            view_w,
+            view_h,
+            commands,
+            fill_color: if fill != 0 { Some(fill) } else { None },
+            stroke_color: if stroke != 0 { Some(stroke) } else { None },
+            stroke_width: s_w,
+        })
+    }
+}
+
+pub struct VectorStore {
+    cache: HashMap<String, VectorGraphic>,
+}
+
+pub static mut VECTOR_STORE: Option<VectorStore> = None;
+
+impl VectorStore {
+    pub fn instance() -> &'static mut Self {
+        unsafe {
+            if VECTOR_STORE.is_none() {
+                let mut vs = VectorStore { cache: HashMap::new() };
+                vs.init_builtins();
+                VECTOR_STORE = Some(vs);
+            }
+            VECTOR_STORE.as_mut().unwrap()
+        }
+    }
+
+    fn init_builtins(&mut self) {
+        // أيقونة Finder: مجلد عصري مفرغ وناعم
+        let mut folder = VectorGraphic::new("folder", 24.0, 24.0);
+        folder.fill_color = Some(0xFF38BDF8);
+        folder.commands.push(PathCommand::Rect(2.0, 4.0, 9.0, 4.0, 1.5));
+        folder.commands.push(PathCommand::Rect(2.0, 7.0, 20.0, 13.0, 2.5));
+        self.register_and_persist(folder);
+
+        // أيقونة Settings: ترس ميكانيكي مسنن
+        let mut gear = VectorGraphic::new("gear", 24.0, 24.0);
+        gear.stroke_color = Some(0xFF94A3B8);
+        gear.stroke_width = 2.0;
+        gear.commands.push(PathCommand::Circle(12.0, 12.0, 7.0));
+        gear.commands.push(PathCommand::Circle(12.0, 12.0, 3.0));
+        gear.commands.push(PathCommand::MoveTo(12.0, 2.0));  gear.commands.push(PathCommand::LineTo(12.0, 5.0));
+        gear.commands.push(PathCommand::MoveTo(12.0, 19.0)); gear.commands.push(PathCommand::LineTo(12.0, 22.0));
+        gear.commands.push(PathCommand::MoveTo(2.0, 12.0));  gear.commands.push(PathCommand::LineTo(5.0, 12.0));
+        gear.commands.push(PathCommand::MoveTo(19.0, 12.0)); gear.commands.push(PathCommand::LineTo(22.0, 12.0));
+        self.register_and_persist(gear);
+
+        // أيقونة Terminal: موجه الأوامر ومؤشر
+        let mut term = VectorGraphic::new("terminal", 24.0, 24.0);
+        term.fill_color = Some(0xFF1E293B);
+        term.stroke_color = Some(0xFF38BDF8);
+        term.stroke_width = 2.0;
+        term.commands.push(PathCommand::Rect(2.0, 3.0, 20.0, 18.0, 3.0));
+        term.commands.push(PathCommand::MoveTo(6.0, 9.0));
+        term.commands.push(PathCommand::LineTo(10.0, 12.0));
+        term.commands.push(PathCommand::LineTo(6.0, 15.0));
+        term.commands.push(PathCommand::MoveTo(12.0, 16.0));
+        term.commands.push(PathCommand::LineTo(17.0, 16.0));
+        self.register_and_persist(term);
+
+        // أيقونة Activity Monitor: مخطط نبض وموجات معالجة
+        let mut monitor = VectorGraphic::new("monitor", 24.0, 24.0);
+        monitor.stroke_color = Some(0xFF10B981);
+        monitor.stroke_width = 2.0;
+        monitor.commands.push(PathCommand::Rect(2.0, 3.0, 20.0, 18.0, 3.0));
+        monitor.commands.push(PathCommand::MoveTo(4.0, 13.0));
+        monitor.commands.push(PathCommand::LineTo(8.0, 13.0));
+        monitor.commands.push(PathCommand::LineTo(11.0, 7.0));
+        monitor.commands.push(PathCommand::LineTo(14.0, 17.0));
+        monitor.commands.push(PathCommand::LineTo(17.0, 11.0));
+        monitor.commands.push(PathCommand::LineTo(20.0, 13.0));
+        self.register_and_persist(monitor);
+
+        // أيقونة Browser: بوصلة عالمية وشبكة
+        let mut browser = VectorGraphic::new("browser", 24.0, 24.0);
+        browser.stroke_color = Some(0xFFA855F7);
+        browser.stroke_width = 2.0;
+        browser.commands.push(PathCommand::Circle(12.0, 12.0, 9.0));
+        browser.commands.push(PathCommand::MoveTo(12.0, 3.0));
+        browser.commands.push(PathCommand::LineTo(12.0, 21.0));
+        browser.commands.push(PathCommand::MoveTo(3.0, 12.0));
+        browser.commands.push(PathCommand::LineTo(21.0, 12.0));
+        self.register_and_persist(browser);
+
+        // زر Close
+        let mut close = VectorGraphic::new("close", 16.0, 16.0);
+        close.stroke_color = Some(0xFFEF4444);
+        close.stroke_width = 2.0;
+        close.commands.push(PathCommand::MoveTo(4.0, 4.0));
+        close.commands.push(PathCommand::LineTo(12.0, 12.0));
+        close.commands.push(PathCommand::MoveTo(12.0, 4.0));
+        close.commands.push(PathCommand::LineTo(4.0, 12.0));
+        self.register_and_persist(close);
+
+        // سهم Back
+        let mut back = VectorGraphic::new("back", 16.0, 16.0);
+        back.stroke_color = Some(0xFF94A3B8);
+        back.stroke_width = 2.0;
+        back.commands.push(PathCommand::MoveTo(10.0, 4.0));
+        back.commands.push(PathCommand::LineTo(5.0, 8.0));
+        back.commands.push(PathCommand::LineTo(10.0, 12.0));
+        self.register_and_persist(back);
+
+        // مستند Document
+        let mut doc = VectorGraphic::new("doc", 16.0, 16.0);
+        doc.fill_color = Some(0xFFE2E8F0);
+        doc.commands.push(PathCommand::Rect(3.0, 2.0, 10.0, 12.0, 1.5));
+        self.register_and_persist(doc);
+
+        // صورة Image
+        let mut img = VectorGraphic::new("img", 16.0, 16.0);
+        img.fill_color = Some(0xFFA855F7);
+        img.commands.push(PathCommand::Rect(2.0, 3.0, 12.0, 10.0, 2.0));
+        img.commands.push(PathCommand::Circle(5.0, 6.0, 1.5));
+        self.register_and_persist(img);
+
+        // علامة Check
+        let mut check = VectorGraphic::new("check", 16.0, 16.0);
+        check.stroke_color = Some(0xFF10B981);
+        check.stroke_width = 2.0;
+        check.commands.push(PathCommand::MoveTo(3.0, 8.0));
+        check.commands.push(PathCommand::LineTo(7.0, 12.0));
+        check.commands.push(PathCommand::LineTo(13.0, 4.0));
+        self.register_and_persist(check);
+    }
+
+    pub fn register_and_persist(&mut self, graphic: VectorGraphic) {
+        let name = graphic.name.clone();
+        let bytes = graphic.to_bytes();
+        self.cache.insert(name.clone(), graphic);
+
+        let ext2_path = format!("RootFS/icons/{}.vec", name);
+        let _ = fs::create_dir_all("RootFS/icons");
+        let _ = fs::write(&ext2_path, &bytes);
+    }
+
+    pub fn get(&mut self, name: &str) -> Option<&VectorGraphic> {
+        if self.cache.contains_key(name) {
+            return self.cache.get(name);
+        }
+
+        let ext2_path = format!("RootFS/icons/{}.vec", name);
+        if let Ok(bytes) = fs::read(&ext2_path) {
+            if let Some(vg) = VectorGraphic::from_bytes(name, &bytes) {
+                self.cache.insert(name.to_string(), vg);
+                return self.cache.get(name);
+            }
+        }
+        None
+    }
+}
+
+pub fn draw_vector_icon(canvas: &mut Canvas, name: &str, dest_x: i32, dest_y: i32, dest_w: i32, dest_h: i32, color_override: Option<u32>) {
+    let t_start = SmartLogger::read_tsc();
+    let graphic = match VectorStore::instance().get(name) {
+        Some(g) => g.clone(),
+        None => {
+            canvas.draw_rect_outline(dest_x, dest_y, dest_w, dest_h, 0xFFFF0000, 2);
+            return;
+        }
+    };
+
+    let scale_x = dest_w as f32 / graphic.view_w;
+    let scale_y = dest_h as f32 / graphic.view_h;
+
+    let fill = color_override.or(graphic.fill_color);
+    let stroke = color_override.or(graphic.stroke_color);
+
+    let mut cursor_x = 0.0f32;
+    let mut cursor_y = 0.0f32;
+
+    for cmd in &graphic.commands {
+        match *cmd {
+            PathCommand::MoveTo(x, y) => {
+                cursor_x = x;
+                cursor_y = y;
+            }
+            PathCommand::LineTo(x, y) => {
+                let x1 = dest_x + (cursor_x * scale_x).round() as i32;
+                let y1 = dest_y + (cursor_y * scale_y).round() as i32;
+                let x2 = dest_x + (x * scale_x).round() as i32;
+                let y2 = dest_y + (y * scale_y).round() as i32;
+                if let Some(col) = stroke {
+                    draw_line(canvas, x1, y1, x2, y2, col);
+                }
+                cursor_x = x;
+                cursor_y = y;
+            }
+            PathCommand::Rect(rx, ry, rw, rh, r) => {
+                let px = dest_x + (rx * scale_x).round() as i32;
+                let py = dest_y + (ry * scale_y).round() as i32;
+                let pw = (rw * scale_x).round() as i32;
+                let ph = (rh * scale_y).round() as i32;
+                let pr = (r * scale_x).round() as usize;
+
+                if let Some(col) = fill {
+                    canvas.draw_rect(px, py, pw, ph, col, pr);
+                }
+                if let Some(col) = stroke {
+                    canvas.draw_rect_outline(px, py, pw, ph, col, pr);
+                }
+            }
+            PathCommand::Circle(cx, cy, r) => {
+                let px = dest_x + ((cx - r) * scale_x).round() as i32;
+                let py = dest_y + ((cy - r) * scale_y).round() as i32;
+                let d = (r * 2.0 * scale_x).round() as i32;
+                if let Some(col) = fill {
+                    canvas.draw_rect(px, py, d, d, col, (d / 2) as usize);
+                }
+                if let Some(col) = stroke {
+                    canvas.draw_rect_outline(px, py, d, d, col, (d / 2) as usize);
+                }
+            }
+        }
+    }
+
+    let t_dur = SmartLogger::read_tsc().saturating_sub(t_start);
+    SmartLogger::record_operation("vector_draw", name, t_dur, 200);
+}
+
+fn draw_line(canvas: &mut Canvas, mut x0: i32, mut y0: i32, x1: i32, y1: i32, color: u32) {
+    let dx = (x1 - x0).abs();
+    let sx = if x0 < x1 { 1 } else { -1 };
+    let dy = -(y1 - y0).abs();
+    let sy = if y0 < y1 { 1 } else { -1 };
+    let mut err = dx + dy;
+
+    loop {
+        if x0 >= 0 && x0 < canvas.width as i32 && y0 >= 0 && y0 < canvas.height as i32 {
+            let idx = (y0 as usize) * canvas.width + (x0 as usize);
+            if idx < canvas.buffer.len() {
+                canvas.buffer[idx] = color;
+            }
+        }
+        if x0 == x1 && y0 == y1 { break; }
+        let e2 = 2 * err;
+        if e2 >= dy { err += dy; x0 += sx; }
+        if e2 <= dx { err += dx; y0 += sy; }
+    }
+}

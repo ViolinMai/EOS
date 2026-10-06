@@ -1,11 +1,9 @@
 #![allow(dead_code)]
 
+use crate::splash_data::{SPLASH_BITMAP, SPLASH_BITMAP_W, SPLASH_BITMAP_H};
+
 pub const FONT_WIDTH: usize = 8;
 pub const FONT_HEIGHT: usize = 16;
-
-const SAVED_SCREEN_SIZE: usize = 3840 * 2160;
-static mut SCREEN_SAVE_BUFFER: [u32; SAVED_SCREEN_SIZE] = [0; SAVED_SCREEN_SIZE];
-static mut SCREEN_SAVED: bool = false;
 
 pub struct FramebufferWriter {
     pub buffer: *mut u8,
@@ -15,15 +13,8 @@ pub struct FramebufferWriter {
     pub cursor_x: usize,
     pub cursor_y: usize,
     pub scale: usize,
-    pub mouse_prev_x: usize,
-    pub mouse_prev_y: usize,
-    pub mouse_saved_pixels: [u32; 32 * 32],
-    pub mouse_drawn: bool,
-    pub select_start: Option<(usize, usize)>,
-    pub select_end: Option<(usize, usize)>,
 }
 
-pub type FrameWriter = FramebufferWriter;
 pub static mut WRITER: Option<FramebufferWriter> = None;
 
 impl FramebufferWriter {
@@ -36,42 +27,10 @@ impl FramebufferWriter {
             cursor_x: 24,
             cursor_y: 24,
             scale: 2,
-            mouse_prev_x: 0,
-            mouse_prev_y: 0,
-            mouse_saved_pixels: [0; 32 * 32],
-            mouse_drawn: false,
-            select_start: None,
-            select_end: None,
         }
     }
 
-    pub fn save_screen(&mut self) {
-        unsafe {
-            self.erase_mouse_cursor();
-            let total = core::cmp::min(self.width * self.height, SAVED_SCREEN_SIZE);
-            let fb_ptr = self.buffer as *const u32;
-            for i in 0..total {
-                SCREEN_SAVE_BUFFER[i] = *fb_ptr.add(i);
-            }
-            SCREEN_SAVED = true;
-        }
-    }
-
-    pub fn restore_screen(&mut self) {
-        unsafe {
-            if SCREEN_SAVED {
-                let total = core::cmp::min(self.width * self.height, SAVED_SCREEN_SIZE);
-                let fb_ptr = self.buffer as *mut u32;
-                for i in 0..total {
-                    *fb_ptr.add(i) = SCREEN_SAVE_BUFFER[i];
-                }
-                SCREEN_SAVED = false;
-                self.mouse_drawn = false;
-            }
-        }
-    }
-
-    #[inline]
+    #[inline(always)]
     pub fn put_pixel(&mut self, x: usize, y: usize, r: u8, g: u8, b: u8) {
         if x >= self.width || y >= self.height { return; }
         unsafe {
@@ -81,112 +40,60 @@ impl FramebufferWriter {
         }
     }
 
-    #[inline]
-    pub fn get_pixel(&self, x: usize, y: usize) -> u32 {
-        if x >= self.width || y >= self.height { return 0; }
-        unsafe {
-            let offset = (y * self.pitch) + (x * 4);
-            let pixel_ptr = self.buffer.add(offset) as *const u32;
-            *pixel_ptr
-        }
-    }
-
-    pub fn erase_mouse_cursor(&mut self) {
-        if self.mouse_drawn {
-            for y in 0..24 {
-                let sy = self.mouse_prev_y + y;
-                if sy >= self.height { break; }
-                for x in 0..24 {
-                    let sx = self.mouse_prev_x + x;
-                    if sx >= self.width { break; }
-                    let old_color = self.mouse_saved_pixels[y * 24 + x];
-                    let r = ((old_color >> 16) & 0xFF) as u8;
-                    let g = ((old_color >> 8) & 0xFF) as u8;
-                    let b = (old_color & 0xFF) as u8;
-                    self.put_pixel(sx, sy, r, g, b);
+    pub fn draw_filled_circle(&mut self, cx: isize, cy: isize, radius: isize, r: u8, g: u8, b: u8) {
+        let r_sq = radius * radius;
+        for dy in -radius..=radius {
+            for dx in -radius..=radius {
+                if dx * dx + dy * dy <= r_sq {
+                    let px = cx + dx;
+                    let py = cy + dy;
+                    if px >= 0 && px < self.width as isize && py >= 0 && py < self.height as isize {
+                        self.put_pixel(px as usize, py as usize, r, g, b);
+                    }
                 }
             }
-            self.mouse_drawn = false;
         }
     }
 
-    pub fn scroll_up(&mut self) {
-        self.erase_mouse_cursor();
-        let line_height = FONT_HEIGHT * self.scale;
-        let bytes_per_line = self.pitch * line_height;
-        let total_bytes = self.height * self.pitch;
-
-        if total_bytes <= bytes_per_line { return; }
-
+    pub fn render_boot_splash(&mut self, step: usize) {
+        // 1. مسح الشاشة باللون الأسود
         unsafe {
-            let src = self.buffer.add(bytes_per_line);
-            let dst = self.buffer;
-            let copy_bytes = total_bytes - bytes_per_line;
-            core::ptr::copy(src, dst, copy_bytes);
-
-            let bottom_ptr = self.buffer.add(copy_bytes);
-            let pixel_color = ((15u32) << 16) | ((23u32) << 8) | 42u32;
-            let bottom_pixels = (bytes_per_line / 4) as usize;
-            let bottom_slice = core::slice::from_raw_parts_mut(bottom_ptr as *mut u32, bottom_pixels);
-            for p in bottom_slice.iter_mut() {
-                *p = pixel_color;
-            }
+            let slice = core::slice::from_raw_parts_mut(self.buffer as *mut u32, (self.pitch / 4) * self.height);
+            slice.fill(0xFF000000);
         }
 
-        if self.cursor_y >= line_height {
-            self.cursor_y -= line_height;
-        }
-    }
+        let start_x = ((self.width.saturating_sub(SPLASH_BITMAP_W)) / 2) as isize;
+        let start_y = (((self.height.saturating_sub(SPLASH_BITMAP_H)) / 2).saturating_sub(40)) as isize;
 
-    pub fn check_scroll(&mut self) {
-        let line_height = FONT_HEIGHT * self.scale;
-        while self.cursor_y + line_height >= self.height - 12 {
-            self.scroll_up();
-        }
-    }
-
-    pub fn write_char(&mut self, c: char, r: u8, g: u8, b: u8) {
-        self.erase_mouse_cursor();
-        let char_w = FONT_WIDTH * self.scale;
-        let char_h = FONT_HEIGHT * self.scale;
-
-        if c == '\n' {
-            self.cursor_x = 24;
-            self.cursor_y += char_h;
-            self.check_scroll();
-            return;
-        }
-        if c == '\r' {
-            self.cursor_x = 24;
-            return;
-        }
-
-        if self.cursor_x + char_w >= self.width - 24 {
-            self.cursor_x = 24;
-            self.cursor_y += char_h;
-            self.check_scroll();
-        }
-
-        let glyph = crate::font::get_glyph(c);
-        for (gy, byte) in glyph.iter().enumerate() {
-            for gx in 0..8 {
-                if (byte & (1 << (7 - gx))) != 0 {
-                    for dy in 0..self.scale {
-                        for dx in 0..self.scale {
-                            let px = self.cursor_x + (gx * self.scale) + dx;
-                            let py = self.cursor_y + (gy * self.scale) + dy;
-                            self.put_pixel(px, py, r, g, b);
+        // 2. رسم الصورة النقطية المستخرجة (1-bit Monochrome) بخطوط بيضاء ساطعة
+        let bytes_per_row = SPLASH_BITMAP_W / 8;
+        for y in 0..SPLASH_BITMAP_H {
+            let py = start_y + y as isize;
+            for bx in 0..bytes_per_row {
+                let byte_val = SPLASH_BITMAP[y * bytes_per_row + bx];
+                if byte_val == 0 { continue; }
+                for bit in 0..8 {
+                    if (byte_val & (1 << (7 - bit))) != 0 {
+                        let px = start_x + (bx * 8 + bit) as isize;
+                        if px >= 0 && px < self.width as isize && py >= 0 && py < self.height as isize {
+                            self.put_pixel(px as usize, py as usize, 255, 255, 255);
                         }
                     }
                 }
             }
         }
-        self.cursor_x += char_w;
-    }
 
-    pub fn write_str(&mut self, s: &str, r: u8, g: u8, b: u8) {
-        for c in s.chars() {
-            self.write_char(c, r, g, b);
+        // 3. ثلاث نقاط متحركة في الأسفل لتوضيح نبض الإقلاع
+        let dot_y = start_y + SPLASH_BITMAP_H as isize + 30;
+        let mid_x = (self.width / 2) as isize;
+        let spacing = 26;
+        for i in 0..3 {
+            let dx = mid_x + ((i as isize - 1) * spacing);
+            if i == (step % 3) {
+                self.draw_filled_circle(dx, dot_y, 6, 255, 255, 255);
+            } else {
+                self.draw_filled_circle(dx, dot_y, 4, 75, 85, 99);
+            }
         }
     }
 }

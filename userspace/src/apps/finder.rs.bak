@@ -50,8 +50,9 @@ impl FinderApp {
 
         let mut read_success = false;
         let candidates = [
-            format!("/{}", target_path),
             target_path.clone(),
+            format!("/{}", target_path),
+            format!("{}/", target_path),
         ];
 
         for p in &candidates {
@@ -184,20 +185,20 @@ impl Widget for FinderApp {
 
                 canvas.draw_rect(self.bounds.x + theme.pt(4.0), cur_y, self.bounds.w - theme.pt(8.0), row_h, bg, theme.pt(4.0) as usize);
 
-                let icon = if entry.name == ".." {
-                    "⤴️"
+                let icon_tag = if entry.name == ".." {
+                    ":back:"
                 } else if entry.is_dir {
-                    "📁"
+                    ":folder:"
                 } else if entry.name.ends_with(".elf") {
-                    "⚙️"
+                    ":gear:"
                 } else if entry.name.ends_with(".png") || entry.name.ends_with(".jpg") || entry.name.ends_with(".jpeg") {
-                    "🖼️"
+                    ":img:"
                 } else {
-                    "📄"
+                    ":doc:"
                 };
 
                 let label = if entry.is_dir {
-                    format!("{}  {}", icon, entry.name)
+                    format!("{} {}", icon_tag, entry.name)
                 } else {
                     let sz_str = if entry.size >= 1024 * 1024 {
                         format!("{:.2} MB", (entry.size as f64) / (1024.0 * 1024.0))
@@ -206,11 +207,11 @@ impl Widget for FinderApp {
                     } else {
                         format!("{} B", entry.size)
                     };
-                    format!("{}  {} ({})", icon, entry.name, sz_str)
+                    format!("{} {} ({})", icon_tag, entry.name, sz_str)
                 };
 
                 let txt_c = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
-                canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), cur_y + theme.pt(8.0), self.bounds.w - theme.pt(28.0), &label, txt_c, theme.font_body());
+                canvas.draw_text_with_icons(self.bounds.x + theme.pt(14.0), cur_y + theme.pt(8.0), &label, txt_c, theme.font_body());
             }
             cur_y += row_h;
         }

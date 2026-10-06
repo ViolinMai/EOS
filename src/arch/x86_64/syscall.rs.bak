@@ -200,7 +200,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             } else { frame.rax = -9i64 as u64; }
         }
         2 | 257 => { // open, openat
-            let (path_ptr, flags) = if frame.rax == 2 { (frame.rdi, 0) } else { (frame.rsi, frame.rdx) };
+            let (path_ptr, flags) = if frame.rax == 2 { (frame.rdi, frame.rsi) } else { (frame.rsi, frame.rdx) };
             let mut buf = [0u8; 512];
             let mut len = 0;
             while len < 511 {

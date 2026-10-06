@@ -153,9 +153,9 @@ impl Widget for FinderApp {
         let favorites = [("Root", "EOS SHARE"), ("RootFS", "RootFS"), ("Initrd", "Initrd")];
         let mut fav_x = self.bounds.x + theme.pt(12.0);
         for &(label, target) in &favorites {
-            let btn_w = theme.pt(54.0);
+            let btn_w = theme.pt(58.0);
             let is_cur = self.current_path == target || (target == "EOS SHARE" && self.current_path.starts_with("EOS SHARE/"));
-            let bg_c = if is_cur { theme.accent } else { 0xFF243044 };
+            let bg_c = if is_cur { theme.accent } else { 0xFF27272A }; // داكن محايد خالي من الأزرق
             canvas.draw_rect(fav_x, self.bounds.y + theme.pt(7.0), btn_w, theme.pt(26.0), bg_c, theme.pt(5.0) as usize);
             let (tw, th) = canvas.measure_text(label, theme.font_caption());
             canvas.draw_text(fav_x + (btn_w - tw as i32) / 2, self.bounds.y + theme.pt(7.0) + (theme.pt(26.0) - th as i32) / 2, label, 0xFFFFFFFF, theme.font_caption());
@@ -180,25 +180,25 @@ impl Widget for FinderApp {
                 } else if idx % 2 == 0 {
                     theme.bg_window
                 } else {
-                    0xFF141E2E
+                    0xFF18181B // رمادي داكن نقي خالي من أي أزرق
                 };
 
                 canvas.draw_rect(self.bounds.x + theme.pt(4.0), cur_y, self.bounds.w - theme.pt(8.0), row_h, bg, theme.pt(4.0) as usize);
 
-                let icon = if entry.name == ".." {
-                    "⤴️"
+                let icon_tag = if entry.name == ".." {
+                    ":back:"
                 } else if entry.is_dir {
-                    "📁"
+                    ":folder:"
                 } else if entry.name.ends_with(".elf") {
-                    "⚙️"
+                    ":gear:"
                 } else if entry.name.ends_with(".png") || entry.name.ends_with(".jpg") || entry.name.ends_with(".jpeg") {
-                    "🖼️"
+                    ":img:"
                 } else {
-                    "📄"
+                    ":doc:"
                 };
 
                 let label = if entry.is_dir {
-                    format!("{}  {}", icon, entry.name)
+                    format!("{} {}", icon_tag, entry.name)
                 } else {
                     let sz_str = if entry.size >= 1024 * 1024 {
                         format!("{:.2} MB", (entry.size as f64) / (1024.0 * 1024.0))
@@ -207,11 +207,11 @@ impl Widget for FinderApp {
                     } else {
                         format!("{} B", entry.size)
                     };
-                    format!("{}  {} ({})", icon, entry.name, sz_str)
+                    format!("{} {} ({})", icon_tag, entry.name, sz_str)
                 };
 
                 let txt_c = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
-                canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), cur_y + theme.pt(8.0), self.bounds.w - theme.pt(28.0), &label, txt_c, theme.font_body());
+                canvas.draw_text_with_icons(self.bounds.x + theme.pt(14.0), cur_y + theme.pt(8.0), &label, txt_c, theme.font_body());
             }
             cur_y += row_h;
         }
@@ -221,7 +221,7 @@ impl Widget for FinderApp {
             let thumb_h = ((list_h as f32 / total_items_h as f32) * list_h as f32).max(20.0);
             let max_sc = (total_items_h - list_h).max(1) as f32;
             let thumb_y = list_y as f32 + ((self.scroll_y as f32 / max_sc) * (list_h as f32 - thumb_h));
-            canvas.draw_rect(self.bounds.x + self.bounds.w - 6, thumb_y as i32, 4, thumb_h as i32, 0x8894A3B8, 2);
+            canvas.draw_rect(self.bounds.x + self.bounds.w - 6, thumb_y as i32, 4, thumb_h as i32, 0x8871717A, 2);
         }
 
         canvas.pop_clip();
@@ -243,7 +243,7 @@ impl Widget for FinderApp {
                 let favorites = ["EOS SHARE", "RootFS", "Initrd"];
                 let mut fav_x = self.bounds.x + theme.pt(12.0);
                 for target in favorites {
-                    let btn_w = theme.pt(54.0);
+                    let btn_w = theme.pt(58.0);
                     if mx >= fav_x && mx <= fav_x + btn_w {
                         self.load_directory(target);
                         return true;
@@ -283,9 +283,9 @@ impl Widget for FinderApp {
         let max_scroll = (total_h - view_h).max(0);
 
         if dy > 0 {
-            self.scroll_y = (self.scroll_y + theme.pt(28.0)).min(max_scroll);
+            self.scroll_y = (self.scroll_y + theme.pt(32.0)).min(max_scroll);
         } else {
-            self.scroll_y = (self.scroll_y - theme.pt(28.0)).max(0);
+            self.scroll_y = (self.scroll_y - theme.pt(32.0)).max(0);
         }
         true
     }

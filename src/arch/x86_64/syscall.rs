@@ -130,7 +130,7 @@ pub fn init_core_syscall(core_id: usize) {
         if core_id < 8 && KERNEL_SYSCALL_STACKS[core_id] != 0 {
             (*state_ptr).kernel_rsp = KERNEL_SYSCALL_STACKS[core_id];
         }
-        wrmsr(0xC0000102, state_ptr as u64); 
+        wrmsr(0xC0000102, state_ptr as u64);
     }
 }
 
@@ -181,7 +181,6 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 let proc = get_current_process();
                 if let Some(file) = &mut proc.fd_table[fd] {
                     if !file.is_writable {
-                        crate::log_warn!("SYSCALL", "sys_write: fd {} ({}) is NOT writable", fd, file.path);
                         frame.rax = -9i64 as u64;
                         return;
                     }
@@ -192,7 +191,6 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                             bytes[file.offset..file.offset+buf.len()].copy_from_slice(&buf);
                             file.offset += buf.len();
                             file.is_dirty = true;
-                            crate::log_info!("SYSCALL", "sys_write: wrote {} bytes to fd {} ({})", buf.len(), fd, file.path);
                             frame.rax = buf.len() as u64;
                         } else { frame.rax = -14i64 as u64; }
                     } else { frame.rax = -9i64 as u64; }
@@ -245,7 +243,6 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 let mut fd_allocated = false;
                 for (i, f) in proc.fd_table.iter_mut().enumerate().skip(3) {
                     if f.is_none() {
-                        crate::log_info!("SYSCALL", "sys_open: '{}' -> fd {} (writable={}, flags={:#o})", path, i, is_writable, flags);
                         *f = Some(crate::task::FileDescriptor {
                             path: alloc::string::String::from(path),
                             source: src,
@@ -258,12 +255,8 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                         break;
                     }
                 }
-                if !fd_allocated {
-                    crate::log_error!("SYSCALL", "sys_open: fd table full for '{}'", path);
-                    frame.rax = -24i64 as u64;
-                }
+                if !fd_allocated { frame.rax = -24i64 as u64; }
             } else {
-                crate::log_warn!("SYSCALL", "sys_open: failed to open/create '{}' (flags={:#o})", path, flags);
                 frame.rax = -2i64 as u64;
             }
         }
@@ -272,10 +265,8 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             if fd < 64 {
                 let proc = get_current_process();
                 if let Some(file) = proc.fd_table[fd].take() {
-                    crate::log_info!("SYSCALL", "sys_close: fd {} ('{}', is_writable={}, is_dirty={})", fd, file.path, file.is_writable, file.is_dirty);
                     if file.is_writable && file.is_dirty {
                         if let crate::task::FileSource::Memory(ref bytes) = file.source {
-                            crate::log_info!("SYSCALL", "sys_close: Flushing {} bytes to disk for '{}'", bytes.len(), file.path);
                             let _ = crate::fs::vfs_save_text_file(&file.path, bytes);
                         }
                     }
@@ -360,9 +351,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 if crate::mm::paging::map_user_pages(cur_pml4, vaddr, pages).is_err() { frame.rax = -12i64 as u64; } else { frame.rax = vaddr; }
             } else { frame.rax = -38i64 as u64; }
         }
-        11 => { // munmap
-            frame.rax = 0;
-        }
+        11 => { frame.rax = 0; }
         12 => { // brk
             let addr = frame.rdi;
             let proc = get_current_process();
@@ -443,13 +432,10 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             frame.rax = 0;
         }
         56 => { // clone
-            let flags = frame.rdi;
             let stack = frame.rsi;
             let ptid = frame.rdx;
             let ctid = frame.r10;
             let tls = frame.r8;
-
-            crate::log_info!("CLONE", "sys_clone invoked with flags {:#x}, stack {:#x}, tls {:#x}", flags, stack, tls);
 
             let mut target_core = None;
             for c in 3..8 {
@@ -522,7 +508,6 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 if let Some(file) = &mut proc.fd_table[fd] {
                     if file.is_writable && file.is_dirty {
                         if let crate::task::FileSource::Memory(ref bytes) = file.source {
-                            crate::log_info!("SYSCALL", "sys_fsync: Flushing {} bytes to disk for '{}'", bytes.len(), file.path);
                             let _ = crate::fs::vfs_save_text_file(&file.path, bytes);
                             file.is_dirty = false;
                         }
@@ -602,16 +587,17 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                                 let name = match item { crate::fs::FsItem::Directory(n,_) => n, crate::fs::FsItem::File(n,_,_) => n };
                                 let d_type = match item { crate::fs::FsItem::Directory(_,_) => 4, _ => 8 };
                                 let name_bytes = name.as_bytes();
-                                let rec_len = (19 + name_bytes.len() + 8) & !7;
+                                // ضمان محاذاة 8 بايتات صارمة لكل سجل في dirent64 لمنع تحطيم مكدس musl
+                                let rec_len = (19 + name_bytes.len() + 1 + 7) & !7;
                                 if written + rec_len > count { break; }
                                 unsafe {
                                     let out_ptr = out_buf.as_mut_ptr().add(written);
+                                    core::ptr::write_bytes(out_ptr, 0, rec_len);
                                     core::ptr::write_unaligned(out_ptr as *mut u64, *off as u64 + 1);
                                     core::ptr::write_unaligned(out_ptr.add(8) as *mut i64, *off as i64 + 1);
                                     core::ptr::write_unaligned(out_ptr.add(16) as *mut u16, rec_len as u16);
                                     core::ptr::write_unaligned(out_ptr.add(18) as *mut u8, d_type);
                                     core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), out_ptr.add(19), name_bytes.len());
-                                    core::ptr::write_unaligned(out_ptr.add(19 + name_bytes.len()), 0);
                                 }
                                 written += rec_len;
                                 *off += 1;
@@ -755,7 +741,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         }
         10 | 13 | 14 | 28 | 131 | 273 | 334 => { frame.rax = 0; }
         39 => { frame.rax = 1; }
-        _ => { crate::log_warn!("SYSCALL", "Unimplemented syscall {}", frame.rax); frame.rax = -38i64 as u64; }
+        _ => { frame.rax = -38i64 as u64; }
     }
 }
 
@@ -836,8 +822,6 @@ fn ap_thread_runner_worker() {
     let core_id = crate::profiler::get_core_id();
     let ctx = unsafe { THREAD_SPAWN_CONTEXTS[core_id].take().expect("Missing thread context") };
 
-    crate::log_info!("THREAD", "Core {} launching Ring 3 pthread (RSP: {:#018x}, TLS: {:#018x})", core_id, ctx.user_rsp, ctx.tls);
-
     let state_ptr = unsafe { core::ptr::addr_of_mut!(CORE_SYSCALL_STATES[core_id]) };
     let spawn_rsp_ptr = unsafe { &mut (*state_ptr).kernel_spawn_rsp as *mut u64 };
 
@@ -863,5 +847,4 @@ fn ap_thread_runner_worker() {
         let _ = copy_to_user(ctid_addr, &zero.to_ne_bytes());
     }
     THREAD_ACTIVE[core_id].store(false, Ordering::SeqCst);
-    crate::log_info!("THREAD", "Core {} pthread exited cleanly.", core_id);
 }

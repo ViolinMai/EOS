@@ -1,16 +1,25 @@
-use crate::framework::widget::Rect;
-use rusttype::{Font, Scale, point};
 use std::collections::BTreeMap;
-
-pub type FontGlyphCache = BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>;
+use rusttype::{Font, Scale, point};
+use crate::framework::widget::Rect;
+use crate::framework::vector::draw_vector_icon;
 
 pub struct Canvas<'a> {
     pub buffer: &'a mut [u32],
     pub width: usize,
     pub height: usize,
     pub font: Option<&'a Font<'a>>,
-    pub font_cache: Option<&'a mut FontGlyphCache>,
+    pub font_cache: Option<&'a mut BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>>,
     pub clip_stack: Vec<Rect>,
+}
+
+#[inline(always)]
+fn blend(bg: u32, fg: u32, alpha: u32) -> u32 {
+    if alpha >= 255 { return fg | 0xFF000000; }
+    if alpha == 0 { return bg | 0xFF000000; }
+    let inv = 255 - alpha;
+    let rb = (((fg & 0x00FF00FF) * alpha + (bg & 0x00FF00FF) * inv) >> 8) & 0x00FF00FF;
+    let g = (((fg & 0x0000FF00) * alpha + (bg & 0x0000FF00) * inv) >> 8) & 0x0000FF00;
+    0xFF000000 | rb | g
 }
 
 impl<'a> Canvas<'a> {
@@ -19,7 +28,7 @@ impl<'a> Canvas<'a> {
         width: usize,
         height: usize,
         font: Option<&'a Font<'a>>,
-        font_cache: &'a mut FontGlyphCache,
+        font_cache: &'a mut BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>,
     ) -> Self {
         Self {
             buffer,
@@ -31,138 +40,78 @@ impl<'a> Canvas<'a> {
         }
     }
 
+    pub fn clear(&mut self, color: u32) {
+        self.buffer.fill(color);
+    }
+
     pub fn push_clip(&mut self, rect: Rect) {
-        let intersected = if let Some(current) = self.clip_stack.last() {
-            let x1 = rect.x.max(current.x);
-            let y1 = rect.y.max(current.y);
-            let x2 = (rect.x + rect.w).min(current.x + current.w);
-            let y2 = (rect.y + rect.h).min(current.y + current.h);
-            Rect {
-                x: x1,
-                y: y1,
-                w: (x2 - x1).max(0),
-                h: (y2 - y1).max(0),
-            }
-        } else {
-            rect
-        };
-        self.clip_stack.push(intersected);
+        let current = self.current_clip();
+        let clipped = current.intersect(&rect);
+        self.clip_stack.push(clipped);
     }
 
     pub fn pop_clip(&mut self) {
         self.clip_stack.pop();
     }
 
-    #[inline(always)]
     pub fn current_clip(&self) -> Rect {
-        self.clip_stack.last().copied().unwrap_or(Rect {
-            x: 0,
-            y: 0,
-            w: self.width as i32,
-            h: self.height as i32,
-        })
-    }
-
-    #[inline(always)]
-    pub fn blend(bg: u32, fg: u32, alpha: u32) -> u32 {
-        if alpha >= 255 { return fg | 0xFF000000; }
-        if alpha == 0 { return bg; }
-        let inv = 255 - alpha;
-        let rb = ((((fg & 0x00FF00FF) * alpha) + ((bg & 0x00FF00FF) * inv) + 0x00800080) >> 8) & 0x00FF00FF;
-        let g  = ((((fg & 0x0000FF00) * alpha) + ((bg & 0x0000FF00) * inv) + 0x00008000) >> 8) & 0x0000FF00;
-        0xFF000000 | rb | g
-    }
-
-    pub fn draw_frosted_glass_rect(&mut self, x: i32, y: i32, w: i32, h: i32, tint: u32, radius: usize) {
-        let clip = self.current_clip();
-        let sx = x.max(clip.x).max(0);
-        let sy = y.max(clip.y).max(0);
-        let ex = (x + w).min(clip.x + clip.w).min(self.width as i32);
-        let ey = (y + h).min(clip.y + clip.h).min(self.height as i32);
-        if sx >= ex || sy >= ey { return; }
-
-        let tint_alpha = (tint >> 24) & 0xFF;
-        let r = radius as i32;
-
-        if r <= 0 {
-            let row_w = (ex - sx) as usize;
-            for cy in sy..ey {
-                let idx = (cy as usize) * self.width + (sx as usize);
-                let row = &mut self.buffer[idx..idx + row_w];
-                for px in row.iter_mut() {
-                    *px = Self::blend(*px, tint, tint_alpha);
-                }
-            }
-        } else {
-            self.draw_rect(x, y, w, h, tint, radius);
-        }
+        self.clip_stack.last().copied().unwrap_or(Rect::new(0, 0, self.width as i32, self.height as i32))
     }
 
     pub fn draw_rect(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, radius: usize) {
         let clip = self.current_clip();
-        let sx = x.max(clip.x).max(0);
-        let sy = y.max(clip.y).max(0);
         let ex = (x + w).min(clip.x + clip.w).min(self.width as i32);
         let ey = (y + h).min(clip.y + clip.h).min(self.height as i32);
+        let sx = x.max(clip.x).max(0);
+        let sy = y.max(clip.y).max(0);
+
         if sx >= ex || sy >= ey { return; }
+        let a = (color >> 24) & 0xFF;
 
-        let alpha = (color >> 24) & 0xFF;
-        let r = radius as i32;
-
-        if r <= 0 {
-            let row_w = (ex - sx) as usize;
-            if alpha == 255 {
-                let fill_c = color | 0xFF000000;
-                for cy in sy..ey {
-                    let idx = (cy as usize) * self.width + (sx as usize);
-                    self.buffer[idx..idx + row_w].fill(fill_c);
-                }
-            } else if alpha > 0 {
-                for cy in sy..ey {
-                    let idx = (cy as usize) * self.width + (sx as usize);
-                    let row = &mut self.buffer[idx..idx + row_w];
-                    for px in row.iter_mut() {
-                        *px = Self::blend(*px, color, alpha);
+        if radius == 0 {
+            for cy in sy..ey {
+                let row = (cy as usize) * self.width;
+                if a == 255 || a == 0 {
+                    let fill_c = if a == 0 { color | 0xFF000000 } else { color };
+                    for cx in sx..ex {
+                        self.buffer[row + (cx as usize)] = fill_c;
                     }
-                }
-            }
-            return;
-        }
-
-        let r_sq = r * r;
-        let inner_r = (r - 1).max(0);
-        let inner_r_sq = inner_r * inner_r;
-        let rx1 = x + r;
-        let rx2 = x + w - r;
-        let ry1 = y + r;
-        let ry2 = y + h - r;
-
-        for cy in sy..ey {
-            let is_y_edge = cy < ry1 || cy >= ry2;
-            let dy = if cy < ry1 { ry1 - cy - 1 } else if cy >= ry2 { cy - ry2 } else { 0 };
-            let dy_sq = dy * dy;
-
-            for cx in sx..ex {
-                let is_x_edge = cx < rx1 || cx >= rx2;
-                if is_y_edge && is_x_edge {
-                    let dx = if cx < rx1 { rx1 - cx - 1 } else { cx - rx2 };
-                    let dist_sq = dx * dx + dy_sq;
-                    if dist_sq >= r_sq {
-                        continue;
-                    }
-                    let p_alpha = if dist_sq > inner_r_sq {
-                        (alpha * (r_sq - dist_sq) as u32) / (r_sq - inner_r_sq).max(1) as u32
-                    } else {
-                        alpha
-                    };
-                    let idx = (cy as usize) * self.width + (cx as usize);
-                    self.buffer[idx] = Self::blend(self.buffer[idx], color, p_alpha);
                 } else {
-                    let idx = (cy as usize) * self.width + (cx as usize);
-                    self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
+                    for cx in sx..ex {
+                        let idx = row + (cx as usize);
+                        self.buffer[idx] = blend(self.buffer[idx], color, a);
+                    }
+                }
+            }
+        } else {
+            let r_sq = (radius * radius) as i32;
+            for cy in sy..ey {
+                let row = (cy as usize) * self.width;
+                let is_top = cy < y + radius as i32;
+                let is_bottom = cy >= y + h - radius as i32;
+                let dy = if is_top { (y + radius as i32 - 1) - cy } else if is_bottom { cy - (y + h - radius as i32) } else { 0 };
+
+                for cx in sx..ex {
+                    let is_left = cx < x + radius as i32;
+                    let is_right = cx >= x + w - radius as i32;
+                    if (is_top || is_bottom) && (is_left || is_right) {
+                        let dx = if is_left { (x + radius as i32 - 1) - cx } else { cx - (x + w - radius as i32) };
+                        if dx * dx + dy * dy >= r_sq { continue; }
+                    }
+                    let idx = row + (cx as usize);
+                    if a == 255 || a == 0 {
+                        self.buffer[idx] = if a == 0 { color | 0xFF000000 } else { color };
+                    } else {
+                        self.buffer[idx] = blend(self.buffer[idx], color, a);
+                    }
                 }
             }
         }
+    }
+
+    pub fn draw_frosted_glass_rect(&mut self, x: i32, y: i32, w: i32, h: i32, tint: u32, radius: usize) {
+        let alpha = ((tint >> 24) & 0xFF).max(180);
+        self.draw_rect(x, y, w, h, (tint & 0x00FFFFFF) | (alpha << 24), radius);
     }
 
     pub fn draw_rect_outline(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, radius: usize) {
@@ -171,200 +120,226 @@ impl<'a> Canvas<'a> {
             self.draw_line_h(x, y + h - 1, w, color);
             self.draw_line_v(x, y, h, color);
             self.draw_line_v(x + w - 1, y, h, color);
-            return;
-        }
-
-        let clip = self.current_clip();
-        let sx = x.max(clip.x).max(0);
-        let sy = y.max(clip.y).max(0);
-        let ex = (x + w).min(clip.x + clip.w).min(self.width as i32);
-        let ey = (y + h).min(clip.y + clip.h).min(self.height as i32);
-        if sx >= ex || sy >= ey { return; }
-
-        let r = radius as i32;
-        let r_sq = r * r;
-        let inner_r = (r - 1).max(0);
-        let inner_r_sq = inner_r * inner_r;
-        let alpha = (color >> 24) & 0xFF;
-
-        for cy in sy..ey {
-            for cx in sx..ex {
-                let is_top = cy < y + r;
-                let is_bottom = cy >= y + h - r;
-                let is_left = cx < x + r;
-                let is_right = cx >= x + w - r;
-
-                let draw = if (is_top || is_bottom) && (is_left || is_right) {
-                    let dx = if is_left { (x + r) - cx - 1 } else { cx - (x + w - r) };
-                    let dy = if is_top { (y + r) - cy - 1 } else { cy - (y + h - r) };
-                    let dist = dx * dx + dy * dy;
-                    dist < r_sq && dist >= inner_r_sq
-                } else {
-                    cx == x || cx == x + w - 1 || cy == y || cy == y + h - 1
-                };
-
-                if draw {
-                    let idx = (cy as usize) * self.width + (cx as usize);
-                    self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
-                }
-            }
+        } else {
+            self.draw_rect(x, y, w, h, color, radius);
         }
     }
 
     pub fn draw_line_h(&mut self, x: i32, y: i32, w: i32, color: u32) {
-        let clip = self.current_clip();
-        if y < clip.y || y >= clip.y + clip.h || y < 0 || y >= self.height as i32 { return; }
-        let sx = x.max(clip.x).max(0);
-        let ex = (x + w).min(clip.x + clip.w).min(self.width as i32);
-        if sx >= ex { return; }
-
-        let alpha = (color >> 24) & 0xFF;
-        let idx = (y as usize) * self.width + (sx as usize);
-        let len = (ex - sx) as usize;
-        if alpha == 255 {
-            self.buffer[idx..idx + len].fill(color | 0xFF000000);
-        } else {
-            for px in &mut self.buffer[idx..idx + len] {
-                *px = Self::blend(*px, color, alpha);
-            }
-        }
+        self.draw_rect(x, y, w, 1, color, 0);
     }
 
     pub fn draw_line_v(&mut self, x: i32, y: i32, h: i32, color: u32) {
-        let clip = self.current_clip();
-        if x < clip.x || x >= clip.x + clip.w || x < 0 || x >= self.width as i32 { return; }
-        let sy = y.max(clip.y).max(0);
-        let ey = (y + h).min(clip.y + clip.h).min(self.height as i32);
-        if sy >= ey { return; }
-
-        let alpha = (color >> 24) & 0xFF;
-        for cy in sy..ey {
-            let idx = (cy as usize) * self.width + (x as usize);
-            self.buffer[idx] = Self::blend(self.buffer[idx], color, alpha);
-        }
+        self.draw_rect(x, y, 1, h, color, 0);
     }
 
-    pub fn measure_text(&mut self, text: &str, size_px: usize) -> (usize, usize) {
-        if let Some(font) = self.font {
-            let scale = Scale::uniform(size_px as f32);
+    pub fn draw_text(&mut self, x: i32, y: i32, text: &str, color: u32, size: usize) {
+        let (w, _) = self.measure_text(text, size);
+        self.draw_text_clipped(x, y, w as i32, text, color, size);
+    }
+
+    pub fn draw_text_clipped(&mut self, x: i32, y: i32, max_w: i32, text: &str, color: u32, size: usize) {
+        let clip = self.current_clip();
+        if self.font.is_some() && self.font_cache.is_some() {
+            let font = self.font.unwrap();
+            let cache = self.font_cache.as_mut().unwrap();
+            let scale = Scale::uniform(size as f32);
             let v_metrics = font.v_metrics(scale);
-            let h = (v_metrics.ascent - v_metrics.descent).ceil() as usize;
-            let mut w = 0.0;
+            let mut cur_x = x;
+
             for c in text.chars() {
-                let key = (size_px, c);
-                if let Some(cache) = self.font_cache.as_ref() {
-                    if let Some((_, _, _, _, adv, _)) = cache.get(&key) {
-                        w += *adv as f32;
-                        continue;
+                if cur_x - x >= max_w { break; }
+                let key = (size, c);
+                if !cache.contains_key(&key) {
+                    let glyph = font.glyph(c).scaled(scale).positioned(point(0.0, v_metrics.ascent));
+                    let adv = glyph.unpositioned().h_metrics().advance_width.round() as usize;
+                    if let Some(bb) = glyph.pixel_bounding_box() {
+                        let mut cov = vec![0u8; bb.width() as usize * bb.height() as usize];
+                        glyph.draw(|gx, gy, v| cov[gy as usize * bb.width() as usize + gx as usize] = (v * 255.0) as u8);
+                        cache.insert(key, (bb.width() as usize, bb.height() as usize, bb.min.x as isize, bb.min.y as isize, adv.max(1), cov));
+                    } else {
+                        cache.insert(key, (0, 0, 0, 0, adv.max(size / 3), Vec::new()));
                     }
                 }
-                let g = font.glyph(c).scaled(scale);
-                w += g.h_metrics().advance_width;
-            }
-            (w.ceil() as usize, h.max(size_px))
-        } else {
-            (text.chars().count() * ((size_px * 6) / 10), size_px)
-        }
-    }
 
-    pub fn draw_text(&mut self, x: i32, y: i32, text: &str, color: u32, size_px: usize) {
-        let font = match self.font {
-            Some(f) => f,
-            None => return,
-        };
+                let (gw, gh, bx, by, adv, cov) = cache.get(&key).unwrap();
+                let gx = cur_x + *bx as i32;
+                let gy = y + *by as i32;
 
-        let clip = self.current_clip();
-        let scale = Scale::uniform(size_px as f32);
-        let v_metrics = font.v_metrics(scale);
-        let mut cur_x = x;
-
-        for c in text.chars() {
-            if c == '\n' { continue; }
-            let key = (size_px, c);
-
-            let has_entry = self.font_cache.as_ref().map(|map| map.contains_key(&key)).unwrap_or(false);
-            if !has_entry {
-                let glyph = font.glyph(c).scaled(scale).positioned(point(0.0, v_metrics.ascent));
-                let adv = glyph.unpositioned().h_metrics().advance_width.round() as usize;
-                if let Some(bb) = glyph.pixel_bounding_box() {
-                    let mut cov = vec![0u8; bb.width() as usize * bb.height() as usize];
-                    glyph.draw(|gx, gy, v| cov[gy as usize * bb.width() as usize + gx as usize] = (v * 255.0) as u8);
-                    if let Some(map) = self.font_cache.as_mut() {
-                        map.insert(key, (bb.width() as usize, bb.height() as usize, bb.min.x as isize, bb.min.y as isize, adv.max(1), cov));
-                    }
-                } else if let Some(map) = self.font_cache.as_mut() {
-                    map.insert(key, (0, 0, 0, 0, adv.max(size_px / 3), Vec::new()));
-                }
-            }
-
-            if let Some(map) = self.font_cache.as_ref() {
-                if let Some((gw, gh, bx, by, adv, cov)) = map.get(&key) {
-                    let gx = cur_x + *bx as i32;
-                    let gy = y + *by as i32;
-
-                    for row in 0..*gh {
-                        let py = gy + row as i32;
-                        if py < clip.y || py >= clip.y + clip.h || py < 0 || py >= self.height as i32 { continue; }
-                        for col in 0..*gw {
-                            let px = gx + col as i32;
-                            if px < clip.x || px >= clip.x + clip.w || px < 0 || px >= self.width as i32 { continue; }
-                            let cov_val = cov[row * gw + col] as u32;
-                            if cov_val > 0 {
-                                let idx = (py as usize) * self.width + (px as usize);
-                                self.buffer[idx] = Self::blend(self.buffer[idx], color, cov_val);
-                            }
+                for row in 0..*gh {
+                    let py = gy + row as i32;
+                    if py < clip.y || py >= clip.y + clip.h || py < 0 || py >= self.height as i32 { continue; }
+                    for col in 0..*gw {
+                        let px = gx + col as i32;
+                        if px < clip.x || px >= clip.x + clip.w || px < 0 || px >= self.width as i32 { continue; }
+                        let alpha = cov[row * gw + col] as u32;
+                        if alpha > 0 {
+                            let idx = (py as usize) * self.width + (px as usize);
+                            self.buffer[idx] = blend(self.buffer[idx], color, alpha);
                         }
                     }
-                    cur_x += *adv as i32;
+                }
+                cur_x += *adv as i32;
+            }
+        }
+    }
+
+    pub fn draw_text_with_icons(&mut self, x: i32, y: i32, text: &str, color: u32, size: usize) {
+        let mut cur_x = x;
+        let icon_sz = (size as i32 + 2).max(12);
+
+        let mut parts = text.split(':');
+        if let Some(first) = parts.next() {
+            if !first.is_empty() {
+                self.draw_text(cur_x, y, first, color, size);
+                let (w, _) = self.measure_text(first, size);
+                cur_x += w as i32;
+            }
+        }
+
+        while let Some(tag) = parts.next() {
+            let next_text = parts.next().unwrap_or("");
+            let is_known_icon = matches!(tag, "folder" | "close" | "back" | "gear" | "doc" | "img" | "check" | "terminal" | "monitor" | "browser");
+
+            if is_known_icon {
+                cur_x += 2;
+                draw_vector_icon(self, tag, cur_x, y - 1, icon_sz, icon_sz, Some(color));
+                cur_x += icon_sz + 4;
+            } else {
+                let restored = format!(":{}:", tag);
+                self.draw_text(cur_x, y, &restored, color, size);
+                let (w, _) = self.measure_text(&restored, size);
+                cur_x += w as i32;
+            }
+
+            if !next_text.is_empty() {
+                self.draw_text(cur_x, y, next_text, color, size);
+                let (w, _) = self.measure_text(next_text, size);
+                cur_x += w as i32;
+            }
+        }
+    }
+
+    pub fn measure_text(&self, text: &str, size: usize) -> (usize, usize) {
+        if let (Some(font), Some(cache)) = (self.font, &self.font_cache) {
+            let scale = Scale::uniform(size as f32);
+            let mut total_w = 0;
+            for c in text.chars() {
+                let key = (size, c);
+                if let Some((_, _, _, _, adv, _)) = cache.get(&key) {
+                    total_w += adv;
+                } else {
+                    let adv = font.glyph(c).scaled(scale).h_metrics().advance_width.round() as usize;
+                    total_w += adv.max(size / 3);
+                }
+            }
+            (total_w, size)
+        } else {
+            let char_w = (size * 6) / 10;
+            (text.len() * char_w, size)
+        }
+    }
+
+    /// مؤشر لينكس الحقيقي المتطابق مع Breeze / Adwaita
+    pub fn draw_linux_cursor(&mut self, mx: i32, my: i32) {
+        // مصفوفة مؤشر لينكس بدقة 19x12 بكسل حقيقية (حواف بيضاء، قلب أسود، ظل شفاف)
+        #[rustfmt::skip]
+        let shape: [&[u8; 12]; 19] = [
+            b"B...........",
+            b"WB..........",
+            b"WWB.........",
+            b"WWWB........",
+            b"WWWWB.......",
+            b"WWWWWB......",
+            b"WWWWWWB.....",
+            b"WWWWWWWB....",
+            b"WWWWWWWWB...",
+            b"WWWWWWWWWB..",
+            b"WWWWWWWWWWBD",
+            b"WWWWWB......",
+            b"WWWB.WB.....",
+            b"WWB...WB....",
+            b"WB....WB....",
+            b"B......WB...",
+            b".......WB...",
+            b"........B...",
+            b"............",
+        ];
+
+        for (ry, row) in shape.iter().enumerate() {
+            let py = my + ry as i32;
+            if py < 0 || py >= self.height as i32 { continue; }
+            for (rx, &pixel) in row.iter().enumerate() {
+                let px = mx + rx as i32;
+                if px < 0 || px >= self.width as i32 { continue; }
+                let col = match pixel {
+                    b'W' => Some(0xFF0F172A), // قلب السهم أسود
+                    b'B' => Some(0xFFFFFFFF), // الحدود الخارجية بيضاء نقية
+                    b'D' => Some(0x88000000), // ظل خفيف
+                    _ => None,
+                };
+                if let Some(c) = col {
+                    let idx = (py as usize) * self.width + (px as usize);
+                    self.buffer[idx] = c;
                 }
             }
         }
     }
 
-    pub fn draw_text_clipped(&mut self, x: i32, y: i32, max_w: i32, text: &str, color: u32, size_px: usize) {
-        if max_w <= 0 { return; }
-        let clip_rect = Rect { x, y, w: max_w, h: (size_px + 8) as i32 };
-        self.push_clip(clip_rect);
-        self.draw_text(x, y, text, color, size_px);
-        self.pop_clip();
-    }
-
-    pub fn draw_linux_cursor(&mut self, mx: i32, my: i32) {
+    pub fn draw_pointer_hand_cursor(&mut self, mx: i32, my: i32) {
         #[rustfmt::skip]
-        const LINUX_CURSOR_BITMAP: [[u8; 11]; 16] = [
-            [1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 2, 1, 0, 0, 0, 0, 0, 0, 0, 0],
-            [1, 2, 2, 1, 0, 0, 0, 0, 0, 0, 0],
-            [1, 2, 2, 2, 1, 0, 0, 0, 0, 0, 0],
-            [1, 2, 2, 2, 2, 1, 0, 0, 0, 0, 0],
-            [1, 2, 2, 2, 2, 2, 1, 0, 0, 0, 0],
-            [1, 2, 2, 2, 2, 2, 2, 1, 0, 0, 0],
-            [1, 2, 2, 2, 2, 2, 2, 2, 1, 0, 0],
-            [1, 2, 2, 2, 2, 2, 2, 2, 2, 1, 0],
-            [1, 2, 2, 2, 2, 2, 1, 1, 1, 1, 1],
-            [1, 2, 2, 1, 2, 2, 1, 0, 0, 0, 0],
-            [1, 2, 1, 0, 1, 2, 2, 1, 0, 0, 0],
-            [1, 1, 0, 0, 0, 1, 2, 2, 1, 0, 0],
-            [1, 0, 0, 0, 0, 0, 1, 2, 1, 0, 0],
-            [0, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0],
+        let shape: [&[u8; 14]; 17] = [
+            b"...BB.........",
+            b"..BWWBD.......",
+            b"..BWWBD.......",
+            b"..BWWBD.......",
+            b"..BWWBBBBBD...",
+            b"..BWWWWWWWWBD.",
+            b".BBWWWWWWWWBD.",
+            b"BWWWWWWWWWWBD.",
+            b"BWWWWWWWWWWBD.",
+            b".BWWWWWWWWBD..",
+            b"..BWWWWWWBD...",
+            b"..BWWWWWWBD...",
+            b"..BWWWWWWBD...",
+            b"...BWWWWBD....",
+            b"...BBBBBD.....",
+            b"....DDDD......",
+            b"..............",
         ];
 
-        let clip = self.current_clip();
-        for (r, row) in LINUX_CURSOR_BITMAP.iter().enumerate() {
-            let py = my + r as i32;
-            if py < clip.y || py >= clip.y + clip.h || py < 0 || py >= self.height as i32 { continue; }
-            for (c, &val) in row.iter().enumerate() {
-                let px = mx + c as i32;
-                if px < clip.x || px >= clip.x + clip.w || px < 0 || px >= self.width as i32 { continue; }
-                let color = match val {
-                    1 => 0xFF000000,
-                    2 => 0xFFFFFFFF,
-                    _ => continue,
+        for (ry, row) in shape.iter().enumerate() {
+            let py = my + ry as i32;
+            if py < 0 || py >= self.height as i32 { continue; }
+            for (rx, &pixel) in row.iter().enumerate() {
+                let px = mx + rx as i32;
+                if px < 0 || px >= self.width as i32 { continue; }
+                let col = match pixel {
+                    b'W' => Some(0xFFFFFFFF),
+                    b'B' => Some(0xFF0F172A),
+                    b'D' => Some(0x66000000),
+                    _ => None,
                 };
-                let idx = (py as usize) * self.width + (px as usize);
-                self.buffer[idx] = color;
+                if let Some(c) = col {
+                    let idx = (py as usize) * self.width + (px as usize);
+                    self.buffer[idx] = c;
+                }
             }
         }
+    }
+
+    pub fn draw_resize_corner_cursor(&mut self, mx: i32, my: i32) {
+        for d in -6..=6 {
+            let px = mx + d;
+            let py = my + d;
+            if px >= 0 && px < self.width as i32 && py >= 0 && py < self.height as i32 {
+                self.buffer[(py as usize) * self.width + (px as usize)] = 0xFFFFFFFF;
+                if px + 1 < self.width as i32 { self.buffer[(py as usize) * self.width + (px as usize + 1)] = 0xFF000000; }
+            }
+        }
+        self.draw_line_h(mx - 6, my - 6, 5, 0xFFFFFFFF);
+        self.draw_line_v(mx - 6, my - 6, 5, 0xFFFFFFFF);
+        self.draw_line_h(mx + 2, my + 6, 5, 0xFFFFFFFF);
+        self.draw_line_v(mx + 6, my + 2, 5, 0xFFFFFFFF);
     }
 }

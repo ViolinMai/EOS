@@ -1,94 +1,124 @@
-use std::sync::Mutex;
-use core::sync::atomic::{AtomicBool, Ordering};
-
-pub static mut DESKTOP_WALLPAPER: Option<(Vec<u32>, usize, usize)> = None;
-
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct Theme {
     pub scale: f32,
+    pub is_dark: bool,
     pub bg_desktop: u32,
     pub bg_window: u32,
     pub bg_titlebar: u32,
     pub border_window: u32,
-    pub accent: u32,
-    pub accent_hover: u32,
     pub text_primary: u32,
     pub text_secondary: u32,
     pub text_muted: u32,
-}
-
-impl Default for Theme {
-    fn default() -> Self {
-        Self {
-            scale: 2.0, // إرجاع الـ UI Scale إلى 2.0x السابق
-            bg_desktop: 0xFF0F172A,
-            bg_window: 0xFF1E293B,
-            bg_titlebar: 0xFF334155,
-            border_window: 0xFF475569,
-            accent: 0xFF0284C7,
-            accent_hover: 0xFF0369A1,
-            text_primary: 0xFFF8FAFC,
-            text_secondary: 0xFF94A3B8,
-            text_muted: 0xFF64748B,
-        }
-    }
+    pub accent: u32,
+    pub accent_hover: u32,
+    pub btn_close: u32,
+    pub btn_minimize: u32,
+    pub btn_maximize: u32,
 }
 
 impl Theme {
-    #[inline(always)]
+    pub fn dark() -> Self {
+        Self {
+            scale: 2.2,
+            is_dark: true,
+            bg_desktop: 0xFF0A0A0C,      // أسود فحمي نقي خالي تماماً من أي زرقة
+            bg_window: 0xFF121215,       // رمادي مسود داكن وفخم
+            bg_titlebar: 0xFF1A1A1E,     // شريط عنوان داكن ومحايد
+            border_window: 0xFF2A2A30,   // حدود ناعمة ومظلمة
+            text_primary: 0xFFF4F4F5,
+            text_secondary: 0xFFA1A1AA,
+            text_muted: 0xFF71717A,
+            accent: 0xFF3F3F46,          // لون أكسنت داكن ومحايد
+            accent_hover: 0xFF52525B,
+            btn_close: 0xFFEF4444,
+            btn_minimize: 0xFFF59E0B,
+            btn_maximize: 0xFF10B981,
+        }
+    }
+
     pub fn pt(&self, val: f32) -> i32 {
-        (val * self.scale).round() as i32
+        let factor = (self.scale / 2.0).max(1.0);
+        (val * factor).round() as i32
     }
 
-    #[inline(always)]
     pub fn font_caption(&self) -> usize {
-        (11.0 * self.scale).round().max(10.0) as usize
+        let factor = (self.scale / 2.0).max(1.0);
+        (13.0 * factor).round() as usize
     }
 
-    #[inline(always)]
     pub fn font_body(&self) -> usize {
-        (13.5 * self.scale).round().max(12.0) as usize
+        let factor = (self.scale / 2.0).max(1.0);
+        (15.0 * factor).round() as usize
     }
 
-    #[inline(always)]
     pub fn font_title(&self) -> usize {
-        (16.0 * self.scale).round().max(14.0) as usize
+        let factor = (self.scale / 2.0).max(1.0);
+        (18.0 * factor).round() as usize
     }
 
-    #[inline(always)]
     pub fn font_large(&self) -> usize {
-        (22.0 * self.scale).round().max(18.0) as usize
+        let factor = (self.scale / 2.0).max(1.0);
+        (22.0 * factor).round() as usize
     }
 }
 
-static CURRENT_THEME: Mutex<Theme> = Mutex::new(Theme {
-    scale: 2.0,
-    bg_desktop: 0xFF0F172A,
-    bg_window: 0xFF1E293B,
-    bg_titlebar: 0xFF334155,
-    border_window: 0xFF475569,
-    accent: 0xFF0284C7,
-    accent_hover: 0xFF0369A1,
-    text_primary: 0xFFF8FAFC,
-    text_secondary: 0xFF94A3B8,
-    text_muted: 0xFF64748B,
-});
+pub static mut CURRENT_THEME: Option<Theme> = None;
+pub static mut DESKTOP_WALLPAPER: Option<(Vec<u32>, usize, usize)> = None;
+pub static mut WALLPAPER_CHANGED: bool = false;
+pub static mut FULL_REDRAW_REQUESTED: bool = false;
 
-pub fn get_theme() -> Theme {
-    *CURRENT_THEME.lock().unwrap()
+pub fn get_theme() -> &'static Theme {
+    unsafe {
+        if CURRENT_THEME.is_none() {
+            CURRENT_THEME = Some(Theme::dark());
+        }
+        CURRENT_THEME.as_ref().unwrap()
+    }
+}
+
+pub fn get_theme_mut() -> &'static mut Theme {
+    unsafe {
+        if CURRENT_THEME.is_none() {
+            CURRENT_THEME = Some(Theme::dark());
+        }
+        CURRENT_THEME.as_mut().unwrap()
+    }
 }
 
 pub fn set_theme_scale(scale: f32) {
-    let mut t = CURRENT_THEME.lock().unwrap();
-    t.scale = scale.clamp(1.0, 4.0);
+    let t = get_theme_mut();
+    t.scale = scale.clamp(2.0, 4.0);
 }
 
-pub static WALLPAPER_CHANGED: AtomicBool = AtomicBool::new(false);
+pub fn set_theme_accent(color: u32) {
+    let t = get_theme_mut();
+    t.accent = color;
+    let r = (((color >> 16) & 0xFF) as f32 * 1.18).min(255.0) as u32;
+    let g = (((color >> 8) & 0xFF) as f32 * 1.18).min(255.0) as u32;
+    let b = ((color & 0xFF) as f32 * 1.18).min(255.0) as u32;
+    t.accent_hover = 0xFF000000 | (r << 16) | (g << 8) | b;
+}
+
+pub fn redraw_fullscreen() {
+    unsafe { FULL_REDRAW_REQUESTED = true; }
+}
+
+pub fn take_full_redraw_requested() -> bool {
+    unsafe {
+        let val = FULL_REDRAW_REQUESTED;
+        FULL_REDRAW_REQUESTED = false;
+        val
+    }
+}
 
 pub fn notify_wallpaper_changed() {
-    WALLPAPER_CHANGED.store(true, Ordering::Release);
+    unsafe { WALLPAPER_CHANGED = true; }
 }
 
 pub fn take_wallpaper_changed() -> bool {
-    WALLPAPER_CHANGED.swap(false, Ordering::AcqRel)
+    unsafe {
+        let val = WALLPAPER_CHANGED;
+        WALLPAPER_CHANGED = false;
+        val
+    }
 }

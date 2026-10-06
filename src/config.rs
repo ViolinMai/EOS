@@ -15,7 +15,7 @@ pub static CONFIG: KernelConfig = KernelConfig {
     trace_buffer_size: 4096,
     log_queue_capacity: 1024,
     ui_scale: AtomicUsize::new(2),
-    dark_mode: AtomicBool::new(false),
+    dark_mode: AtomicBool::new(true),
 };
 
 impl KernelConfig {
@@ -41,7 +41,9 @@ impl KernelConfig {
                         if key == "dark_mode" {
                             self.dark_mode.store(val == "true" || val == "1", Ordering::Relaxed);
                         } else if key == "ui_scale" {
-                            if let Ok(scale) = val.parse::<usize>() {
+                            // يدعم قراءة القيم الكسرية مثل 2.0 أو 2.5 بأمان
+                            let scale_num = val.split('.').next().unwrap_or(val);
+                            if let Ok(scale) = scale_num.parse::<usize>() {
                                 self.ui_scale.store(scale.clamp(1, 4), Ordering::Relaxed);
                             }
                         }

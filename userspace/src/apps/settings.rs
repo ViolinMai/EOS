@@ -5,8 +5,10 @@ use std::fs;
 enum SettingsTab {
     General,
     Appearance,
+    ThemeColor,
     Display,
     About,
+    Detective,
 }
 
 pub struct SettingsApp {
@@ -15,6 +17,7 @@ pub struct SettingsApp {
     available_wallpapers: Vec<String>,
     selected_wp: Option<usize>,
     status: String,
+    color_picker: crate::framework::tools::ColorPickerTool,
 }
 
 impl SettingsApp {
@@ -25,6 +28,7 @@ impl SettingsApp {
             available_wallpapers: Vec::new(),
             selected_wp: None,
             status: String::new(),
+            color_picker: crate::framework::tools::ColorPickerTool::new(0, 0, 320, 200, 0xFF2563EB),
         };
         app.scan_wallpapers();
         app
@@ -49,11 +53,38 @@ impl SettingsApp {
         }
     }
 
+    pub fn save_setting_key_value(key: &str, val: &str) {
+        let mut lines = Vec::new();
+        let paths = ["RootFS/settings.ini", "settings.ini"];
+
+        let mut existing_content = String::new();
+        for p in &paths {
+            if let Ok(c) = fs::read_to_string(p) {
+                if !c.is_empty() {
+                    existing_content = c;
+                    break;
+                }
+            }
+        }
+
+        let prefix = format!("{}=", key);
+        for line in existing_content.lines() {
+            let tr = line.trim();
+            if !tr.starts_with(&prefix) && !tr.is_empty() {
+                lines.push(tr.to_string());
+            }
+        }
+        lines.push(format!("{}={}", key, val));
+        let payload = lines.join("\n") + "\n";
+
+        for p in &paths {
+            let _ = fs::write(p, payload.as_bytes());
+        }
+    }
+
     fn apply_wallpaper(&mut self, idx: usize) {
         if idx >= self.available_wallpapers.len() { return; }
         let fname = self.available_wallpapers[idx].clone();
-
-        println!("[APP-SETTINGS] apply_wallpaper triggered for index {} -> '{}'", idx, fname);
 
         let candidates = [
             format!("EOS SHARE/{}", fname),
@@ -63,17 +94,10 @@ impl SettingsApp {
 
         let mut read_bytes = Vec::new();
         for p in &candidates {
-            match fs::read(p) {
-                Ok(b) if !b.is_empty() => {
-                    println!("[APP-SETTINGS] Successfully read {} bytes from '{}'", b.len(), p);
+            if let Ok(b) = fs::read(p) {
+                if !b.is_empty() {
                     read_bytes = b;
                     break;
-                }
-                Ok(_) => {
-                    println!("[APP-SETTINGS] Path '{}' returned 0 bytes", p);
-                }
-                Err(e) => {
-                    println!("[APP-SETTINGS] Failed reading path '{}': {:?}", p, e);
                 }
             }
         }
@@ -82,15 +106,10 @@ impl SettingsApp {
             let mut decoded: Option<(Vec<u32>, usize, usize)> = None;
 
             if read_bytes.len() >= 8 && &read_bytes[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
-                println!("[APP-SETTINGS] Attempting PNG decode...");
                 if let Ok((px, w, h)) = crate::png::decode_png(&read_bytes) {
-                    println!("[APP-SETTINGS] PNG decode SUCCESS: {}x{}", w, h);
                     decoded = Some((px, w, h));
-                } else {
-                    println!("[APP-SETTINGS] PNG decode FAILED");
                 }
             } else if read_bytes.len() >= 3 && read_bytes[0] == 0xFF && read_bytes[1] == 0xD8 && read_bytes[2] == 0xFF {
-                println!("[APP-SETTINGS] Attempting JPEG decode...");
                 let mut dec = zune_jpeg::JpegDecoder::new(&read_bytes);
                 if let Ok(raw) = dec.decode() {
                     if let Some(info) = dec.info() {
@@ -116,46 +135,23 @@ impl SettingsApp {
                                 }
                             }
                         }
-                        println!("[APP-SETTINGS] JPEG decode SUCCESS: scaled to {}x{}", out_w, out_h);
                         decoded = Some((px, out_w, out_h));
                     }
-                } else {
-                    println!("[APP-SETTINGS] JPEG decode FAILED");
                 }
-            } else {
-                println!("[APP-SETTINGS] Unknown image format magic: {:02X?}", &read_bytes[..read_bytes.len().min(8)]);
             }
 
             if let Some((px, w, h)) = decoded {
-                unsafe {
-                    crate::framework::theme::DESKTOP_WALLPAPER = Some((px, w, h));
-                }
+                unsafe { crate::framework::theme::DESKTOP_WALLPAPER = Some((px, w, h)); }
                 crate::framework::theme::notify_wallpaper_changed();
+                crate::framework::theme::redraw_fullscreen();
 
-                let mut lines = Vec::new();
-                if let Ok(existing) = fs::read_to_string("settings.ini") {
-                    for line in existing.lines() {
-                        if !line.starts_with("wallpaper=") && !line.trim().is_empty() {
-                            lines.push(line.to_string());
-                        }
-                    }
-                }
-
-                lines.push(format!("wallpaper={}", fname));
-                let new_payload = lines.join("\n") + "\n";
-
-                println!("[APP-SETTINGS] Writing new settings payload ({} bytes) to 'settings.ini'...", new_payload.len());
-                match fs::write("settings.ini", new_payload.as_bytes()) {
-                    Ok(_) => println!("[APP-SETTINGS] fs::write to 'settings.ini' returned OK!"),
-                    Err(e) => println!("[APP-SETTINGS] fs::write to 'settings.ini' returned ERROR: {:?}", e),
-                }
+                Self::save_setting_key_value("wallpaper", &fname);
 
                 self.status = format!("Active: {}", fname);
                 self.selected_wp = Some(idx);
                 return;
             }
         }
-
         self.status = format!("Failed to read {}", fname);
     }
 }
@@ -166,6 +162,13 @@ impl Widget for SettingsApp {
 
     fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
         self.bounds = Rect::new(x, y, w, h);
+        let theme = get_theme();
+        let sidebar_w = theme.pt(160.0);
+        let picker_x = self.bounds.x + sidebar_w + theme.pt(24.0);
+        let picker_y = self.bounds.y + theme.pt(80.0);
+        let picker_w = (self.bounds.w - sidebar_w - theme.pt(48.0)).min(360);
+        let picker_h = theme.pt(180.0);
+        self.color_picker.bounds = Rect::new(picker_x, picker_y, picker_w, picker_h);
         self.bounds
     }
 
@@ -180,8 +183,10 @@ impl Widget for SettingsApp {
         let tabs = [
             (SettingsTab::General, "General"),
             (SettingsTab::Appearance, "Wallpaper"),
+            (SettingsTab::ThemeColor, "Accent Color"),
             (SettingsTab::Display, "Display & Scale"),
             (SettingsTab::About, "About EOS"),
+            (SettingsTab::Detective, "Detective (Log)"),
         ];
 
         let tab_h = theme.pt(32.0);
@@ -204,6 +209,13 @@ impl Widget for SettingsApp {
             SettingsTab::General => {
                 canvas.draw_text(content_x, content_y, "System Preferences", theme.text_primary, theme.font_large());
                 canvas.draw_text(content_x, content_y + theme.pt(36.0), "EOS 64-bit Musl Desktop on Symmetrical Cores", theme.text_secondary, theme.font_body());
+
+                let btn_w = theme.pt(200.0);
+                let btn_h = theme.pt(34.0);
+                let btn_y = content_y + theme.pt(80.0);
+                canvas.draw_rect(content_x, btn_y, btn_w, btn_h, theme.accent, theme.pt(6.0) as usize);
+                canvas.draw_text(content_x + theme.pt(16.0), btn_y + theme.pt(8.0), "Redraw Full Screen", 0xFFFFFFFF, theme.font_body());
+                canvas.draw_text(content_x, btn_y + theme.pt(44.0), "Forces a complete framebuffer damage refresh for the UI.", theme.text_muted, theme.font_caption());
             }
             SettingsTab::Appearance => {
                 canvas.draw_text(content_x, content_y, "Desktop Wallpaper", theme.text_primary, theme.font_large());
@@ -216,7 +228,7 @@ impl Widget for SettingsApp {
                     let bg = if is_sel { theme.accent } else { 0xFF141E2E };
                     canvas.draw_rect(content_x, item_y, row_w, theme.pt(32.0), bg, theme.pt(5.0) as usize);
                     let txt_c = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
-                    canvas.draw_text_clipped(content_x + theme.pt(12.0), item_y + theme.pt(7.0), row_w - theme.pt(24.0), &format!("🖼️  {}", wp), txt_c, theme.font_body());
+                    canvas.draw_text_clipped(content_x + theme.pt(12.0), item_y + theme.pt(7.0), row_w - theme.pt(24.0), &format!(":img: {}", wp), txt_c, theme.font_body());
                     item_y += theme.pt(36.0);
                 }
 
@@ -224,28 +236,81 @@ impl Widget for SettingsApp {
                     canvas.draw_text(content_x, item_y + theme.pt(10.0), &self.status, theme.accent, theme.font_body());
                 }
             }
+            SettingsTab::ThemeColor => {
+                canvas.draw_text(content_x, content_y, "System Accent Color", theme.text_primary, theme.font_large());
+                canvas.draw_text(content_x, content_y + theme.pt(32.0), "Pick any custom color across the UI & Controls:", theme.text_secondary, theme.font_body());
+
+                self.color_picker.draw(canvas);
+
+                let btn_w = theme.pt(120.0);
+                let btn_h = theme.pt(32.0);
+                let btn_x = content_x;
+                let btn_y = self.color_picker.bounds.y + self.color_picker.bounds.h + theme.pt(16.0);
+
+                canvas.draw_rect(btn_x, btn_y, btn_w, btn_h, self.color_picker.selected_color, theme.pt(6.0) as usize);
+                canvas.draw_text(btn_x + theme.pt(18.0), btn_y + theme.pt(8.0), "Apply Theme", 0xFFFFFFFF, theme.font_body());
+
+                let presets = [0xFF2563EB, 0xFF8B5CF6, 0xFFEC4899, 0xFF10B981, 0xFFF59E0B, 0xFFEF4444, 0xFF06B6D4];
+                let p_y = btn_y;
+                let mut p_x = btn_x + btn_w + theme.pt(20.0);
+                for &preset in &presets {
+                    canvas.draw_rect(p_x, p_y + theme.pt(4.0), theme.pt(24.0), theme.pt(24.0), preset, theme.pt(12.0) as usize);
+                    p_x += theme.pt(32.0);
+                }
+            }
             SettingsTab::Display => {
                 canvas.draw_text(content_x, content_y, "Interface Scale", theme.text_primary, theme.font_large());
-                canvas.draw_text(content_x, content_y + theme.pt(36.0), "Select typography & UI scaling factor (Live):", theme.text_secondary, theme.font_body());
+                canvas.draw_text(content_x, content_y + theme.pt(36.0), "Select typography & UI scaling factor (Persistent across reboots):", theme.text_secondary, theme.font_body());
 
-                for s in 1..=3 {
-                    let bx = content_x + ((s as i32 - 1) * theme.pt(70.0));
+                let scales = [(2.0, "1x (Normal)"), (2.5, "2x (Medium)"), (3.0, "3x (Large)")];
+                for (i, (s_val, label)) in scales.iter().enumerate() {
+                    let bx = content_x + (i as i32 * theme.pt(110.0));
                     let by = content_y + theme.pt(70.0);
-                    let cur_scale = get_theme().scale.round() as usize;
-                    let (bg, fg) = if cur_scale == s {
+                    let cur_scale = get_theme().scale;
+                    let is_active = (cur_scale - *s_val).abs() < 0.1;
+                    let (bg, fg) = if is_active {
                         (theme.accent, 0xFFFFFFFF)
                     } else {
                         (theme.bg_titlebar, theme.text_primary)
                     };
-                    canvas.draw_rect(bx, by, theme.pt(60.0), theme.pt(32.0), bg, theme.pt(6.0) as usize);
-                    canvas.draw_rect_outline(bx, by, theme.pt(60.0), theme.pt(32.0), theme.border_window, theme.pt(6.0) as usize);
-                    canvas.draw_text(bx + theme.pt(20.0), by + theme.pt(7.0), &format!("{}x", s), fg, theme.font_body());
+                    canvas.draw_rect(bx, by, theme.pt(100.0), theme.pt(34.0), bg, theme.pt(6.0) as usize);
+                    canvas.draw_rect_outline(bx, by, theme.pt(100.0), theme.pt(34.0), theme.border_window, theme.pt(6.0) as usize);
+                    canvas.draw_text(bx + theme.pt(12.0), by + theme.pt(8.0), label, fg, theme.font_caption());
                 }
             }
             SettingsTab::About => {
                 canvas.draw_text(content_x, content_y, "About EOS", theme.text_primary, theme.font_large());
                 canvas.draw_text(content_x, content_y + theme.pt(36.0), "Kernel: x86_64 SMP Monolithic + Ring 3 UI", theme.text_secondary, theme.font_body());
                 canvas.draw_text(content_x, content_y + theme.pt(66.0), "Hardware: 8 Cores Online & Active", theme.text_secondary, theme.font_body());
+            }
+            SettingsTab::Detective => {
+                canvas.draw_text(content_x, content_y, "Detective: Framework Bottleneck Logger", theme.text_primary, theme.font_large());
+
+                let btn_w = theme.pt(140.0);
+                let btn_h = theme.pt(28.0);
+                let btn_x = self.bounds.x + self.bounds.w - btn_w - theme.pt(24.0);
+                canvas.draw_rect(btn_x, content_y, btn_w, btn_h, theme.accent, theme.pt(4.0) as usize);
+                canvas.draw_text(btn_x + theme.pt(12.0), content_y + theme.pt(6.0), "Print to Terminal", 0xFFFFFFFF, theme.font_caption());
+
+                let log_box_y = content_y + theme.pt(40.0);
+                let log_box_w = self.bounds.w - sidebar_w - theme.pt(48.0);
+                let log_box_h = self.bounds.h - theme.pt(80.0);
+                canvas.draw_rect(content_x, log_box_y, log_box_w, log_box_h, 0xFF0B1120, theme.pt(6.0) as usize);
+                canvas.draw_rect_outline(content_x, log_box_y, log_box_w, log_box_h, theme.border_window, theme.pt(6.0) as usize);
+
+                let entries = crate::framework::perf_log::SmartLogger::get_recent_entries();
+                let mut line_y = log_box_y + theme.pt(10.0);
+                let row_h = theme.pt(18.0);
+
+                if entries.is_empty() {
+                    canvas.draw_text(content_x + theme.pt(16.0), line_y, "No performance bottlenecks detected. UI operations nominal.", 0xFF10B981, theme.font_caption());
+                } else {
+                    for entry in entries.iter().rev() {
+                        if line_y + row_h >= log_box_y + log_box_h - theme.pt(10.0) { break; }
+                        canvas.draw_text_clipped(content_x + theme.pt(12.0), line_y, log_box_w - theme.pt(24.0), entry, 0xFFF59E0B, theme.font_caption());
+                        line_y += row_h;
+                    }
+                }
             }
         }
     }
@@ -262,11 +327,78 @@ impl Widget for SettingsApp {
             match idx {
                 0 => self.current_tab = SettingsTab::General,
                 1 => { self.current_tab = SettingsTab::Appearance; self.scan_wallpapers(); }
-                2 => self.current_tab = SettingsTab::Display,
-                3 => self.current_tab = SettingsTab::About,
+                2 => self.current_tab = SettingsTab::ThemeColor,
+                3 => self.current_tab = SettingsTab::Display,
+                4 => self.current_tab = SettingsTab::About,
+                5 => self.current_tab = SettingsTab::Detective,
                 _ => {}
             }
             return true;
+        }
+
+        if pressed && self.current_tab == SettingsTab::General {
+            let content_x = self.bounds.x + sidebar_w + theme.pt(24.0);
+            let content_y = self.bounds.y + theme.pt(24.0);
+            let btn_w = theme.pt(200.0);
+            let btn_h = theme.pt(34.0);
+            let btn_y = content_y + theme.pt(80.0);
+            if mx >= content_x && mx <= content_x + btn_w && my >= btn_y && my <= btn_y + btn_h {
+                crate::framework::theme::redraw_fullscreen();
+                return true;
+            }
+        }
+
+        if self.current_tab == SettingsTab::ThemeColor {
+            if self.color_picker.handle_mouse(mx, my, pressed) {
+                return true;
+            }
+
+            let content_x = self.bounds.x + sidebar_w + theme.pt(24.0);
+            let btn_w = theme.pt(120.0);
+            let btn_h = theme.pt(32.0);
+            let btn_x = content_x;
+            let btn_y = self.color_picker.bounds.y + self.color_picker.bounds.h + theme.pt(16.0);
+
+            if pressed && mx >= btn_x && mx <= btn_x + btn_w && my >= btn_y && my <= btn_y + btn_h {
+                crate::framework::theme::set_theme_accent(self.color_picker.selected_color);
+                Self::save_setting_key_value("accent", &format!("0x{:08X}", self.color_picker.selected_color));
+                crate::framework::theme::redraw_fullscreen();
+                return true;
+            }
+
+            let presets = [0xFF2563EB, 0xFF8B5CF6, 0xFFEC4899, 0xFF10B981, 0xFFF59E0B, 0xFFEF4444, 0xFF06B6D4];
+            let mut p_x = btn_x + btn_w + theme.pt(20.0);
+            for &preset in &presets {
+                if pressed && mx >= p_x && mx <= p_x + theme.pt(24.0) && my >= btn_y + theme.pt(4.0) && my <= btn_y + theme.pt(28.0) {
+                    self.color_picker.selected_color = preset;
+                    crate::framework::theme::set_theme_accent(preset);
+                    Self::save_setting_key_value("accent", &format!("0x{:08X}", preset));
+                    crate::framework::theme::redraw_fullscreen();
+                    return true;
+                }
+                p_x += theme.pt(32.0);
+            }
+        }
+
+        if pressed && self.current_tab == SettingsTab::Detective {
+            let content_y = self.bounds.y + theme.pt(24.0);
+            let btn_w = theme.pt(140.0);
+            let btn_h = theme.pt(28.0);
+            let btn_x = self.bounds.x + self.bounds.w - btn_w - theme.pt(24.0);
+
+            if mx >= btn_x && mx <= btn_x + btn_w && my >= content_y && my <= content_y + btn_h {
+                let logs = crate::framework::perf_log::SmartLogger::get_recent_entries();
+                println!("\n=== [DETECTIVE LOGS - LIVE TRACE] ===");
+                if logs.is_empty() {
+                    println!("No bottleneck logs recorded yet.");
+                } else {
+                    for l in logs {
+                        println!("{}", l);
+                    }
+                }
+                println!("=== [END DETECTIVE LOGS] ===\n");
+                return true;
+            }
         }
 
         if pressed && self.current_tab == SettingsTab::Appearance {
@@ -288,11 +420,14 @@ impl Widget for SettingsApp {
             let content_x = self.bounds.x + sidebar_w + theme.pt(24.0);
             let content_y = self.bounds.y + theme.pt(24.0);
             let by = content_y + theme.pt(70.0);
-            if my >= by && my <= by + theme.pt(32.0) {
-                for s in 1..=3 {
-                    let bx = content_x + ((s as i32 - 1) * theme.pt(70.0));
-                    if mx >= bx && mx <= bx + theme.pt(60.0) {
-                        set_theme_scale(s as f32);
+            if my >= by && my <= by + theme.pt(34.0) {
+                let scales = [2.0, 2.5, 3.0];
+                for (i, &s) in scales.iter().enumerate() {
+                    let bx = content_x + (i as i32 * theme.pt(110.0));
+                    if mx >= bx && mx <= bx + theme.pt(100.0) {
+                        set_theme_scale(s);
+                        Self::save_setting_key_value("ui_scale", &format!("{:.1}", s));
+                        crate::framework::theme::redraw_fullscreen();
                         return true;
                     }
                 }

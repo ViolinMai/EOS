@@ -74,14 +74,14 @@ pub extern "C" fn _start() -> ! {
     if let Some(fb_resp) = FRAMEBUFFER_REQUEST.response() {
         if let Some(fb) = fb_resp.framebuffers().first() {
             unsafe {
-                let w = writer::FramebufferWriter::new(
+                let mut w = writer::FramebufferWriter::new(
                     fb.address() as *mut u8,
                     fb.width as usize,
                     fb.height as usize,
                     fb.pitch as usize,
                 );
-                let slice = core::slice::from_raw_parts_mut(fb.address() as *mut u32, (fb.pitch as usize / 4) * fb.height as usize);
-                slice.fill(0xFF0F172A);
+                // عرض شاشة الـ Boot Splash التفاعلية
+                w.render_boot_splash(0);
                 *core::ptr::addr_of_mut!(writer::WRITER) = Some(w);
             }
             crate::log_info!("FRAMEBUFFER", "Initialized: {}x{} (Pitch: {})", fb.width, fb.height, fb.pitch);
@@ -100,6 +100,13 @@ pub extern "C" fn _start() -> ! {
     drivers::mouse::init();
     arch::x86_64::syscall::init();
 
+    // تحديث النقطة الثانية لمؤشر الإقلاع
+    unsafe {
+        if let Some(w) = (*core::ptr::addr_of_mut!(writer::WRITER)).as_mut() {
+            w.render_boot_splash(1);
+        }
+    }
+
     drivers::pci::init();
     drivers::e1000::init();
     net::init();
@@ -116,6 +123,13 @@ pub extern "C" fn _start() -> ! {
 
     config::CONFIG.load_from_disk();
     task::init();
+
+    // تحديث النقطة الثالثة لمؤشر الإقلاع
+    unsafe {
+        if let Some(w) = (*core::ptr::addr_of_mut!(writer::WRITER)).as_mut() {
+            w.render_boot_splash(2);
+        }
+    }
 
     if let Some(mp_resp) = MP_REQUEST.response() {
         let cpus = mp_resp.cpus();
@@ -196,3 +210,5 @@ fn panic(info: &PanicInfo) -> ! {
     crate::serial_println!("\n\x1b[31;1m[KERNEL PANIC]\x1b[0m {}", info);
     loop { core::hint::spin_loop(); }
 }
+
+pub mod splash_data;
