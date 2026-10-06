@@ -19,46 +19,24 @@ pub struct Theme {
 impl Theme {
     pub fn dark() -> Self {
         Self {
-            scale: 2.2, // الأساس الطبيعي المكبر بدقة
-            is_dark: true,
-            bg_desktop: 0xFF080C14,      // أسود كربوني عميق
-            bg_window: 0xFF0F172A,       // رمادي داكن فخم
-            bg_titlebar: 0xFF182234,     // شريط عنوان أنيق
-            border_window: 0xFF283548,   // حدود ناعمة
-            text_primary: 0xFFF8FAFC,
-            text_secondary: 0xFF94A3B8,
-            text_muted: 0xFF64748B,
-            accent: 0xFF6366F1,          // لون أرجواني كلاسيكي هادئ بدلاً من الأزرق الفاقع
-            accent_hover: 0xFF818CF8,
-            btn_close: 0xFFEF4444,
-            btn_minimize: 0xFFF59E0B,
-            btn_maximize: 0xFF10B981,
+            bg_desktop: 0xFF0B1120,
+            bg_window: 0xFF18181B,
+            bg_titlebar: 0xFF27272A,
+            bg_card: 0xFF18181B,
+            text_primary: 0xFFF4F4F5,
+            text_secondary: 0xFFA1A1AA,
+            text_muted: 0xFF71717A,
+            accent: 0xFF2563EB,
+            accent_hover: 0xFF3B82F6,
+            border_window: 0xFF3F3F46,
+            border_subtle: 0xFF27272A,
+            scale: 3.0,
+            font_caption_pt: 11.0,
+            font_body_pt: 13.0,
+            font_title_pt: 15.0,
+            font_heading_pt: 18.0,
+            font_large_pt: 24.0,
         }
-    }
-
-    pub fn pt(&self, val: f32) -> i32 {
-        let factor = (self.scale / 2.0).max(1.0);
-        (val * factor).round() as i32
-    }
-
-    pub fn font_caption(&self) -> usize {
-        let factor = (self.scale / 2.0).max(1.0);
-        (13.0 * factor).round() as usize
-    }
-
-    pub fn font_body(&self) -> usize {
-        let factor = (self.scale / 2.0).max(1.0);
-        (15.0 * factor).round() as usize
-    }
-
-    pub fn font_title(&self) -> usize {
-        let factor = (self.scale / 2.0).max(1.0);
-        (18.0 * factor).round() as usize
-    }
-
-    pub fn font_large(&self) -> usize {
-        let factor = (self.scale / 2.0).max(1.0);
-        (22.0 * factor).round() as usize
     }
 }
 

@@ -17,6 +17,7 @@ pub struct FinderApp {
     pub scroll_y: i32,
     pub status_label: String,
     pub pending_open_image: Option<(String, String)>,
+    pub pending_open_text: Option<String>,
     pub thumb_cache: HashMap<String, (Vec<u32>, usize, usize)>,
 }
 
@@ -30,6 +31,7 @@ impl FinderApp {
             scroll_y: 0,
             status_label: String::from("Ready"),
             pending_open_image: None,
+            pending_open_text: None,
             thumb_cache: HashMap::new(),
         };
         app.load_directory("EOS SHARE");
@@ -38,11 +40,7 @@ impl FinderApp {
 
     pub fn load_directory(&mut self, path: &str) {
         let clean = path.trim().trim_matches('/');
-        let target_path = if clean.is_empty() {
-            String::from("EOS SHARE")
-        } else {
-            clean.to_string()
-        };
+        let target_path = if clean.is_empty() { String::from("EOS SHARE") } else { clean.to_string() };
 
         self.entries.clear();
         self.selected_idx = None;
@@ -61,16 +59,12 @@ impl FinderApp {
                     let name = entry.file_name().to_string_lossy().to_string();
                     if name == "." || name == ".." { continue; }
                     let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-
                     let size = if is_dir {
                         0
                     } else {
                         let full_file_path = format!("{}/{}", p.trim_end_matches('/'), name);
-                        fs::metadata(&full_file_path)
-                            .map(|m| m.len() as usize)
-                            .unwrap_or(0)
+                        fs::metadata(&full_file_path).map(|m| m.len() as usize).unwrap_or(0)
                     };
-
                     self.entries.push(FinderEntry { name, is_dir, size });
                 }
                 read_success = true;
@@ -81,21 +75,13 @@ impl FinderApp {
         self.current_path = target_path;
 
         if self.current_path.contains('/') || (self.current_path != "EOS SHARE" && self.current_path != "RootFS" && self.current_path != "Initrd") {
-            self.entries.insert(0, FinderEntry {
-                name: String::from(".."),
-                is_dir: true,
-                size: 0,
-            });
+            self.entries.insert(0, FinderEntry { name: String::from(".."), is_dir: true, size: 0 });
         }
 
         self.entries.sort_by(|a, b| {
-            if a.name == ".." {
-                std::cmp::Ordering::Less
-            } else if b.name == ".." {
-                std::cmp::Ordering::Greater
-            } else {
-                b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
-            }
+            if a.name == ".." { std::cmp::Ordering::Less }
+            else if b.name == ".." { std::cmp::Ordering::Greater }
+            else { b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())) }
         });
 
         self.status_label = if read_success {
@@ -105,7 +91,7 @@ impl FinderApp {
         };
     }
 
-    fn open_entry(&mut self, idx: usize) {
+    pub fn open_entry(&mut self, idx: usize) {
         if idx >= self.entries.len() { return; }
         let entry = self.entries[idx].clone();
 
@@ -123,9 +109,11 @@ impl FinderApp {
             }
         } else {
             let lower = entry.name.to_lowercase();
+            let full_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
             if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-                let full_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
                 self.pending_open_image = Some((entry.name.clone(), full_path));
+            } else {
+                self.pending_open_text = Some(full_path);
             }
         }
     }
@@ -155,7 +143,7 @@ impl Widget for FinderApp {
         for &(label, target) in &favorites {
             let btn_w = theme.pt(58.0);
             let is_cur = self.current_path == target || (target == "EOS SHARE" && self.current_path.starts_with("EOS SHARE/"));
-            let bg_c = if is_cur { theme.accent } else { 0xFF27272A }; // داكن محايد خالي من الأزرق
+            let bg_c = if is_cur { theme.accent } else { 0xFF27272A };
             canvas.draw_rect(fav_x, self.bounds.y + theme.pt(7.0), btn_w, theme.pt(26.0), bg_c, theme.pt(5.0) as usize);
             let (tw, th) = canvas.measure_text(label, theme.font_caption());
             canvas.draw_text(fav_x + (btn_w - tw as i32) / 2, self.bounds.y + theme.pt(7.0) + (theme.pt(26.0) - th as i32) / 2, label, 0xFFFFFFFF, theme.font_caption());
@@ -175,30 +163,27 @@ impl Widget for FinderApp {
         for (idx, entry) in self.entries.iter().enumerate() {
             if cur_y + row_h >= list_y && cur_y <= list_y + list_h {
                 let is_sel = self.selected_idx == Some(idx);
-                let bg = if is_sel {
-                    theme.accent
-                } else if idx % 2 == 0 {
-                    theme.bg_window
-                } else {
-                    0xFF18181B // رمادي داكن نقي خالي من أي أزرق
-                };
+                let bg = if is_sel { theme.accent } else if idx % 2 == 0 { theme.bg_window } else { 0xFF18181B };
 
                 canvas.draw_rect(self.bounds.x + theme.pt(4.0), cur_y, self.bounds.w - theme.pt(8.0), row_h, bg, theme.pt(4.0) as usize);
 
-                let icon_tag = if entry.name == ".." {
-                    ":back:"
+                let (tag, tag_col) = if entry.name == ".." {
+                    ("[DIR]", 0xFF38BDF8)
                 } else if entry.is_dir {
-                    ":folder:"
-                } else if entry.name.ends_with(".elf") {
-                    ":gear:"
-                } else if entry.name.ends_with(".png") || entry.name.ends_with(".jpg") || entry.name.ends_with(".jpeg") {
-                    ":img:"
+                    ("[DIR]", 0xFF38BDF8)
                 } else {
-                    ":doc:"
+                    let l = entry.name.to_lowercase();
+                    if l.ends_with(".png") || l.ends_with(".jpg") || l.ends_with(".jpeg") {
+                        ("[IMG]", 0xFFA78BFA)
+                    } else if l.ends_with(".elf") {
+                        ("[BIN]", 0xFF34D399)
+                    } else {
+                        ("[TXT]", 0xFFFCD34D)
+                    }
                 };
 
                 let label = if entry.is_dir {
-                    format!("{} {}", icon_tag, entry.name)
+                    format!("{} {}", tag, entry.name)
                 } else {
                     let sz_str = if entry.size >= 1024 * 1024 {
                         format!("{:.2} MB", (entry.size as f64) / (1024.0 * 1024.0))
@@ -207,21 +192,14 @@ impl Widget for FinderApp {
                     } else {
                         format!("{} B", entry.size)
                     };
-                    format!("{} {} ({})", icon_tag, entry.name, sz_str)
+                    format!("{} {} ({})", tag, entry.name, sz_str)
                 };
 
                 let txt_c = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
-                canvas.draw_text_with_icons(self.bounds.x + theme.pt(14.0), cur_y + theme.pt(8.0), &label, txt_c, theme.font_body());
+                canvas.draw_text(self.bounds.x + theme.pt(14.0), cur_y + theme.pt(8.0), tag, tag_col, theme.font_body());
+                canvas.draw_text(self.bounds.x + theme.pt(54.0), cur_y + theme.pt(8.0), &label[5..], txt_c, theme.font_body());
             }
             cur_y += row_h;
-        }
-
-        let total_items_h = (self.entries.len() as i32) * row_h;
-        if total_items_h > list_h && list_h > 0 {
-            let thumb_h = ((list_h as f32 / total_items_h as f32) * list_h as f32).max(20.0);
-            let max_sc = (total_items_h - list_h).max(1) as f32;
-            let thumb_y = list_y as f32 + ((self.scroll_y as f32 / max_sc) * (list_h as f32 - thumb_h));
-            canvas.draw_rect(self.bounds.x + self.bounds.w - 6, thumb_y as i32, 4, thumb_h as i32, 0x8871717A, 2);
         }
 
         canvas.pop_clip();
@@ -288,43 +266,5 @@ impl Widget for FinderApp {
             self.scroll_y = (self.scroll_y - theme.pt(32.0)).max(0);
         }
         true
-    }
-
-    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
-        match keycode {
-            0x1C => {
-                if let Some(idx) = self.selected_idx {
-                    self.open_entry(idx);
-                    return true;
-                }
-            }
-            0x48 => {
-                if let Some(idx) = self.selected_idx {
-                    if idx > 0 { self.selected_idx = Some(idx - 1); return true; }
-                } else if !self.entries.is_empty() {
-                    self.selected_idx = Some(0);
-                    return true;
-                }
-            }
-            0x50 => {
-                if let Some(idx) = self.selected_idx {
-                    if idx + 1 < self.entries.len() { self.selected_idx = Some(idx + 1); return true; }
-                } else if !self.entries.is_empty() {
-                    self.selected_idx = Some(0);
-                    return true;
-                }
-            }
-            0x0E => {
-                if let Some(pos) = self.current_path.rfind('/') {
-                    let parent = self.current_path[..pos].to_string();
-                    self.load_directory(&parent);
-                } else {
-                    self.load_directory("EOS SHARE");
-                }
-                return true;
-            }
-            _ => {}
-        }
-        false
     }
 }

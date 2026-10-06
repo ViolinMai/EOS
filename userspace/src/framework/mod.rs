@@ -26,3 +26,6 @@ pub use app::*;
 pub use vector::*;
 pub use perf_log::*;
 pub use tools::*;
+pub use animator::*;
+
+pub mod animator;

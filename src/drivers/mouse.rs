@@ -95,13 +95,19 @@ pub fn init() {
         let dev_id = mouse_read_data();
         HAS_WHEEL = dev_id == 3 || dev_id == 4;
 
+        // Boost sample rate to 200 Hz & resolution to 8 counts/mm
+        mouse_write_device(0xF3); let _ = mouse_read_data();
+        mouse_write_device(200);  let _ = mouse_read_data();
+        mouse_write_device(0xE8); let _ = mouse_read_data();
+        mouse_write_device(0x03); let _ = mouse_read_data();
+
         mouse_write_device(0xF4);
         let _ = mouse_read_data();
 
         CYCLE = 0;
         LAST_LEFT = false;
         LAST_RIGHT = false;
-        crate::log_info!("MOUSE", "PS/2 Mouse Ready.");
+        crate::log_info!("MOUSE", "PS/2 Mouse Ready (200Hz, High-Res).");
     }
 }
 
@@ -147,7 +153,6 @@ pub unsafe fn on_mouse_interrupt() {
 unsafe fn process_packet() {
     unsafe {
         let flags = BYTES[0];
-        if (flags & 0xC0) != 0 { return; }
 
         let mut dx = BYTES[1] as isize;
         let mut dy = BYTES[2] as isize;
@@ -155,10 +160,13 @@ unsafe fn process_packet() {
         if (flags & 0x10) != 0 { dx |= !0xFF; }
         if (flags & 0x20) != 0 { dy |= !0xFF; }
 
+        // Clamp overflows instead of dropping packet completely
+        if (flags & 0x40) != 0 { dx = if (flags & 0x10) != 0 { -255 } else { 255 }; }
+        if (flags & 0x80) != 0 { dy = if (flags & 0x20) != 0 { -255 } else { 255 }; }
+
         let left = (flags & 0x01) != 0;
         let right = (flags & 0x02) != 0;
 
-        // إرسال الحركة الخام بدقة 1:1 بدون أي تضخيم
         if dx != 0 || dy != 0 {
             push_event(InputEvent::MouseMove { x: dx, y: -dy });
         }

@@ -1,54 +1,101 @@
 use crate::framework::canvas::Canvas;
+use crate::framework::widget::Rect;
 use crate::framework::theme::get_theme;
-use crate::framework::widget::{Rect, Widget};
-use std::any::Any;
+use crate::framework::vector::draw_vector_icon;
 
 pub struct MenuBarWidget {
     pub bounds: Rect,
+    pub active_app_title: String,
+    pub active_app_menus: Vec<String>,
 }
 
 impl MenuBarWidget {
     pub fn new() -> Self {
-        Self { bounds: Rect::default() }
+        Self {
+            bounds: Rect::default(),
+            active_app_title: "Finder".to_string(),
+            active_app_menus: vec!["File".into(), "Edit".into(), "View".into(), "Help".into()],
+        }
     }
-}
 
-impl Widget for MenuBarWidget {
-    fn as_any(&self) -> &dyn Any { self }
-    fn as_any_mut(&mut self) -> &mut dyn Any { self }
-
-    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+    pub fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
         self.bounds = Rect::new(x, y, w, h);
         self.bounds
     }
 
-    fn paint(&self, canvas: &mut Canvas) {
+    pub fn set_active_app(&mut self, title: &str) {
+        let clean = title.split('-').next().unwrap_or(title).trim();
+        self.active_app_title = clean.to_string();
+        self.active_app_menus = match clean {
+            "Finder" => vec!["File".into(), "Edit".into(), "View".into(), "Go".into(), "Window".into()],
+            "Settings" => vec!["Preferences".into(), "Display".into(), "Theme".into(), "Help".into()],
+            "Terminal" => vec!["Shell".into(), "Edit".into(), "View".into(), "Window".into()],
+            "Activity Monitor" => vec!["Process".into(), "Inspect".into(), "Diagnostic".into(), "Help".into()],
+            "Browser" => vec!["Navigate".into(), "Bookmarks".into(), "Network".into(), "Window".into()],
+            "TextEdit" => vec!["File".into(), "Edit".into(), "Format".into(), "View".into(), "Help".into()],
+            _ => vec!["File".into(), "Edit".into(), "Window".into()],
+        };
+    }
+
+    pub fn paint(&self, canvas: &mut Canvas) {
         let theme = get_theme();
         let h = self.bounds.h;
 
-        // شريط MenuBar شفاف وضبابي بالكامل (Frosted Glass Blur)
-        canvas.draw_frosted_glass_rect(self.bounds.x, self.bounds.y, self.bounds.w, h, 0xBB1E293B, 0);
-        canvas.draw_line_h(self.bounds.x, self.bounds.y + h - 1, self.bounds.w, 0x44FFFFFF);
+        canvas.draw_frosted_glass_rect(self.bounds.x, self.bounds.y, self.bounds.w, h, 0xEE18181B, 0);
+        canvas.draw_line_h(self.bounds.x, self.bounds.y + h - 1, self.bounds.w, theme.border_window);
 
-        let apple_w = theme.pt(28.0);
-        let cur_x = self.bounds.x + theme.pt(14.0);
-        canvas.draw_text(cur_x, self.bounds.y + (h - (theme.font_title() as i32)) / 2, "", theme.text_primary, theme.font_title());
+        let logo_x = self.bounds.x + theme.pt(14.0);
+        let logo_y = self.bounds.y + (h - theme.pt(16.0)) / 2;
+        draw_vector_icon(canvas, "gear", logo_x, logo_y, theme.pt(16.0), theme.pt(16.0), Some(theme.accent_hover));
 
-        let menus = ["Finder", "File", "Edit", "View", "Window", "Help"];
-        let mut mx = cur_x + apple_w;
-        for m in menus {
-            let (tw, th) = canvas.measure_text(m, theme.font_body());
-            canvas.draw_text(mx, self.bounds.y + (h - (th as i32)) / 2, m, theme.text_secondary, theme.font_body());
-            mx += tw as i32 + theme.pt(16.0);
+        let mut cur_x = logo_x + theme.pt(24.0);
+        let app_name = &self.active_app_title;
+        canvas.draw_text(cur_x, self.bounds.y + theme.pt(6.0), app_name, 0xFFFFFFFF, theme.font_body());
+        let (aw, _) = canvas.measure_text(app_name, theme.font_body());
+        cur_x += aw as i32 + theme.pt(22.0);
+
+        for menu in &self.active_app_menus {
+            canvas.draw_text(cur_x, self.bounds.y + theme.pt(6.0), menu, theme.text_secondary, theme.font_caption());
+            let (mw, _) = canvas.measure_text(menu, theme.font_caption());
+            cur_x += mw as i32 + theme.pt(18.0);
         }
 
-        let sys_info = "EOS 64-bit | Ring 3 Musl";
-        let (sw, sh) = canvas.measure_text(sys_info, theme.font_caption());
-        let rx = self.bounds.x + self.bounds.w - sw as i32 - theme.pt(16.0);
-        canvas.draw_text(rx, self.bounds.y + (h - (sh as i32)) / 2, sys_info, theme.text_muted, theme.font_caption());
+        let clock_str = get_system_clock_string();
+        let (cw, _) = canvas.measure_text(&clock_str, theme.font_caption());
+        let clock_x = self.bounds.x + self.bounds.w - (cw as i32) - theme.pt(18.0);
+        canvas.draw_text(clock_x, self.bounds.y + theme.pt(6.0), &clock_str, 0xFFF4F4F5, theme.font_caption());
     }
+}
 
-    fn handle_mouse(&mut self, mx: i32, my: i32, _pressed: bool) -> bool {
-        self.bounds.contains(mx, my)
+pub fn get_system_clock_string() -> String {
+    let (mut sec, mut min, mut hour) = (0u8, 0u8, 0u8);
+    unsafe {
+        #[inline]
+        unsafe fn cmos_read(reg: u8) -> u8 {
+            let val: u8;
+            core::arch::asm!("out 0x70, al", in("al") reg, options(nomem, nostack));
+            core::arch::asm!("in al, 0x71", out("al") val, options(nomem, nostack));
+            val
+        }
+        #[inline]
+        fn bcd(v: u8) -> u8 { ((v >> 4) * 10) + (v & 0x0F) }
+
+        let reg_a = cmos_read(0x0A);
+        if (reg_a & 0x80) == 0 {
+            sec = cmos_read(0x00);
+            min = cmos_read(0x02);
+            hour = cmos_read(0x04);
+            let reg_b = cmos_read(0x0B);
+            if (reg_b & 0x04) == 0 {
+                sec = bcd(sec);
+                min = bcd(min);
+                hour = bcd(hour);
+            }
+            if (reg_b & 0x02) == 0 && (hour & 0x80) != 0 {
+                hour = ((hour & 0x7F) + 12) % 24;
+            }
+            hour = (hour + 3) % 24;
+        }
     }
+    format!("{:02}:{:02}:{:02}", hour, min, sec)
 }

@@ -45,10 +45,9 @@ impl ActivityMonitorApp {
 
     fn update_stats(&mut self) {
         let t = crate::framework::perf_log::SmartLogger::read_tsc();
-        if t.saturating_sub(self.last_update_tick) < 2_500_000_000 { return; } // تحديث كل ثانية
+        if t.saturating_sub(self.last_update_tick) < 2_500_000_000 { return; }
         self.last_update_tick = t;
 
-        // محاكاة قراءات حية لمعالجة الفريمات والنواقل
         let step = (t % 7) as usize;
         let new_load = 10 + (step * 3);
         if self.cpu_history.len() >= 20 { self.cpu_history.remove(0); }
@@ -57,6 +56,30 @@ impl ActivityMonitorApp {
         self.disk_read_kb += 64 + step * 10;
         self.net_rx_packets += 2 + step;
         self.net_tx_packets += 1 + (step / 2);
+    }
+
+    pub fn paint_process_list(&self, canvas: &mut Canvas, x: i32, y: i32, w: i32) {
+        let theme = get_theme();
+        let row_h = theme.pt(28.0);
+        let header_h = theme.pt(26.0);
+
+        canvas.draw_rect(x, y, w, header_h, 0xFF1E293B, 4);
+        canvas.draw_text(x + theme.pt(12.0), y + theme.pt(5.0), "PID", theme.text_muted, theme.font_caption());
+        canvas.draw_text(x + theme.pt(60.0), y + theme.pt(5.0), "Process Name", theme.text_muted, theme.font_caption());
+        canvas.draw_text(x + theme.pt(240.0), y + theme.pt(5.0), "CPU %", theme.text_muted, theme.font_caption());
+        canvas.draw_text(x + theme.pt(320.0), y + theme.pt(5.0), "Memory", theme.text_muted, theme.font_caption());
+        canvas.draw_text(x + theme.pt(400.0), y + theme.pt(5.0), "Status", theme.text_muted, theme.font_caption());
+
+        let mut cy = y + header_h + 2;
+        for p in &self.processes {
+            canvas.draw_rect(x, cy, w, row_h, 0xFF141E2E, 2);
+            canvas.draw_text(x + theme.pt(12.0), cy + theme.pt(6.0), &p.pid.to_string(), theme.text_primary, theme.font_caption());
+            canvas.draw_text(x + theme.pt(60.0), cy + theme.pt(6.0), &p.name, 0xFFFFFFFF, theme.font_body());
+            canvas.draw_text(x + theme.pt(240.0), cy + theme.pt(6.0), &format!("{}%", p.cpu_percent), theme.accent_hover, theme.font_caption());
+            canvas.draw_text(x + theme.pt(320.0), cy + theme.pt(6.0), &format!("{} MB", p.mem_mb), theme.text_secondary, theme.font_caption());
+            canvas.draw_text(x + theme.pt(400.0), cy + theme.pt(6.0), p.status, 0xFF10B981, theme.font_caption());
+            cy += row_h + 2;
+        }
     }
 }
 
@@ -105,7 +128,7 @@ impl Widget for ActivityMonitorApp {
         let card_w = self.bounds.w - theme.pt(48.0);
 
         match self.selected_tab {
-            0 => { // CPU
+            0 => {
                 let card_h = theme.pt(120.0);
                 canvas.draw_rect(pad_x, content_y, card_w, card_h, theme.bg_titlebar, theme.pt(8.0) as usize);
                 canvas.draw_rect_outline(pad_x, content_y, card_w, card_h, theme.border_window, theme.pt(8.0) as usize);
@@ -114,7 +137,6 @@ impl Widget for ActivityMonitorApp {
                 canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(14.0), &format!("Processor Load: {}% (8 Active SMP Cores)", cur_cpu), theme.text_primary, theme.font_title());
                 canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(40.0), "Real-time thread dispatcher: Symmetrical Cores Online", theme.text_secondary, theme.font_caption());
 
-                // رسم مخطط نشاط المعالج
                 let graph_y = content_y + theme.pt(65.0);
                 let bar_w = (card_w - theme.pt(40.0)) / self.cpu_history.len().max(1) as i32;
                 for (idx, &load) in self.cpu_history.iter().enumerate() {
@@ -123,11 +145,10 @@ impl Widget for ActivityMonitorApp {
                     canvas.draw_rect(gx, graph_y + theme.pt(35.0) - bar_h, bar_w - 3, bar_h, theme.accent, 2);
                 }
 
-                // قائمة العمليات
                 let list_y = content_y + card_h + theme.pt(16.0);
                 self.paint_process_list(canvas, pad_x, list_y, card_w);
             }
-            1 => { // Memory
+            1 => {
                 let card_h = theme.pt(100.0);
                 canvas.draw_rect(pad_x, content_y, card_w, card_h, theme.bg_titlebar, theme.pt(8.0) as usize);
                 canvas.draw_rect_outline(pad_x, content_y, card_w, card_h, theme.border_window, theme.pt(8.0) as usize);
@@ -143,7 +164,7 @@ impl Widget for ActivityMonitorApp {
                 let list_y = content_y + card_h + theme.pt(16.0);
                 self.paint_process_list(canvas, pad_x, list_y, card_w);
             }
-            2 => { // Disk
+            2 => {
                 let card_h = theme.pt(140.0);
                 canvas.draw_rect(pad_x, content_y, card_w, card_h, theme.bg_titlebar, theme.pt(8.0) as usize);
                 canvas.draw_rect_outline(pad_x, content_y, card_w, card_h, theme.border_window, theme.pt(8.0) as usize);
@@ -154,7 +175,7 @@ impl Widget for ActivityMonitorApp {
                 canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(92.0), "Drive 1: Shared FAT32 Host Bridge (EOS SHARE)", theme.text_secondary, theme.font_caption());
                 canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(112.0), "Drive 2: EXT2 Native Persistent RootFS (Active)", 0xFF10B981, theme.font_caption());
             }
-            3 => { // Network
+            3 => {
                 let card_h = theme.pt(140.0);
                 canvas.draw_rect(pad_x, content_y, card_w, card_h, theme.bg_titlebar, theme.pt(8.0) as usize);
                 canvas.draw_rect_outline(pad_x, content_y, card_w, card_h, theme.border_window, theme.pt(8.0) as usize);
@@ -166,30 +187,6 @@ impl Widget for ActivityMonitorApp {
                 canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(112.0), "Status: Online (Zero-copy raw ring buffer)", 0xFF10B981, theme.font_caption());
             }
             _ => {}
-        }
-    }
-
-    fn paint_process_list(&self, canvas: &mut Canvas, x: i32, y: i32, w: i32) {
-        let theme = get_theme();
-        let row_h = theme.pt(28.0);
-        let header_h = theme.pt(26.0);
-
-        canvas.draw_rect(x, y, w, header_h, 0xFF1E293B, 4);
-        canvas.draw_text(x + theme.pt(12.0), y + theme.pt(5.0), "PID", theme.text_muted, theme.font_caption());
-        canvas.draw_text(x + theme.pt(60.0), y + theme.pt(5.0), "Process Name", theme.text_muted, theme.font_caption());
-        canvas.draw_text(x + theme.pt(240.0), y + theme.pt(5.0), "CPU %", theme.text_muted, theme.font_caption());
-        canvas.draw_text(x + theme.pt(320.0), y + theme.pt(5.0), "Memory", theme.text_muted, theme.font_caption());
-        canvas.draw_text(x + theme.pt(400.0), y + theme.pt(5.0), "Status", theme.text_muted, theme.font_caption());
-
-        let mut cy = y + header_h + 2;
-        for p in &self.processes {
-            canvas.draw_rect(x, cy, w, row_h, 0xFF141E2E, 2);
-            canvas.draw_text(x + theme.pt(12.0), cy + theme.pt(6.0), &p.pid.to_string(), theme.text_primary, theme.font_caption());
-            canvas.draw_text(x + theme.pt(60.0), cy + theme.pt(6.0), &p.name, 0xFFFFFFFF, theme.font_body());
-            canvas.draw_text(x + theme.pt(240.0), cy + theme.pt(6.0), &format!("{}%", p.cpu_percent), theme.accent_hover, theme.font_caption());
-            canvas.draw_text(x + theme.pt(320.0), cy + theme.pt(6.0), &format!("{} MB", p.mem_mb), theme.text_secondary, theme.font_caption());
-            canvas.draw_text(x + theme.pt(400.0), cy + theme.pt(6.0), p.status, 0xFF10B981, theme.font_caption());
-            cy += row_h + 2;
         }
     }
 

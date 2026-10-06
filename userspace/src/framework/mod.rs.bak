@@ -10,6 +10,7 @@ pub mod controls;
 pub mod log;
 pub mod vector;
 pub mod perf_log;
+pub mod tools;
 pub mod app;
 
 pub use canvas::*;
@@ -24,3 +25,4 @@ pub use controls::*;
 pub use app::*;
 pub use vector::*;
 pub use perf_log::*;
+pub use tools::*;

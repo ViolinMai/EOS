@@ -23,8 +23,22 @@ pub static USER_EVENT_TAIL: AtomicUsize = AtomicUsize::new(0);
 
 pub fn push_user_event(ev: InputEvent) {
     let head = USER_EVENT_HEAD.load(Ordering::Relaxed);
+    let tail = USER_EVENT_TAIL.load(Ordering::Acquire);
+
+    // Merge consecutive MouseMove events in the queue to save space and reduce latency
+    if let InputEvent::MouseMove { x: new_dx, y: new_dy } = ev {
+        if head != tail {
+            let prev_idx = if head == 0 { 127 } else { head - 1 };
+            if let Some(InputEvent::MouseMove { x, y }) = unsafe { USERSPACE_EVENTS[prev_idx].as_mut() } {
+                *x += new_dx;
+                *y += new_dy;
+                return;
+            }
+        }
+    }
+
     let next = (head + 1) % 128;
-    if next != USER_EVENT_TAIL.load(Ordering::Acquire) {
+    if next != tail {
         unsafe { USERSPACE_EVENTS[head] = Some(ev); }
         USER_EVENT_HEAD.store(next, Ordering::Release);
     }
@@ -524,8 +538,12 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         96 => { // gettimeofday
             let tv_ptr = frame.rdi;
             if validate_user_range(tv_ptr, 16) {
-                let s = pit::get_uptime_seconds(); let ms = (pit::get_ticks() % 1000) * 1000; let tv = [s as u64, ms as u64];
-                let _ = copy_to_user(tv_ptr, unsafe { core::slice::from_raw_parts(tv.as_ptr() as *const u8, 16) }); frame.rax = 0;
+                let rtc = crate::drivers::rtc::get_riyadh_time();
+                let s = (rtc.hour as u64 * 3600) + (rtc.minute as u64 * 60) + (rtc.second as u64);
+                let ms = (pit::get_ticks() % 1000) * 1000;
+                let tv = [s, ms as u64];
+                let _ = copy_to_user(tv_ptr, unsafe { core::slice::from_raw_parts(tv.as_ptr() as *const u8, 16) });
+                frame.rax = 0;
             } else { frame.rax = -14i64 as u64; }
         }
         158 => { // arch_prctl
@@ -587,7 +605,6 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                                 let name = match item { crate::fs::FsItem::Directory(n,_) => n, crate::fs::FsItem::File(n,_,_) => n };
                                 let d_type = match item { crate::fs::FsItem::Directory(_,_) => 4, _ => 8 };
                                 let name_bytes = name.as_bytes();
-                                // ضمان محاذاة 8 بايتات صارمة لكل سجل في dirent64 لمنع تحطيم مكدس musl
                                 let rec_len = (19 + name_bytes.len() + 1 + 7) & !7;
                                 if written + rec_len > count { break; }
                                 unsafe {

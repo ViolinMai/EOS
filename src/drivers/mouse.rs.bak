@@ -158,9 +158,9 @@ unsafe fn process_packet() {
         let left = (flags & 0x01) != 0;
         let right = (flags & 0x02) != 0;
 
-        // مضاعفة حساسية الماوس لتغطية شاشة 1080p بسلاسة وبدون تقطيع
+        // إرسال الحركة الخام بدقة 1:1 بدون أي تضخيم
         if dx != 0 || dy != 0 {
-            push_event(InputEvent::MouseMove { x: dx * 2, y: -dy * 2 });
+            push_event(InputEvent::MouseMove { x: dx, y: -dy });
         }
 
         if left != LAST_LEFT {

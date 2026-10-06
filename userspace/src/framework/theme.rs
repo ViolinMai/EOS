@@ -19,17 +19,17 @@ pub struct Theme {
 impl Theme {
     pub fn dark() -> Self {
         Self {
-            scale: 2.2,
+            scale: 3.0,                  // 3X UI Scale افتراضي
             is_dark: true,
-            bg_desktop: 0xFF0A0A0C,      // أسود فحمي نقي خالي تماماً من أي زرقة
+            bg_desktop: 0xFF0A0A0C,      // أسود فحمي نقي
             bg_window: 0xFF121215,       // رمادي مسود داكن وفخم
             bg_titlebar: 0xFF1A1A1E,     // شريط عنوان داكن ومحايد
             border_window: 0xFF2A2A30,   // حدود ناعمة ومظلمة
             text_primary: 0xFFF4F4F5,
             text_secondary: 0xFFA1A1AA,
             text_muted: 0xFF71717A,
-            accent: 0xFF3F3F46,          // لون أكسنت داكن ومحايد
-            accent_hover: 0xFF52525B,
+            accent: 0xFF2563EB,          // أزرق عصري للمحددات
+            accent_hover: 0xFF3B82F6,
             btn_close: 0xFFEF4444,
             btn_minimize: 0xFFF59E0B,
             btn_maximize: 0xFF10B981,

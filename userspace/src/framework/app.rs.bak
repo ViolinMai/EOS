@@ -4,17 +4,17 @@ use rusttype::Font;
 use crate::framework::canvas::Canvas;
 use crate::framework::input::{InputManager, PointerButton, PointerEvent};
 use crate::framework::menu::MenuBarWidget;
-use crate::framework::theme::{get_theme, set_theme_scale, set_theme_accent, DESKTOP_WALLPAPER, take_full_redraw_requested};
-use crate::framework::layout::ContainerWidget;
+use crate::framework::theme::{get_theme, DESKTOP_WALLPAPER, take_wallpaper_changed};
 use crate::apps::finder::FinderApp;
 use crate::apps::settings::SettingsApp;
 use crate::apps::terminal::TerminalApp;
 use crate::apps::activity_monitor::ActivityMonitorApp;
 use crate::apps::browser::BrowserApp;
 use crate::apps::preview::PreviewApp;
+use crate::apps::textedit::TextEditApp;
 use crate::syscall::{sys_present_rects, sys_poll_event, sys_wait_event};
-use crate::framework::widget::{Rect, ResizeEdge, Widget, WindowFrame, WindowTileState};
-use crate::framework::vector::draw_vector_icon;
+use crate::framework::widget::{Rect, ResizeEdge, Widget, WindowFrame};
+use crate::framework::tools::ContextMenu;
 
 pub struct FocusManager {
     pub active_window_idx: Option<usize>,
@@ -34,28 +34,27 @@ pub enum CursorType {
 }
 
 pub struct FrameworkApp<'a> {
-    pub buffer: Vec<u32>,
     pub width: usize,
     pub height: usize,
+    pub buffer: Vec<u32>,
     pub font: Option<Font<'a>>,
     pub font_cache: BTreeMap<(usize, char), (usize, usize, isize, isize, usize, Vec<u8>)>,
+    pub input_mgr: InputManager,
+    pub focus_mgr: FocusManager,
     pub root_widgets: Vec<Box<dyn Widget>>,
     pub window_surfaces: Vec<crate::framework::surface::WindowSurface>,
     pub menubar_widget: MenuBarWidget,
     pub dock_items: Vec<String>,
-    pub hovered_dock_idx: Option<usize>,
-    pub current_cursor: CursorType,
-    pub input_mgr: InputManager,
-    pub focus_mgr: FocusManager,
-    pub damage: crate::framework::damage::DamageRegion,
-    pub captured_window_idx: Option<usize>,
     pub dock_handler: Option<Box<dyn FnMut(usize)>>,
-    pub prev_pointer_x: i32,
-    pub prev_pointer_y: i32,
+    pub current_cursor: CursorType,
+    pub damage: crate::framework::damage::DamageRegion,
     pub wallpaper_cache: Vec<u32>,
     pub wallpaper_dirty: bool,
-    pub active_wallpaper_path: String,
-    pub show_debug_overlay: bool,
+    pub hovered_dock_idx: Option<usize>,
+    pub captured_window_idx: Option<usize>,
+    pub prev_pointer_x: i32,
+    pub prev_pointer_y: i32,
+    pub context_menu: ContextMenu,
 }
 
 impl<'a> FrameworkApp<'a> {
@@ -65,151 +64,79 @@ impl<'a> FrameworkApp<'a> {
         } else {
             None
         };
-
         let mut menubar = MenuBarWidget::new();
-        menubar.layout(0, 0, width as i32, get_theme().pt(36.0));
+        menubar.layout(0, 0, width as i32, 28);
 
         let mut app = Self {
-            buffer: vec![0; width * height],
             width,
             height,
+            buffer: vec![0xFF0B1120; width * height],
             font,
             font_cache: BTreeMap::new(),
+            input_mgr: InputManager::new(),
+            focus_mgr: FocusManager::new(),
             root_widgets: Vec::new(),
             window_surfaces: Vec::new(),
             menubar_widget: menubar,
             dock_items: vec![
                 "Finder".into(),
-                "Settings".into(),
+                "TextEdit".into(),
                 "Terminal".into(),
                 "Activity Monitor".into(),
                 "Browser".into(),
+                "Settings".into(),
             ],
-            hovered_dock_idx: None,
-            current_cursor: CursorType::Default,
-            input_mgr: InputManager::new(),
-            focus_mgr: FocusManager::new(),
-            damage: crate::framework::damage::DamageRegion::new(),
-            captured_window_idx: None,
             dock_handler: None,
+            current_cursor: CursorType::Default,
+            damage: crate::framework::damage::DamageRegion::new(),
+            wallpaper_cache: vec![0xFF0B1120; width * height],
+            wallpaper_dirty: true,
+            hovered_dock_idx: None,
+            captured_window_idx: None,
             prev_pointer_x: (width / 2) as i32,
             prev_pointer_y: (height / 2) as i32,
-            wallpaper_cache: vec![0; width * height],
-            wallpaper_dirty: true,
-            active_wallpaper_path: String::new(),
-            show_debug_overlay: false,
+            context_menu: ContextMenu::new(),
         };
 
         app.input_mgr.pointer.x = (width / 2) as i32;
         app.input_mgr.pointer.y = (height / 2) as i32;
-        app.damage.add(Rect::new(0, 0, width as i32, height as i32));
-        app.load_persisted_settings();
+        app.load_startup_wallpaper();
         app
     }
 
-    pub fn request_full_redraw(&mut self) {
-        self.damage.add(Rect::new(0, 0, self.width as i32, self.height as i32));
-        for surf in &mut self.window_surfaces {
-            surf.is_dirty = true;
-        }
-    }
-
-    pub fn set_dock_handler<F: FnMut(usize) + 'static>(&mut self, handler: F) {
-        self.dock_handler = Some(Box::new(handler));
-    }
-
-    pub fn get_work_area(&self) -> Rect {
-        let theme = get_theme();
-        let top = self.menubar_widget.bounds.h;
-        let dock_h = theme.pt(64.0) + theme.pt(16.0);
-        Rect {
-            x: 0,
-            y: top,
-            w: self.width as i32,
-            h: (self.height as i32).saturating_sub(top + dock_h),
-        }
-    }
-
-    fn load_persisted_settings(&mut self) {
-        let candidates_cfg = ["RootFS/settings.ini", "settings.ini", "/EOS SHARE/settings.ini"];
-        let mut content = String::new();
-        for cfg in &candidates_cfg {
-            if let Ok(c) = fs::read_to_string(cfg) {
-                if !c.is_empty() {
-                    content = c;
-                    break;
-                }
-            }
-        }
-
-        if content.is_empty() { return; }
-
-        for line in content.lines() {
-            let trimmed = line.trim();
-            if let Some(val) = trimmed.strip_prefix("ui_scale=") {
-                if let Ok(scale_val) = val.trim().parse::<f32>() {
-                    set_theme_scale(scale_val);
-                }
-            } else if let Some(val) = trimmed.strip_prefix("accent=") {
-                if let Ok(acc) = u32::from_str_radix(val.trim().trim_start_matches("0x"), 16) {
-                    set_theme_accent(acc);
-                }
-            } else if let Some(val) = trimmed.strip_prefix("wallpaper=") {
-                let fname = val.trim();
-                if !fname.is_empty() {
-                    let candidates = [
-                        format!("EOS SHARE/{}", fname),
-                        format!("/EOS SHARE/{}", fname),
-                        fname.to_string(),
-                    ];
-                    for path in &candidates {
-                        if let Ok(data) = fs::read(path) {
-                            let mut decoded: Option<(Vec<u32>, usize, usize)> = None;
-                            if data.len() >= 8 && &data[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
-                                if let Ok((px, w, h)) = crate::png::decode_png(&data) {
-                                    decoded = Some((px, w, h));
-                                }
-                            } else if data.len() >= 3 && data[0] == 0xFF && data[1] == 0xD8 && data[2] == 0xFF {
-                                let mut dec = zune_jpeg::JpegDecoder::new(&data);
-                                if let Ok(raw) = dec.decode() {
-                                    if let Some(info) = dec.info() {
-                                        let orig_w = info.width as usize;
-                                        let orig_h = info.height as usize;
-                                        let step = ((orig_w + 1919) / 1920).max((orig_h + 1079) / 1080).max(1);
-                                        let out_w = orig_w / step;
-                                        let out_h = orig_h / step;
-                                        let mut px = vec![0u32; out_w * out_h];
-                                        for dy in 0..out_h {
-                                            let sy = dy * step;
-                                            let src_row = sy * orig_w * 3;
-                                            let dst_row = dy * out_w;
-                                            for dx in 0..out_w {
-                                                let sx = dx * step;
-                                                let o = src_row + (sx * 3);
-                                                if o + 2 < raw.len() {
-                                                    px[dst_row + dx] = (0xFF << 24)
-                                                        | ((raw[o] as u32) << 16)
-                                                        | ((raw[o+1] as u32) << 8)
-                                                        | (raw[o+2] as u32);
-                                                }
-                                            }
+    fn load_startup_wallpaper(&mut self) {
+        let paths = ["RootFS/settings.ini", "settings.ini"];
+        for p in &paths {
+            if let Ok(content) = fs::read_to_string(p) {
+                for line in content.lines() {
+                    if let Some(wp) = line.trim().strip_prefix("wallpaper=") {
+                        let wp_name = wp.trim();
+                        if !wp_name.is_empty() {
+                            let candidates = [
+                                format!("EOS SHARE/{}", wp_name),
+                                format!("/EOS SHARE/{}", wp_name),
+                                wp_name.to_string(),
+                            ];
+                            for cp in &candidates {
+                                if let Ok(bytes) = fs::read(cp) {
+                                    if bytes.len() >= 8 && &bytes[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
+                                        if let Ok((px, w, h)) = crate::png::decode_png(&bytes) {
+                                            unsafe { DESKTOP_WALLPAPER = Some((px, w, h)); }
+                                            self.wallpaper_dirty = true;
+                                            return;
                                         }
-                                        decoded = Some((px, out_w, out_h));
                                     }
                                 }
-                            }
-
-                            if let Some((px, w, h)) = decoded {
-                                unsafe { DESKTOP_WALLPAPER = Some((px, w, h)); }
-                                self.wallpaper_dirty = true;
-                                self.damage.add(Rect::new(0, 0, self.width as i32, self.height as i32));
-                                break;
                             }
                         }
                     }
                 }
             }
         }
+    }
+
+    pub fn set_dock_handler<F: 'static + FnMut(usize)>(&mut self, handler: F) {
+        self.dock_handler = Some(Box::new(handler));
     }
 
     pub fn spawn_app(&mut self, name: &str) {
@@ -228,34 +155,100 @@ impl<'a> FrameworkApp<'a> {
             }
         }
 
-        let content: Box<dyn Widget> = match name {
+        let initial_w = theme.pt(680.0);
+        let initial_h = theme.pt(460.0);
+        let pos_offset = (self.root_widgets.len() as i32 * 28) % 240;
+        let x = theme.pt(80.0) + pos_offset;
+        let y = theme.pt(50.0) + pos_offset;
+
+        let content_widget: Box<dyn Widget> = match name {
             "Finder" => Box::new(FinderApp::new()),
-            "Settings" => Box::new(SettingsApp::new()),
+            "TextEdit" => Box::new(TextEditApp::new()),
             "Terminal" => Box::new(TerminalApp::new()),
             "Activity Monitor" => Box::new(ActivityMonitorApp::new()),
             "Browser" => Box::new(BrowserApp::new()),
-            _ => Box::new(ContainerWidget::vbox()),
+            "Settings" => Box::new(SettingsApp::new()),
+            _ => Box::new(FinderApp::new()),
         };
 
-        let offset = (self.root_widgets.len() as i32) * theme.pt(25.0);
-        let win_w = theme.pt(700.0);
-        let win_h = theme.pt(480.0);
-        let win = Box::new(WindowFrame::new(
-            name,
-            theme.pt(80.0) + offset,
-            self.menubar_widget.bounds.h + theme.pt(20.0) + offset,
-            win_w,
-            win_h,
-            content,
-        ));
-        self.root_widgets.push(win);
-        self.window_surfaces.push(crate::framework::surface::WindowSurface::new(win_w as usize, win_h as usize));
-        self.focus_mgr.active_window_idx = Some(self.root_widgets.len() - 1);
+        let mut frame = WindowFrame::new(name, x, y, initial_w, initial_h, content_widget);
+        let top_bar = self.menubar_widget.bounds.h;
+        frame.bounds.y = frame.bounds.y.max(top_bar);
+
+        let mut surface = crate::framework::surface::WindowSurface::new(frame.bounds.w as usize, frame.bounds.h as usize);
+        surface.is_dirty = true;
+
+        self.root_widgets.push(Box::new(frame));
+        self.window_surfaces.push(surface);
+
+        let new_idx = self.root_widgets.len() - 1;
+        self.focus_mgr.active_window_idx = Some(new_idx);
         self.menubar_widget.set_active_app(name);
         self.request_full_redraw();
     }
 
-    fn route_pointer_event(&mut self, ev: PointerEvent) {
+    pub fn spawn_text_editor(&mut self, file_path: &str) {
+        let theme = get_theme();
+        let initial_w = theme.pt(700.0);
+        let initial_h = theme.pt(480.0);
+        let x = theme.pt(100.0);
+        let y = theme.pt(60.0);
+
+        let content = Box::new(TextEditApp::open_file(file_path));
+        let title = format!("TextEdit - {}", file_path);
+        let frame = WindowFrame::new(&title, x, y, initial_w, initial_h, content);
+
+        let mut surface = crate::framework::surface::WindowSurface::new(initial_w as usize, initial_h as usize);
+        surface.is_dirty = true;
+
+        self.root_widgets.push(Box::new(frame));
+        self.window_surfaces.push(surface);
+
+        let new_idx = self.root_widgets.len() - 1;
+        self.focus_mgr.active_window_idx = Some(new_idx);
+        self.menubar_widget.set_active_app("TextEdit");
+        self.request_full_redraw();
+    }
+
+    pub fn request_full_redraw(&mut self) {
+        self.damage.add(Rect::new(0, 0, self.width as i32, self.height as i32));
+    }
+
+    pub fn update_cursor_state(&mut self, x: i32, y: i32) {
+        let theme = get_theme();
+        let dock_h = theme.pt(58.0);
+        let dock_w = (self.dock_items.len() as i32) * theme.pt(54.0) + theme.pt(24.0);
+        let dock_x = ((self.width as i32) - dock_w) / 2;
+        let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
+
+        let mut new_cursor = CursorType::Default;
+
+        if y >= dock_y && y <= dock_y + dock_h && x >= dock_x && x <= dock_x + dock_w {
+            new_cursor = CursorType::Pointer;
+        } else {
+            for w in self.root_widgets.iter() {
+                if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
+                    if f.hover_btn.is_some() {
+                        new_cursor = CursorType::Pointer;
+                        break;
+                    } else if f.bounds.contains(x, y) {
+                        let border_pad = 12;
+                        if x >= f.bounds.x + f.bounds.w - border_pad && y >= f.bounds.y + f.bounds.h - border_pad {
+                            new_cursor = CursorType::ResizeCorner;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        if self.current_cursor != new_cursor {
+            self.current_cursor = new_cursor;
+            self.damage.add(Rect::new(x - 4, y - 4, 32, 32));
+        }
+    }
+
+    pub fn route_pointer_event(&mut self, ev: PointerEvent) {
         let theme = get_theme();
         let dock_h = theme.pt(58.0);
         let dock_w = (self.dock_items.len() as i32) * theme.pt(54.0) + theme.pt(24.0);
@@ -264,17 +257,14 @@ impl<'a> FrameworkApp<'a> {
 
         match ev {
             PointerEvent::Move { x, y, .. } => {
-                let cur_cursor_rect = Rect::new(x - 4, y - 4, 28, 28);
-                let prev_cursor_rect = Rect::new(self.prev_pointer_x - 4, self.prev_pointer_y - 4, 28, 28);
+                let cur_cursor_rect = Rect::new(x - 4, y - 4, 32, 32);
+                let prev_cursor_rect = Rect::new(self.prev_pointer_x - 4, self.prev_pointer_y - 4, 32, 32);
                 self.damage.add(cur_cursor_rect);
                 self.damage.add(prev_cursor_rect);
                 self.prev_pointer_x = x;
                 self.prev_pointer_y = y;
 
-                let mut new_cursor = CursorType::Default;
-
                 if y >= dock_y && y <= dock_y + dock_h && x >= dock_x && x <= dock_x + dock_w {
-                    new_cursor = CursorType::Pointer;
                     let idx = ((x - dock_x - theme.pt(12.0)) / theme.pt(54.0)) as usize;
                     if idx < self.dock_items.len() && self.hovered_dock_idx != Some(idx) {
                         self.hovered_dock_idx = Some(idx);
@@ -295,23 +285,12 @@ impl<'a> FrameworkApp<'a> {
                                 surf.is_dirty = true;
                             }
                         }
-
-                        if f.hover_btn.is_some() {
-                            new_cursor = CursorType::Pointer;
-                        } else if f.bounds.contains(x, y) {
-                            let border_pad = 12;
-                            if x >= f.bounds.x + f.bounds.w - border_pad && y >= f.bounds.y + f.bounds.h - border_pad {
-                                new_cursor = CursorType::ResizeCorner;
-                            }
-                        }
                     }
                 }
 
-                if self.current_cursor != new_cursor {
-                    self.current_cursor = new_cursor;
-                    self.damage.add(cur_cursor_rect);
-                }
+                self.update_cursor_state(x, y);
 
+                // Handle Window Dragging & Resizing
                 if let Some(idx) = self.captured_window_idx {
                     if idx < self.root_widgets.len() {
                         if let Some(frame) = self.root_widgets[idx].as_any_mut().downcast_mut::<WindowFrame>() {
@@ -324,29 +303,8 @@ impl<'a> FrameworkApp<'a> {
                                 self.damage.add(frame.bounds);
                             } else if frame.is_resizing {
                                 let mut b = frame.bounds;
-                                match frame.resize_edge {
-                                    ResizeEdge::Right => b.w = (x - b.x).max(frame.min_w),
-                                    ResizeEdge::Bottom => b.h = (y - b.y).max(frame.min_h),
-                                    ResizeEdge::BottomRight => {
-                                        b.w = (x - b.x).max(frame.min_w);
-                                        b.h = (y - b.y).max(frame.min_h);
-                                    }
-                                    ResizeEdge::Left => {
-                                        let nw = (b.x + b.w - x).max(frame.min_w);
-                                        b.x += b.w - nw;
-                                        b.w = nw;
-                                    }
-                                    ResizeEdge::Top => {
-                                        let nh = (b.y + b.h - y).max(frame.min_h);
-                                        b.y += b.h - nh;
-                                        b.h = nh;
-                                    }
-                                    _ => {}
-                                }
-
-                                b.w = b.w.clamp(frame.min_w, (self.width as i32).max(frame.min_w));
-                                b.h = b.h.clamp(frame.min_h, (self.height as i32).max(frame.min_h));
-
+                                b.w = (x - b.x).max(frame.min_w).min(self.width as i32 - b.x);
+                                b.h = (y - b.y).max(frame.min_h).min(self.height as i32 - b.y);
                                 frame.layout(b.x, b.y, b.w, b.h);
                                 if let Some(surf) = self.window_surfaces.get_mut(idx) {
                                     surf.resize(b.w as usize, b.h as usize);
@@ -360,6 +318,40 @@ impl<'a> FrameworkApp<'a> {
                 }
             }
             PointerEvent::Down { x, y, button } => {
+                if button == PointerButton::Secondary {
+                    let mut found_target = None;
+                    for w in self.root_widgets.iter().rev() {
+                        if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
+                            if f.bounds.contains(x, y) {
+                                found_target = Some("file");
+                                break;
+                            }
+                        }
+                    }
+                    if found_target.is_some() {
+                        self.context_menu.show(x, y, vec!["Open".into(), "Rename".into(), "Delete".into()], Some("file".into()));
+                    } else {
+                        self.context_menu.show(x, y, vec!["New File".into(), "Open Terminal".into(), "Refresh".into()], None);
+                    }
+                    self.damage.add(self.context_menu.bounds);
+                    return;
+                }
+
+                if self.context_menu.is_visible {
+                    let old_bounds = self.context_menu.bounds;
+                    let action = self.context_menu.handle_mouse(x, y, true);
+                    self.damage.add(old_bounds);
+                    if let Some(act) = action {
+                        match act.as_str() {
+                            "Open Terminal" => self.spawn_app("Terminal"),
+                            "New File" => self.spawn_app("TextEdit"),
+                            _ => {}
+                        }
+                        self.request_full_redraw();
+                        return;
+                    }
+                }
+
                 if button == PointerButton::Primary {
                     if y >= dock_y && y <= dock_y + dock_h && x >= dock_x && x <= dock_x + dock_w {
                         let idx = ((x - dock_x - theme.pt(12.0)) / theme.pt(54.0)) as usize;
@@ -367,6 +359,7 @@ impl<'a> FrameworkApp<'a> {
                             if let Some(ref mut handler) = self.dock_handler { handler(idx); }
                             let app_name = self.dock_items[idx].clone();
                             self.spawn_app(&app_name);
+                            self.update_cursor_state(x, y);
                             return;
                         }
                     }
@@ -380,19 +373,6 @@ impl<'a> FrameworkApp<'a> {
                     }
 
                     if let Some(i) = hit_idx {
-                        let work_area = self.get_work_area();
-                        if let Some(f) = self.root_widgets[i].as_any_mut().downcast_mut::<WindowFrame>() {
-                            if f.hover_btn == Some(1) {
-                                f.toggle_maximize(&work_area);
-                                if let Some(surf) = self.window_surfaces.get_mut(i) {
-                                    surf.resize(f.bounds.w as usize, f.bounds.h as usize);
-                                    surf.is_dirty = true;
-                                }
-                                self.request_full_redraw();
-                                return;
-                            }
-                        }
-
                         let win = self.root_widgets.remove(i);
                         let surf = self.window_surfaces.remove(i);
                         self.root_widgets.push(win);
@@ -400,30 +380,20 @@ impl<'a> FrameworkApp<'a> {
                         let top_idx = self.root_widgets.len() - 1;
                         self.focus_mgr.active_window_idx = Some(top_idx);
 
-                        let app_title = if let Some(f) = self.root_widgets[top_idx].as_any().downcast_ref::<WindowFrame>() {
-                            f.title.clone()
-                        } else {
-                            "Finder".into()
-                        };
-                        self.menubar_widget.set_active_app(&app_title);
-
-                        for (k, w) in self.root_widgets.iter_mut().enumerate() {
-                            if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
-                                f.is_active = k == top_idx;
-                                if let Some(s) = self.window_surfaces.get_mut(k) {
-                                    s.is_dirty = true;
-                                }
-                            }
-                        }
-
                         if let Some(f) = self.root_widgets[top_idx].as_any_mut().downcast_mut::<WindowFrame>() {
-                            if f.is_dragging || f.is_resizing {
+                            let border_pad = 14;
+                            if x >= f.bounds.x + f.bounds.w - border_pad && y >= f.bounds.y + f.bounds.h - border_pad {
+                                f.is_resizing = true;
+                                f.resize_edge = ResizeEdge::BottomRight;
+                                self.captured_window_idx = Some(top_idx);
+                            } else if f.is_dragging {
                                 self.captured_window_idx = Some(top_idx);
                             }
                         }
                         self.request_full_redraw();
                     }
                 }
+                self.update_cursor_state(x, y);
             }
             PointerEvent::Up { button, .. } => {
                 if button == PointerButton::Primary {
@@ -438,6 +408,7 @@ impl<'a> FrameworkApp<'a> {
                     }
                     self.captured_window_idx = None;
                 }
+                self.update_cursor_state(self.prev_pointer_x, self.prev_pointer_y);
             }
             PointerEvent::Scroll { x, y, dy } => {
                 for (idx, w) in self.root_widgets.iter_mut().enumerate().rev() {
@@ -445,10 +416,62 @@ impl<'a> FrameworkApp<'a> {
                         if let Some(surf) = self.window_surfaces.get_mut(idx) {
                             surf.is_dirty = true;
                         }
+                        if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
+                            self.damage.add(f.bounds);
+                        }
                         break;
                     }
                 }
             }
+        }
+    }
+
+    fn handle_raw_event(&mut self, raw: [u64; 3]) {
+        match raw[0] {
+            1 => {
+                let dx = (raw[1] as i32) as isize;
+                let dy = ((raw[1] >> 32) as i32) as isize;
+                let new_x = (self.prev_pointer_x + dx as i32).clamp(0, self.width as i32 - 1);
+                let new_y = (self.prev_pointer_y + dy as i32).clamp(0, self.height as i32 - 1);
+                self.input_mgr.pointer.x = new_x;
+                self.input_mgr.pointer.y = new_y;
+                self.route_pointer_event(PointerEvent::Move { x: new_x, y: new_y, dx: dx as i32, dy: dy as i32 });
+            }
+            2 => {
+                let btn = (raw[1] & 0xFF) as u8;
+                let pressed = ((raw[1] >> 8) & 0x01) != 0;
+                let ptr_ev = self.input_mgr.handle_raw_button(btn, pressed);
+                self.route_pointer_event(ptr_ev);
+            }
+            3 => {
+                let keycode = (raw[1] & 0xFF) as u8;
+                let mods = ((raw[1] >> 8) & 0xFF) as u8;
+                if let Some(idx) = self.focus_mgr.active_window_idx {
+                    if idx < self.root_widgets.len() {
+                        self.root_widgets[idx].handle_key(keycode, mods);
+                        self.request_full_redraw();
+                    }
+                }
+            }
+            4 => {
+                let c = (raw[1] as u32) as u8 as char;
+                if let Some(idx) = self.focus_mgr.active_window_idx {
+                    if idx < self.root_widgets.len() {
+                        self.root_widgets[idx].handle_char(c);
+                        self.request_full_redraw();
+                    }
+                }
+            }
+            5 => {
+                let dy = raw[1] as i64 as i32;
+                let ptr_ev = PointerEvent::Scroll {
+                    x: self.prev_pointer_x,
+                    y: self.prev_pointer_y,
+                    dy,
+                };
+                self.route_pointer_event(ptr_ev);
+            }
+            _ => {}
         }
     }
 
@@ -481,153 +504,60 @@ impl<'a> FrameworkApp<'a> {
         self.wallpaper_dirty = false;
     }
 
-    pub fn handle_shortcuts(&mut self, keycode: u8, mods: u8) -> bool {
-        const MOD_WIN: u8 = 1 << 4;
-        if (mods & MOD_WIN) == 0 { return false; }
-
-        if keycode == 0x01 {
-            self.spawn_app("Activity Monitor");
-            return true;
-        }
-
-        if let Some(idx) = self.focus_mgr.active_window_idx {
-            if idx < self.root_widgets.len() {
-                let work_area = self.get_work_area();
-                if let Some(f) = self.root_widgets[idx].as_any_mut().downcast_mut::<WindowFrame>() {
-                    let handled = match keycode {
-                        0x4B => { f.tile_left(&work_area); true }
-                        0x4D => { f.tile_right(&work_area); true }
-                        0x48 => { f.toggle_maximize(&work_area); true }
-                        0x50 => {
-                            if f.is_maximized || f.tile_state != WindowTileState::None {
-                                f.layout(f.prev_bounds.x, f.prev_bounds.y, f.prev_bounds.w, f.prev_bounds.h);
-                                f.is_maximized = false;
-                                f.tile_state = WindowTileState::None;
-                                true
-                            } else {
-                                false
-                            }
-                        }
-                        _ => false,
-                    };
-
-                    if handled {
-                        if let Some(surf) = self.window_surfaces.get_mut(idx) {
-                            surf.resize(f.bounds.w as usize, f.bounds.h as usize);
-                            surf.is_dirty = true;
-                        }
-                        self.request_full_redraw();
-                        return true;
-                    }
-                }
-            }
-        }
-        false
-    }
-
     pub fn run_loop(&mut self) {
+        self.rebuild_wallpaper_cache();
+        self.request_full_redraw();
+
         loop {
-            let mut got_any_event = false;
-            let mut raw_ev = sys_wait_event(16);
-
-            while let Some(ev) = raw_ev {
-                got_any_event = true;
-                match ev[0] {
-                    1 => {
-                        let dx = (ev[1] as u32) as i32;
-                        let dy = ((ev[1] >> 32) as u32) as i32;
-                        let ptr_ev = self.input_mgr.handle_raw_motion(dx, dy, self.width as i32, self.height as i32);
-                        self.route_pointer_event(ptr_ev);
-                    }
-                    2 => {
-                        let btn = (ev[1] & 0xFF) as u8;
-                        let pressed = ((ev[1] >> 8) & 0xFF) != 0;
-                        let ptr_ev = self.input_mgr.handle_raw_button(btn, pressed);
-                        self.route_pointer_event(ptr_ev);
-                    }
-                    3 => {
-                        let keycode = (ev[1] & 0xFF) as u8;
-                        let mods = ((ev[1] >> 8) & 0xFF) as u8;
-
-                        if keycode == 0x44 {
-                            self.show_debug_overlay = !self.show_debug_overlay;
-                            self.request_full_redraw();
-                        } else if !self.handle_shortcuts(keycode, mods) {
-                            let _key_ev = self.input_mgr.handle_raw_key(keycode, mods, true);
-                            if let Some(idx) = self.focus_mgr.active_window_idx {
-                                if let Some(w) = self.root_widgets.get_mut(idx) {
-                                    w.handle_key(keycode, mods);
-                                    if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
-                                        self.damage.add(f.bounds);
-                                        if let Some(s) = self.window_surfaces.get_mut(idx) {
-                                            s.is_dirty = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    4 => {
-                        let c_code = ev[1] as u32;
-                        if let Some(c) = char::from_u32(c_code) {
-                            if let Some(idx) = self.focus_mgr.active_window_idx {
-                                if let Some(w) = self.root_widgets.get_mut(idx) {
-                                    w.handle_char(c);
-                                    if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
-                                        self.damage.add(f.bounds);
-                                        if let Some(s) = self.window_surfaces.get_mut(idx) {
-                                            s.is_dirty = true;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    5 => {
-                        let dy = (ev[1] as u32) as i32;
-                        let ptr_ev = PointerEvent::Scroll {
-                            x: self.input_mgr.pointer.x,
-                            y: self.input_mgr.pointer.y,
-                            dy,
-                        };
-                        self.route_pointer_event(ptr_ev);
-                    }
-                    _ => {}
-                }
-                raw_ev = sys_poll_event();
+            if take_wallpaper_changed() || self.wallpaper_dirty {
+                self.rebuild_wallpaper_cache();
+                self.request_full_redraw();
             }
 
-            let mut removed_indices = Vec::new();
+            // Cleanup closed windows cleanly to prevent Page Faults
+            let mut removed = Vec::new();
             for (idx, w) in self.root_widgets.iter().enumerate() {
                 if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
                     if f.is_closed {
-                        removed_indices.push(idx);
+                        removed.push(idx);
                         self.damage.add(f.bounds);
                     }
                 }
             }
-            for &idx in removed_indices.iter().rev() {
-                self.root_widgets.remove(idx);
-                self.window_surfaces.remove(idx);
+            for &idx in removed.iter().rev() {
+                if idx < self.root_widgets.len() {
+                    self.root_widgets.remove(idx);
+                }
+                if idx < self.window_surfaces.len() {
+                    self.window_surfaces.remove(idx);
+                }
             }
-            if !removed_indices.is_empty() {
+            if !removed.is_empty() {
                 self.focus_mgr.active_window_idx = if self.root_widgets.is_empty() { None } else { Some(self.root_widgets.len() - 1) };
                 self.request_full_redraw();
             }
 
-            let mut image_to_open = None;
-            for w in &mut self.root_widgets {
+            let mut pending_open_text = None;
+            let mut pending_open_img = None;
+
+            for w in self.root_widgets.iter_mut() {
                 if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
                     if let Some(finder) = frame.content.as_any_mut().downcast_mut::<FinderApp>() {
+                        if let Some(path) = finder.pending_open_text.take() {
+                            pending_open_text = Some(path);
+                        }
                         if let Some(req) = finder.pending_open_image.take() {
-                            image_to_open = Some(req);
-                            break;
+                            pending_open_img = Some(req);
                         }
                     }
                 }
             }
 
-            if let Some((name, path)) = image_to_open {
+            if let Some(path) = pending_open_text {
+                self.spawn_text_editor(&path);
+            }
+
+            if let Some((name, path)) = pending_open_img {
                 let theme = get_theme();
                 let prev_app = Box::new(PreviewApp::new(name.clone(), path));
                 let win_w = theme.pt(680.0);
@@ -647,181 +577,176 @@ impl<'a> FrameworkApp<'a> {
                 self.request_full_redraw();
             }
 
-            if crate::framework::theme::take_wallpaper_changed() {
-                self.wallpaper_dirty = true;
+            if let Some(ev) = sys_wait_event(16) {
+                self.handle_raw_event(ev);
             }
 
-            if take_full_redraw_requested() {
-                self.request_full_redraw();
-            }
+            let mut pending_dx: i32 = 0;
+            let mut pending_dy: i32 = 0;
+            let mut has_mouse_move = false;
 
-            unsafe {
-                if DESKTOP_WALLPAPER.is_some() && self.wallpaper_dirty {
-                    self.rebuild_wallpaper_cache();
-                    self.damage.add(Rect::new(0, 0, self.width as i32, self.height as i32));
-                }
-            }
-
-            if !got_any_event && self.damage.is_empty() {
-                continue;
-            }
-
-            let theme = get_theme();
-            let dock_h = theme.pt(58.0);
-            let dock_w = (self.dock_items.len() as i32) * theme.pt(54.0) + theme.pt(24.0);
-            let dock_x = ((self.width as i32) - dock_w) / 2;
-            let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
-            let dock_rect = Rect::new(dock_x - 10, dock_y - 15, dock_w + 20, dock_h + 20);
-            let menubar_rect = self.menubar_widget.bounds;
-
-            self.damage.clamp_to_screen(self.width, self.height);
-
-            for (idx, w) in self.root_widgets.iter_mut().enumerate() {
-                if let Some(surf) = self.window_surfaces.get_mut(idx) {
-                    if surf.is_dirty {
-                        let mut local_canvas = Canvas::new(
-                            &mut surf.pixels,
-                            surf.width,
-                            surf.height,
-                            self.font.as_ref(),
-                            &mut self.font_cache,
-                        );
-                        local_canvas.clear(0x00000000);
-                        let old_b = if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() { f.bounds } else { Rect::default() };
-                        w.layout(0, 0, surf.width as i32, surf.height as i32);
-                        w.paint(&mut local_canvas);
-                        if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
-                            f.layout(old_b.x, old_b.y, old_b.w, old_b.h);
-                        }
-                        surf.is_dirty = false;
+            while let Some(raw) = sys_poll_event() {
+                if raw[0] == 1 {
+                    pending_dx += raw[1] as i32;
+                    pending_dy += (raw[1] >> 32) as i32;
+                    has_mouse_move = true;
+                } else {
+                    if has_mouse_move {
+                        let new_x = (self.prev_pointer_x + pending_dx).clamp(0, self.width as i32 - 1);
+                        let new_y = (self.prev_pointer_y + pending_dy).clamp(0, self.height as i32 - 1);
+                        self.input_mgr.pointer.x = new_x;
+                        self.input_mgr.pointer.y = new_y;
+                        self.route_pointer_event(PointerEvent::Move { x: new_x, y: new_y, dx: pending_dx, dy: pending_dy });
+                        pending_dx = 0;
+                        pending_dy = 0;
+                        has_mouse_move = false;
                     }
+                    self.handle_raw_event(raw);
                 }
             }
 
-            for r in self.damage.rects.clone() {
-                let ex = (r.x + r.w).min(self.width as i32);
-                let ey = (r.y + r.h).min(self.height as i32);
-                let sx = r.x.max(0);
-                let sy = r.y.max(0);
-
-                for cy in sy..ey {
-                    let row = (cy as usize) * self.width;
-                    let src = &self.wallpaper_cache[row + sx as usize..row + ex as usize];
-                    self.buffer[row + sx as usize..row + ex as usize].copy_from_slice(src);
-                }
-
-                for (idx, w) in self.root_widgets.iter().enumerate() {
-                    let win_b = if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() { f.bounds } else { continue };
-                    if let Some(intersect) = win_b.intersect(&r).non_empty() {
-                        if let Some(surf) = self.window_surfaces.get(idx) {
-                            let s_w = surf.width;
-                            let s_h = surf.height;
-
-                            let bound_max_y = (win_b.y + s_h as i32).min(intersect.y + intersect.h);
-                            let bound_max_x = (win_b.x + s_w as i32).min(intersect.x + intersect.w);
-
-                            for cy in intersect.y..bound_max_y {
-                                let local_y = (cy - win_b.y) as usize;
-                                if local_y >= s_h { break; }
-                                let dst_row = (cy as usize) * self.width;
-                                let src_row = local_y * s_w;
-
-                                for cx in intersect.x..bound_max_x {
-                                    let local_x = (cx - win_b.x) as usize;
-                                    if local_x >= s_w { break; }
-                                    let pixel_index = src_row + local_x;
-
-                                    if let Some(&c) = surf.pixels.get(pixel_index) {
-                                        let a = (c >> 24) & 0xFF;
-                                        if a == 255 {
-                                            self.buffer[dst_row + cx as usize] = c;
-                                        } else if a > 0 {
-                                            let bg = self.buffer[dst_row + cx as usize];
-                                            let inv = 255 - a;
-                                            let rb = (((c & 0x00FF00FF) * a + (bg & 0x00FF00FF) * inv) >> 8) & 0x00FF00FF;
-                                            let g = (((c & 0x0000FF00) * a + (bg & 0x0000FF00) * inv) >> 8) & 0x0000FF00;
-                                            self.buffer[dst_row + cx as usize] = 0xFF000000 | rb | g;
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-
-                if let Some(intersect) = menubar_rect.intersect(&r).non_empty() {
-                    let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-                    canvas.push_clip(intersect);
-                    self.menubar_widget.paint(&mut canvas);
-                    canvas.pop_clip();
-                }
-
-                if let Some(intersect) = dock_rect.intersect(&r).non_empty() {
-                    let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-                    canvas.push_clip(intersect);
-                    canvas.draw_frosted_glass_rect(dock_x, dock_y, dock_w, dock_h, 0xDD0B1120, theme.pt(16.0) as usize);
-                    canvas.draw_rect_outline(dock_x, dock_y, dock_w, dock_h, theme.border_window, theme.pt(16.0) as usize);
-
-                    for (i, item) in self.dock_items.iter().enumerate() {
-                        let is_hovered = self.hovered_dock_idx == Some(i);
-                        let lift_y = if is_hovered { theme.pt(8.0) } else { 0 };
-                        let icon_box_sz = if is_hovered { theme.pt(44.0) } else { theme.pt(40.0) };
-
-                        let ix = dock_x + theme.pt(12.0) + (i as i32 * theme.pt(54.0)) - if is_hovered { 2 } else { 0 };
-                        let iy = dock_y + theme.pt(6.0) - lift_y;
-
-                        let is_active = self.focus_mgr.active_window_idx.and_then(|idx| self.root_widgets.get(idx))
-                            .map_or(false, |w| if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() { f.title.contains(item) } else { false });
-                        let is_open = self.root_widgets.iter().any(|w| if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() { f.title.contains(item) && !f.is_closed } else { false });
-
-                        let bg_c = if is_active { theme.accent } else if is_hovered { 0xFF1E293B } else { 0xFF131D2E };
-                        canvas.draw_rect(ix, iy, icon_box_sz, icon_box_sz, bg_c, theme.pt(10.0) as usize);
-                        canvas.draw_rect_outline(ix, iy, icon_box_sz, icon_box_sz, theme.border_window, theme.pt(10.0) as usize);
-
-                        let icon_name = match item.as_str() {
-                            "Finder" => "folder",
-                            "Settings" => "gear",
-                            "Terminal" => "terminal",
-                            "Activity Monitor" => "monitor",
-                            "Browser" => "browser",
-                            _ => "folder",
-                        };
-                        draw_vector_icon(&mut canvas, icon_name, ix + theme.pt(8.0), iy + theme.pt(8.0), icon_box_sz - theme.pt(16.0), icon_box_sz - theme.pt(16.0), Some(0xFFFFFFFF));
-
-                        if is_open {
-                            let dot_r = theme.pt(2.5) as usize;
-                            let dot_cx = ix + (icon_box_sz / 2);
-                            let dot_cy = dock_y + dock_h - theme.pt(5.0);
-                            let dot_color = if is_active { theme.accent_hover } else { 0xFF94A3B8 };
-                            canvas.draw_rect(dot_cx - dot_r as i32, dot_cy - dot_r as i32, (dot_r * 2) as i32, (dot_r * 2) as i32, dot_color, dot_r);
-                        }
-                    }
-                    canvas.pop_clip();
-                }
-
-                let cur_cursor_rect = Rect::new(self.input_mgr.pointer.x - 4, self.input_mgr.pointer.y - 4, 28, 28);
-                if let Some(intersect) = cur_cursor_rect.intersect(&r).non_empty() {
-                    let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-                    canvas.push_clip(intersect);
-                    match self.current_cursor {
-                        CursorType::Default => canvas.draw_linux_cursor(self.input_mgr.pointer.x, self.input_mgr.pointer.y),
-                        CursorType::Pointer => canvas.draw_pointer_hand_cursor(self.input_mgr.pointer.x, self.input_mgr.pointer.y),
-                        CursorType::ResizeCorner => canvas.draw_resize_corner_cursor(self.input_mgr.pointer.x, self.input_mgr.pointer.y),
-                    }
-                    canvas.pop_clip();
-                }
+            if has_mouse_move {
+                let new_x = (self.prev_pointer_x + pending_dx).clamp(0, self.width as i32 - 1);
+                let new_y = (self.prev_pointer_y + pending_dy).clamp(0, self.height as i32 - 1);
+                self.input_mgr.pointer.x = new_x;
+                self.input_mgr.pointer.y = new_y;
+                self.route_pointer_event(PointerEvent::Move { x: new_x, y: new_y, dx: pending_dx, dy: pending_dy });
             }
 
-            if self.show_debug_overlay {
-                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-                canvas.draw_rect(20, 40, 220, 50, 0xCC000000, 6);
-                canvas.draw_text(30, 48, "Debug Overlay: F10", 0xFF00FF00, 14);
-                canvas.draw_text(30, 68, &format!("Damage rects: {}", self.damage.rects.len()), 0xFFFFFFFF, 14);
-            }
-
-            let syscall_rects = self.damage.to_syscall_rects();
-            sys_present_rects(self.buffer.as_ptr(), self.width, self.height, &syscall_rects);
-            self.damage.clear();
+            self.render();
         }
+    }
+
+    pub fn render(&mut self) {
+        let theme = get_theme();
+        let dock_h = theme.pt(58.0);
+        let dock_w = (self.dock_items.len() as i32) * theme.pt(54.0) + theme.pt(24.0);
+        let dock_x = ((self.width as i32) - dock_w) / 2;
+        let dock_y = (self.height as i32) - dock_h - theme.pt(12.0);
+
+        if self.damage.is_empty() { return; }
+        let dirty_rects = self.damage.rects.clone();
+
+        let dock_rect = Rect::new(dock_x - 10, dock_y - 15, dock_w + 20, dock_h + 20);
+
+        for r in &dirty_rects {
+            let cx1 = r.x.clamp(0, self.width as i32) as usize;
+            let cy1 = r.y.clamp(0, self.height as i32) as usize;
+            let cx2 = (r.x + r.w).clamp(0, self.width as i32) as usize;
+            let cy2 = (r.y + r.h).clamp(0, self.height as i32) as usize;
+
+            for y in cy1..cy2 {
+                let row = y * self.width;
+                self.buffer[row + cx1..row + cx2].copy_from_slice(&self.wallpaper_cache[row + cx1..row + cx2]);
+            }
+
+            for (_idx, w) in self.root_widgets.iter().enumerate() {
+                if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
+                    if let Some(intersect) = f.bounds.intersect(&r).non_empty() {
+                        let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                        canvas.push_clip(intersect);
+                        w.paint(&mut canvas);
+                        canvas.pop_clip();
+                    }
+                }
+            }
+
+            if let Some(intersect) = self.menubar_widget.bounds.intersect(&r).non_empty() {
+                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                canvas.push_clip(intersect);
+                self.menubar_widget.paint(&mut canvas);
+                canvas.pop_clip();
+            }
+
+            if let Some(intersect) = dock_rect.intersect(&r).non_empty() {
+                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                canvas.push_clip(intersect);
+                canvas.draw_frosted_glass_rect(dock_x, dock_y, dock_w, dock_h, 0xDD18181B, theme.pt(16.0) as usize);
+                canvas.draw_rect_outline(dock_x, dock_y, dock_w, dock_h, theme.border_window, theme.pt(16.0) as usize);
+
+                for (i, item) in self.dock_items.iter().enumerate() {
+                    let is_hovered = self.hovered_dock_idx == Some(i);
+                    let lift_y = if is_hovered { theme.pt(8.0) } else { 0 };
+                    let icon_box_sz = if is_hovered { theme.pt(44.0) } else { theme.pt(40.0) };
+
+                    let ix = dock_x + theme.pt(12.0) + (i as i32 * theme.pt(54.0)) - if is_hovered { 2 } else { 0 };
+                    let iy = dock_y + theme.pt(6.0) - lift_y;
+
+                    let bg_c = match item.as_str() {
+                        "Finder" => 0xFF1E3A8A,
+                        "TextEdit" => 0xFF7C2D12,
+                        "Terminal" => 0xFF064E3B,
+                        "Activity Monitor" => 0xFF0C4A6E,
+                        "Browser" => 0xFF581C87,
+                        _ => 0xFF334155,
+                    };
+
+                    canvas.draw_rect(ix, iy, icon_box_sz, icon_box_sz, bg_c, theme.pt(10.0) as usize);
+                    canvas.draw_rect_outline(ix, iy, icon_box_sz, icon_box_sz, 0x88FFFFFF, theme.pt(10.0) as usize);
+
+                    let cx = ix + (icon_box_sz / 2);
+                    let cy = iy + (icon_box_sz / 2);
+
+                    match item.as_str() {
+                        "Finder" => {
+                            canvas.draw_rect(cx - 10, cy - 8, 8, 4, 0xFF38BDF8, 1);
+                            canvas.draw_rect(cx - 10, cy - 5, 20, 14, 0xFF0284C7, 2);
+                            canvas.draw_rect(cx - 8, cy - 3, 16, 10, 0xFFFFFFFF, 1);
+                            canvas.draw_rect(cx - 6, cy - 1, 12, 6, 0xFF0284C7, 0);
+                        }
+                        "TextEdit" => {
+                            canvas.draw_rect(cx - 8, cy - 10, 16, 20, 0xFFF8FAFC, 2);
+                            canvas.draw_line_h(cx - 5, cy - 6, 10, 0xFF94A3B8);
+                            canvas.draw_line_h(cx - 5, cy - 2, 10, 0xFF94A3B8);
+                            canvas.draw_line_h(cx - 5, cy + 2, 7, 0xFF94A3B8);
+                            canvas.draw_rect(cx + 2, cy + 1, 4, 8, 0xFFEA580C, 1);
+                        }
+                        "Terminal" => {
+                            canvas.draw_rect(cx - 11, cy - 9, 22, 18, 0xFF022C22, 2);
+                            canvas.draw_rect_outline(cx - 11, cy - 9, 22, 18, 0xFF10B981, 2);
+                            canvas.draw_text(cx - 8, cy - 6, ">", 0xFF34D399, 13);
+                            canvas.draw_line_h(cx - 1, cy + 4, 7, 0xFF34D399);
+                        }
+                        "Activity Monitor" => {
+                            canvas.draw_rect(cx - 11, cy - 9, 22, 18, 0xFF082F49, 2);
+                            canvas.draw_line_h(cx - 9, cy, 4, 0xFF38BDF8);
+                            canvas.draw_line_v(cx - 5, cy - 6, 8, 0xFF38BDF8);
+                            canvas.draw_line_v(cx - 1, cy + 1, 6, 0xFF38BDF8);
+                            canvas.draw_line_h(cx + 3, cy, 6, 0xFF38BDF8);
+                        }
+                        "Browser" => {
+                            canvas.draw_rect(cx - 9, cy - 9, 18, 18, 0xFF7C3AED, 9);
+                            canvas.draw_rect_outline(cx - 9, cy - 9, 18, 18, 0xFFE9D5FF, 9);
+                            canvas.draw_line_h(cx - 8, cy, 16, 0xFFFFFFFF);
+                            canvas.draw_line_v(cx, cy - 8, 16, 0xFFFFFFFF);
+                        }
+                        _ => {
+                            canvas.draw_rect(cx - 8, cy - 8, 16, 16, 0xFF64748B, 8);
+                            canvas.draw_rect(cx - 3, cy - 3, 6, 6, 0xFF1E293B, 3);
+                        }
+                    }
+                }
+                canvas.pop_clip();
+            }
+
+            if self.context_menu.is_visible {
+                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                self.context_menu.draw(&mut canvas);
+            }
+
+            let cur_cursor_rect = Rect::new(self.prev_pointer_x - 4, self.prev_pointer_y - 4, 32, 32);
+            if cur_cursor_rect.intersect(&r).non_empty().is_some() {
+                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                match self.current_cursor {
+                    CursorType::Default => canvas.draw_linux_cursor(self.prev_pointer_x, self.prev_pointer_y),
+                    CursorType::Pointer => canvas.draw_pointer_hand_cursor(self.prev_pointer_x, self.prev_pointer_y),
+                    CursorType::ResizeCorner => canvas.draw_resize_corner_cursor(self.prev_pointer_x, self.prev_pointer_y),
+                }
+            }
+        }
+
+        let rect_data: Vec<[u32; 4]> = dirty_rects.iter().map(|r| [r.x as u32, r.y as u32, r.w as u32, r.h as u32]).collect();
+        sys_present_rects(self.buffer.as_ptr(), self.width, self.height, &rect_data);
+        self.damage.clear();
     }
 }
