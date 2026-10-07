@@ -19,6 +19,8 @@ pub struct TerminalApp {
     history_idx: Option<usize>,
     scroll_y: i32,
     current_dir: String,
+    current_user: String,
+    is_root: bool,
     is_selecting: bool,
     sel_start: Option<TextPos>,
     sel_end: Option<TextPos>,
@@ -29,8 +31,8 @@ impl TerminalApp {
         let mut app = Self {
             bounds: Rect::default(),
             history: vec![
-                ("EOS Interactive POSIX Shell v0.2".into(), 0xFF38BDF8),
-                ("Persistent history loaded from RootFS/.bash_history".into(), 0xFF94A3B8),
+                ("EOS Linux Shell (FHS POSIX environment)".into(), 0xFF38BDF8),
+                ("Logged in as 'march'. Use 'hero <cmd>' for root privileged operations.".into(), 0xFF94A3B8),
                 ("".into(), 0xFFFFFFFF),
             ],
             input: String::new(),
@@ -38,7 +40,9 @@ impl TerminalApp {
             cmd_history: Vec::new(),
             history_idx: None,
             scroll_y: 0,
-            current_dir: "/".into(),
+            current_dir: "/home/march".into(),
+            current_user: "march".into(),
+            is_root: false,
             is_selecting: false,
             sel_start: None,
             sel_end: None,
@@ -47,8 +51,23 @@ impl TerminalApp {
         app
     }
 
+    fn prompt_prefix(&self) -> String {
+        let symbol = if self.is_root { "#" } else { "$" };
+        let disp_dir = if self.current_dir.starts_with("/home/march") {
+            self.current_dir.replacen("/home/march", "~", 1)
+        } else {
+            self.current_dir.clone()
+        };
+        format!("{}@eos:{}{} ", self.current_user, disp_dir, symbol)
+    }
+
     fn load_history_from_disk(&mut self) {
-        let candidates = ["RootFS/.bash_history", ".bash_history", "/RootFS/.bash_history"];
+        let candidates = [
+            "/home/march/.bash_history",
+            "home/march/.bash_history",
+            "RootFS/.bash_history",
+            ".bash_history",
+        ];
         for p in &candidates {
             if let Ok(content) = fs::read_to_string(p) {
                 for line in content.lines() {
@@ -64,7 +83,7 @@ impl TerminalApp {
 
     fn save_history_to_disk(&self) {
         let payload = self.cmd_history.join("\n") + "\n";
-        let paths = ["RootFS/.bash_history", ".bash_history"];
+        let paths = ["/home/march/.bash_history", "home/march/.bash_history", ".bash_history"];
         for p in &paths {
             let _ = fs::write(p, payload.as_bytes());
         }
@@ -85,7 +104,7 @@ impl TerminalApp {
 
     fn execute(&mut self) {
         let raw_cmd = self.input.trim().to_string();
-        let prompt_line = format!("eos:{}$ {}", self.current_dir, self.input);
+        let prompt_line = format!("{}{}", self.prompt_prefix(), self.input);
         self.history.push((prompt_line.clone(), 0xFF38BDF8));
         self.print_to_host(&prompt_line);
 
@@ -111,28 +130,49 @@ impl TerminalApp {
             return;
         }
 
-        let program = &parts[0];
-        let args = &parts[1..];
+        let (is_hero_invoked, program, args) = if parts[0] == "hero" {
+            if parts.len() < 2 {
+                let msg = "usage: hero <command>";
+                self.history.push((msg.into(), 0xFFEF4444));
+                self.print_to_host(msg);
+                self.scroll_to_bottom();
+                return;
+            }
+            (true, parts[1].as_str(), &parts[2..])
+        } else {
+            (false, parts[0].as_str(), &parts[1..])
+        };
 
-        match program.as_str() {
+        let has_root = self.is_root || is_hero_invoked;
+
+        match program {
             "help" => {
                 let msgs = [
-                    ("Built-in commands:", 0xFFFCD34D),
-                    ("  help           - Display command overview", 0xFFE2E8F0),
-                    ("  clear          - Clear terminal history buffer", 0xFFE2E8F0),
-                    ("  history        - View saved commands across reboots", 0xFFE2E8F0),
-                    ("  ls [path]      - List directory contents", 0xFFE2E8F0),
+                    ("Standard Linux Commands:", 0xFFFCD34D),
+                    ("  hero <cmd>     - Execute command as superuser (root)", 0xFF34D399),
+                    ("  whoami         - Print current username", 0xFFE2E8F0),
+                    ("  pwd            - Print current directory", 0xFFE2E8F0),
+                    ("  history        - View command history", 0xFFE2E8F0),
+                    ("  ls [path]      - List directory entries", 0xFFE2E8F0),
                     ("  cd <path>      - Change working directory", 0xFFE2E8F0),
-                    ("  cat <file>     - Print file contents", 0xFFE2E8F0),
-                    ("  uname -a       - Print system & kernel information", 0xFFE2E8F0),
-                    ("  net / ipconfig - Print network status", 0xFFE2E8F0),
-                    ("Supported Binaries:", 0xFFFCD34D),
-                    ("  python.elf <args> - CPython 3.12 Runtime", 0xFF34D399),
+                    ("  cat <file>     - Display file contents", 0xFFE2E8F0),
+                    ("  rm <file>      - Remove file (requires hero for system paths)", 0xFFE2E8F0),
+                    ("  clear          - Clear terminal buffer", 0xFFE2E8F0),
+                    ("  python <args>  - Run CPython 3.12 binary", 0xFF34D399),
                 ];
                 for (m, c) in msgs {
                     self.history.push((m.into(), c));
                     self.print_to_host(m);
                 }
+            }
+            "whoami" => {
+                let u = if has_root { "root" } else { &self.current_user };
+                self.history.push((u.to_string(), 0xFFE2E8F0));
+                self.print_to_host(u);
+            }
+            "pwd" => {
+                self.history.push((self.current_dir.clone(), 0xFFE2E8F0));
+                self.print_to_host(&self.current_dir);
             }
             "history" => {
                 for (i, h) in self.cmd_history.iter().enumerate() {
@@ -150,16 +190,52 @@ impl TerminalApp {
                 self.history.push((msg.into(), 0xFFE2E8F0));
                 self.print_to_host(msg);
             }
-            "ipconfig" | "net" => {
-                let msg = "eth0 (Intel E1000): IP=10.0.2.15 Subnet=255.255.255.0 Gateway=10.0.2.2 [UP]";
-                self.history.push((msg.into(), 0xFF10B981));
-                self.print_to_host(msg);
+            "rm" => {
+                if args.is_empty() {
+                    let msg = "rm: missing operand";
+                    self.history.push((msg.into(), 0xFFEF4444));
+                    self.print_to_host(msg);
+                } else {
+                    let target = &args[0];
+                    let full_path = if target.starts_with('/') {
+                        target.clone()
+                    } else if self.current_dir == "/" {
+                        format!("/{}", target)
+                    } else {
+                        format!("{}/{}", self.current_dir, target)
+                    };
+
+                    let clean = full_path.trim_matches('/');
+                    let is_user_space = clean.starts_with("home/march") || clean.starts_with("tmp");
+
+                    if !is_user_space && !has_root {
+                        let err = format!("rm: cannot remove '{}': Permission denied (Protected system file. Use 'hero rm')", target);
+                        self.history.push((err.clone(), 0xFFEF4444));
+                        self.print_to_host(&err);
+                    } else {
+                        match fs::remove_file(&full_path) {
+                            Ok(_) => {
+                                let ok_msg = format!("Removed '{}'", target);
+                                self.history.push((ok_msg.clone(), 0xFF10B981));
+                                self.print_to_host(&ok_msg);
+                            }
+                            Err(e) => {
+                                let err = format!("rm: cannot remove '{}': {:?}", target, e);
+                                self.history.push((err.clone(), 0xFFEF4444));
+                                self.print_to_host(&err);
+                            }
+                        }
+                    }
+                }
             }
             "ls" => {
                 let target = if args.is_empty() {
-                    if self.current_dir == "/" { "".into() } else { self.current_dir.clone() }
+                    self.current_dir.clone()
                 } else {
-                    args[0].clone()
+                    let t = &args[0];
+                    if t == "~" { "/home/march".into() }
+                    else if t.starts_with("~/") { format!("/home/march/{}", &t[2..]) }
+                    else { t.clone() }
                 };
 
                 let clean = target.trim_matches('/').to_string();
@@ -200,7 +276,9 @@ impl TerminalApp {
                 }
             }
             "cd" => {
-                if args.is_empty() || args[0] == "/" || args[0] == "~" {
+                if args.is_empty() || args[0] == "~" {
+                    self.current_dir = "/home/march".into();
+                } else if args[0] == "/" {
                     self.current_dir = "/".into();
                 } else {
                     let target = &args[0];
@@ -212,7 +290,9 @@ impl TerminalApp {
                             self.current_dir = "/".into();
                         }
                     } else {
-                        let next = if target.starts_with('/') {
+                        let next = if target.starts_with("~/") {
+                            format!("/home/march/{}", &target[2..])
+                        } else if target.starts_with('/') {
                             target.clone()
                         } else if self.current_dir == "/" {
                             format!("/{}", target)
@@ -237,7 +317,9 @@ impl TerminalApp {
                     self.history.push((err.into(), 0xFFEF4444));
                     self.print_to_host(err);
                 } else {
-                    let fpath = if self.current_dir == "/" {
+                    let fpath = if args[0].starts_with('/') {
+                        args[0].clone()
+                    } else if self.current_dir == "/" {
                         args[0].clone()
                     } else {
                         format!("{}/{}", self.current_dir.trim_matches('/'), args[0])
@@ -274,12 +356,15 @@ impl TerminalApp {
         let candidates = [
             clean_prog.to_string(),
             format!("{}.elf", clean_prog),
+            format!("bin/{}", clean_prog),
+            format!("bin/{}.elf", clean_prog),
+            format!("usr/bin/{}", clean_prog),
+            format!("usr/bin/{}.elf", clean_prog),
             if cur.is_empty() { clean_prog.to_string() } else { format!("{}/{}", cur, clean_prog) },
             format!("Initrd/{}", clean_prog),
             format!("Initrd/{}.elf", clean_prog),
             format!("EOS SHARE/{}", clean_prog),
             format!("EOS SHARE/{}.elf", clean_prog),
-            format!("RootFS/{}", clean_prog),
         ];
 
         let mut found_path = None;
@@ -472,9 +557,10 @@ impl Widget for TerminalApp {
             cy += line_h;
         }
 
-        let prompt_prefix = format!("eos:{}$ ", self.current_dir);
-        let (pw, _) = canvas.measure_text(&prompt_prefix, font_size);
-        canvas.draw_text(self.bounds.x + pad_x, cy, &prompt_prefix, 0xFF38BDF8, font_size);
+        let prompt = self.prompt_prefix();
+        let (pw, _) = canvas.measure_text(&prompt, font_size);
+        let p_color = if self.is_root { 0xFFEF4444 } else { 0xFF38BDF8 };
+        canvas.draw_text(self.bounds.x + pad_x, cy, &prompt, p_color, font_size);
 
         let input_before_cursor = &self.input[..self.cursor_idx.min(self.input.len())];
         let (cx_offset, _) = canvas.measure_text(input_before_cursor, font_size);
@@ -490,7 +576,7 @@ impl Widget for TerminalApp {
 
         let cur_x = self.bounds.x + pad_x + pw as i32 + cx_offset as i32;
         let cursor_w = theme.pt(2.5).max(2);
-        canvas.draw_rect(cur_x, cy + theme.pt(2.0), cursor_w, line_h - theme.pt(6.0), 0xFF38BDF8, 1);
+        canvas.draw_rect(cur_x, cy + theme.pt(2.0), cursor_w, line_h - theme.pt(6.0), p_color, 1);
 
         let total_lines = self.history.len() + 1;
         let total_h = (total_lines as i32) * line_h;
@@ -569,7 +655,7 @@ impl Widget for TerminalApp {
                 if self.copy_selection() {
                     return true;
                 }
-                self.history.push((format!("eos:{}$ {}^C", self.current_dir, self.input), 0xFFF87171));
+                self.history.push((format!("{}{}^C", self.prompt_prefix(), self.input), 0xFFF87171));
                 self.input.clear();
                 self.cursor_idx = 0;
                 self.sel_start = None;

@@ -65,7 +65,23 @@ pub fn reset_core2_process() {
 }
 
 pub fn validate_user_range(ptr: u64, len: usize) -> bool {
-    ptr != 0 && ptr.checked_add(len as u64).map_or(false, |end| end < 0x0000_8000_0000_0000)
+    if ptr == 0 || len == 0 { return false; }
+    let end = match ptr.checked_add(len as u64) {
+        Some(e) => e,
+        None => return false,
+    };
+    if end >= 0x0000_8000_0000_0000 { return false; }
+
+    let start_page = ptr & !0xFFF;
+    let end_page = (end + 0xFFF) & !0xFFF;
+    let cr3 = crate::mm::paging::read_cr3() & 0x000F_FFFF_FFFF_F000;
+
+    let mut curr = start_page;
+    while curr < end_page {
+        if !crate::mm::paging::is_user_mapped(cr3, curr) { return false; }
+        curr += 4096;
+    }
+    true
 }
 
 pub fn copy_from_user(dst: &mut [u8], src: u64, len: usize) -> Result<(), ()> {
@@ -168,7 +184,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             if fd < 64 {
                 let proc = get_current_process();
                 if let Some(file) = &mut proc.fd_table[fd] {
-                    match &file.source {
+                    match &mut file.source {
                         crate::task::FileSource::Memory(bytes) => {
                             let remain = bytes.len().saturating_sub(file.offset);
                             let to_copy = remain.min(frame.rdx as usize);
@@ -177,6 +193,32 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                                     file.offset += to_copy; frame.rax = to_copy as u64;
                                 } else { frame.rax = -14i64 as u64; }
                             } else { frame.rax = 0; }
+                        },
+                        crate::task::FileSource::Pipe { id, is_read } => {
+                            if !*is_read { frame.rax = -9i64 as u64; return; }
+                            crate::task::PIPE_LOCK.lock();
+                            if let Some(pipe) = unsafe { &mut crate::task::PIPE_REGISTRY[*id] } {
+                                let to_read = core::cmp::min(pipe.data.len(), frame.rdx as usize);
+                                if to_read > 0 {
+                                    let mut buf = alloc::vec![0u8; to_read];
+                                    for i in 0..to_read {
+                                        buf[i] = pipe.data.pop_front().unwrap();
+                                    }
+                                    crate::task::PIPE_LOCK.unlock();
+                                    if copy_to_user(frame.rsi, &buf).is_ok() {
+                                        frame.rax = to_read as u64;
+                                    } else {
+                                        frame.rax = -14i64 as u64;
+                                    }
+                                } else {
+                                    crate::task::PIPE_LOCK.unlock();
+                                    if pipe.closed { frame.rax = 0; }
+                                    else { crate::task::yield_now(); frame.rax = -11i64 as u64; }
+                                }
+                            } else {
+                                crate::task::PIPE_LOCK.unlock();
+                                frame.rax = -9i64 as u64;
+                            }
                         },
                         _ => { frame.rax = -38i64 as u64; }
                     }
@@ -198,16 +240,41 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                         frame.rax = -9i64 as u64;
                         return;
                     }
-                    if let crate::task::FileSource::Memory(ref mut bytes) = file.source {
-                        let mut buf = alloc::vec![0u8; frame.rdx as usize];
-                        if copy_from_user(&mut buf, frame.rsi, frame.rdx as usize).is_ok() {
-                            if file.offset + buf.len() > bytes.len() { bytes.resize(file.offset + buf.len(), 0); }
-                            bytes[file.offset..file.offset+buf.len()].copy_from_slice(&buf);
-                            file.offset += buf.len();
-                            file.is_dirty = true;
-                            frame.rax = buf.len() as u64;
-                        } else { frame.rax = -14i64 as u64; }
-                    } else { frame.rax = -9i64 as u64; }
+                    match &mut file.source {
+                        crate::task::FileSource::Memory(bytes) => {
+                            let mut buf = alloc::vec![0u8; frame.rdx as usize];
+                            if copy_from_user(&mut buf, frame.rsi, frame.rdx as usize).is_ok() {
+                                if file.offset + buf.len() > bytes.len() { bytes.resize(file.offset + buf.len(), 0); }
+                                bytes[file.offset..file.offset+buf.len()].copy_from_slice(&buf);
+                                file.offset += buf.len();
+                                file.is_dirty = true;
+                                frame.rax = buf.len() as u64;
+                            } else { frame.rax = -14i64 as u64; }
+                        },
+                        crate::task::FileSource::Pipe { id, is_read } => {
+                            if *is_read { frame.rax = -9i64 as u64; return; }
+                            let mut buf = alloc::vec![0u8; frame.rdx as usize];
+                            if copy_from_user(&mut buf, frame.rsi, frame.rdx as usize).is_ok() {
+                                crate::task::PIPE_LOCK.lock();
+                                if let Some(pipe) = unsafe { &mut crate::task::PIPE_REGISTRY[*id] } {
+                                    if pipe.closed {
+                                        crate::task::PIPE_LOCK.unlock();
+                                        frame.rax = -32i64 as u64;
+                                    } else {
+                                        pipe.data.extend(buf.into_iter());
+                                        crate::task::PIPE_LOCK.unlock();
+                                        frame.rax = frame.rdx;
+                                    }
+                                } else {
+                                    crate::task::PIPE_LOCK.unlock();
+                                    frame.rax = -9i64 as u64;
+                                }
+                            } else {
+                                frame.rax = -14i64 as u64;
+                            }
+                        },
+                        _ => { frame.rax = -9i64 as u64; }
+                    }
                 } else { frame.rax = -9i64 as u64; }
             } else { frame.rax = -9i64 as u64; }
         }
@@ -221,6 +288,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 buf[len as usize] = b[0]; len += 1;
             }
             let path = core::str::from_utf8(&buf[..len as usize]).unwrap_or("").trim();
+            let clean_path = path.trim_matches('/');
 
             let o_accmode = flags & 3;
             let o_wronly = o_accmode == 1;
@@ -235,7 +303,16 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             let mut src = crate::task::FileSource::Memory(alloc::vec![]);
             let mut init_offset = 0usize;
 
-            if is_dir_req {
+            if clean_path == "dev/urandom" || clean_path == "dev/random" {
+                let mut rand_bytes = alloc::vec![0u8; 1024];
+                let mut r = pit::read_tsc();
+                for b in rand_bytes.iter_mut() {
+                    *b = (r & 0xFF) as u8;
+                    r = r.wrapping_mul(6364136223846793005).wrapping_add(1);
+                }
+                src = crate::task::FileSource::Memory(rand_bytes);
+                opened = true;
+            } else if is_dir_req {
                 if let Ok(items) = crate::fs::vfs_list_dir(path) {
                     src = crate::task::FileSource::Directory(items, 0);
                     opened = true;
@@ -284,6 +361,13 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                             let _ = crate::fs::vfs_save_text_file(&file.path, bytes);
                         }
                     }
+                    if let crate::task::FileSource::Pipe { id, .. } = file.source {
+                        crate::task::PIPE_LOCK.lock();
+                        if let Some(pipe) = unsafe { &mut crate::task::PIPE_REGISTRY[id] } {
+                            pipe.closed = true;
+                        }
+                        crate::task::PIPE_LOCK.unlock();
+                    }
                 }
                 frame.rax = 0;
             } else { frame.rax = -9i64 as u64; }
@@ -328,6 +412,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                         crate::task::FileSource::Memory(b) => { size = b.len() as u64; mode = 0o100644; is_ok = true; },
                         crate::task::FileSource::Directory(_,_) => { size = 0; mode = 0o040755; is_ok = true; },
                         crate::task::FileSource::AtaDisk { size: s, .. } => { size = *s as u64; mode = 0o100644; is_ok = true; },
+                        crate::task::FileSource::Pipe { .. } => { size = 0; mode = 0o010600; is_ok = true; },
                     }
                 }
             }
@@ -356,7 +441,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         }
         9 => { // mmap
             let len = frame.rsi as usize; let flags = frame.r10;
-            if (flags & 0x20) != 0 {
+            if (flags & 0x20) != 0 || len > 0 {
                 let pages = (len + 0xFFF) / 4096;
                 let proc = get_current_process();
                 let vaddr = proc.mmap_bump;
@@ -394,7 +479,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     frame.rax = -14i64 as u64;
                 }
             } else {
-                frame.rax = -25i64 as u64; // ENOTTY
+                frame.rax = 0;
             }
         }
         20 => { // writev
@@ -414,122 +499,44 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = written;
             } else { frame.rax = -9i64 as u64; }
         }
-        24 => { // sched_yield
-            for _ in 0..32 { core::hint::spin_loop(); }
-            frame.rax = 0;
-        }
-        25 => { // mremap
-            let old_addr = frame.rdi;
-            let old_size = frame.rsi as usize;
-            let new_size = frame.rdx as usize;
-            if new_size > old_size {
-                let additional_bytes = new_size - old_size;
-                let additional_pages = (additional_bytes + 0xFFF) / 4096;
-                let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
-                let append_vaddr = (old_addr + old_size as u64 + 0xFFF) & !0xFFF;
-                if crate::mm::paging::map_user_pages(cur_pml4, append_vaddr, additional_pages).is_ok() {
-                    frame.rax = old_addr;
-                } else {
+        22 => { // pipe
+            let pipefd_ptr = frame.rdi;
+            if validate_user_range(pipefd_ptr, 8) {
+                if let Some((r_id, w_id)) = crate::task::create_pipe() {
                     let proc = get_current_process();
-                    let new_vaddr = proc.mmap_bump;
-                    let total_pages = (new_size + 0xFFF) / 4096;
-                    proc.mmap_bump += (total_pages * 4096) as u64;
-                    if crate::mm::paging::map_user_pages(cur_pml4, new_vaddr, total_pages).is_ok() {
-                        let mut copy_buf = alloc::vec![0u8; old_size];
-                        if copy_from_user(&mut copy_buf, old_addr, old_size).is_ok() {
-                            let _ = copy_to_user(new_vaddr, &copy_buf);
-                        }
-                        frame.rax = new_vaddr;
+                    let mut r_fd = None;
+                    let mut w_fd = None;
+                    for (i, f) in proc.fd_table.iter_mut().enumerate().skip(3) {
+                        if f.is_none() && r_fd.is_none() { r_fd = Some(i); continue; }
+                        if f.is_none() && w_fd.is_none() { w_fd = Some(i); break; }
+                    }
+                    if let (Some(r), Some(w)) = (r_fd, w_fd) {
+                        proc.fd_table[r] = Some(crate::task::FileDescriptor {
+                            path: alloc::string::String::from("pipe:read"),
+                            source: crate::task::FileSource::Pipe { id: r_id, is_read: true },
+                            offset: 0, is_writable: false, is_dirty: false,
+                        });
+                        proc.fd_table[w] = Some(crate::task::FileDescriptor {
+                            path: alloc::string::String::from("pipe:write"),
+                            source: crate::task::FileSource::Pipe { id: w_id, is_read: false },
+                            offset: 0, is_writable: true, is_dirty: false,
+                        });
+                        let fds = [(r as u32), (w as u32)];
+                        let _ = copy_to_user(pipefd_ptr, unsafe { core::slice::from_raw_parts(fds.as_ptr() as *const u8, 8) });
+                        frame.rax = 0;
                     } else {
-                        frame.rax = -12i64 as u64;
+                        frame.rax = -24i64 as u64;
                     }
+                } else {
+                    frame.rax = -23i64 as u64;
                 }
             } else {
-                frame.rax = old_addr;
+                frame.rax = -14i64 as u64;
             }
         }
-        32 => { // dup
-            let old_fd = frame.rdi as usize;
-            if old_fd < 64 {
-                let proc = get_current_process();
-                if let Some(file) = proc.fd_table[old_fd].clone() {
-                    let mut allocated = false;
-                    for (new_fd, slot) in proc.fd_table.iter_mut().enumerate().skip(3) {
-                        if slot.is_none() {
-                            *slot = Some(file);
-                            frame.rax = new_fd as u64;
-                            allocated = true;
-                            break;
-                        }
-                    }
-                    if !allocated { frame.rax = -24i64 as u64; }
-                } else { frame.rax = -9i64 as u64; }
-            } else { frame.rax = -9i64 as u64; }
-        }
-        33 => { // dup2
-            let old_fd = frame.rdi as usize;
-            let new_fd = frame.rsi as usize;
-            if old_fd < 64 && new_fd < 64 {
-                let proc = get_current_process();
-                if let Some(file) = proc.fd_table[old_fd].clone() {
-                    proc.fd_table[new_fd] = Some(file);
-                    frame.rax = new_fd as u64;
-                } else { frame.rax = -9i64 as u64; }
-            } else { frame.rax = -9i64 as u64; }
-        }
-        35 | 226 | 230 => { // nanosleep & clock_nanosleep
-            let req = if frame.rax == 230 { frame.rdx } else { frame.rdi } as *const [u64; 2];
-            if validate_user_range(req as u64, 16) {
-                let mut times = [0u64; 2];
-                if copy_from_user(unsafe { core::slice::from_raw_parts_mut(times.as_mut_ptr() as *mut u8, 16) }, req as u64, 16).is_ok() {
-                    let ms = times[0].saturating_mul(1000).saturating_add(times[1] / 1_000_000);
-                    crate::arch::x86_64::pit::sleep_ms(ms.max(1));
-                }
-            }
+        24 => { // sched_yield
+            crate::task::yield_now();
             frame.rax = 0;
-        }
-        56 => { // clone
-            let stack = frame.rsi;
-            let ptid = frame.rdx;
-            let ctid = frame.r10;
-            let tls = frame.r8;
-
-            let mut target_core = None;
-            for c in 3..8 {
-                if crate::CORE_READY[c].load(Ordering::Acquire) && !THREAD_ACTIVE[c].load(Ordering::Acquire) {
-                    target_core = Some(c);
-                    break;
-                }
-            }
-
-            if let Some(core_id) = target_core {
-                let mut entry_ip = frame.rcx;
-                if stack != 0 && validate_user_range(stack.saturating_sub(8), 8) {
-                    let mut ret_buf = [0u8; 8];
-                    if copy_from_user(&mut ret_buf, stack.saturating_sub(8), 8).is_ok() {
-                        let potential = u64::from_le_bytes(ret_buf);
-                        if potential != 0 { entry_ip = potential; }
-                    }
-                }
-
-                let cur_cr3 = read_cr3();
-                spawn_thread_on_core(core_id, ThreadSpawnContext {
-                    entry: entry_ip,
-                    user_rsp: stack,
-                    tls,
-                    ctid,
-                    cr3: cur_cr3,
-                });
-
-                if ptid != 0 && validate_user_range(ptid, 4) {
-                    let tid_val = core_id as u32;
-                    let _ = copy_to_user(ptid, &tid_val.to_ne_bytes());
-                }
-
-                frame.rax = core_id as u64;
-            } else {
-                frame.rax = -11i64 as u64;
-            }
         }
         60 => { // exit
             if cur_core == 2 {
@@ -557,53 +564,22 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = 0;
             } else { frame.rax = -14i64 as u64; }
         }
-        72 => { // fcntl
-            let cmd = frame.rsi;
-            match cmd {
-                0 => { // F_DUPFD
-                    let old_fd = frame.rdi as usize;
-                    if old_fd < 64 {
-                        let proc = get_current_process();
-                        if let Some(file) = proc.fd_table[old_fd].clone() {
-                            let mut allocated = false;
-                            for (new_fd, slot) in proc.fd_table.iter_mut().enumerate().skip(3) {
-                                if slot.is_none() {
-                                    *slot = Some(file);
-                                    frame.rax = new_fd as u64;
-                                    allocated = true;
-                                    break;
-                                }
-                            }
-                            if !allocated { frame.rax = -24i64 as u64; }
-                        } else { frame.rax = -9i64 as u64; }
-                    } else { frame.rax = -9i64 as u64; }
-                }
-                1 | 2 => frame.rax = 0,
-                3 => frame.rax = 2,
-                4 => frame.rax = 0,
-                _ => frame.rax = 0,
-            }
-        }
-        74 => { // fsync
-            let fd = frame.rdi as usize;
-            if fd < 64 {
-                let proc = get_current_process();
-                if let Some(file) = &mut proc.fd_table[fd] {
-                    if file.is_writable && file.is_dirty {
-                        if let crate::task::FileSource::Memory(ref bytes) = file.source {
-                            let _ = crate::fs::vfs_save_text_file(&file.path, bytes);
-                            file.is_dirty = false;
-                        }
-                    }
-                }
-                frame.rax = 0;
-            } else { frame.rax = -9i64 as u64; }
-        }
         79 => { // getcwd
             let buf = frame.rdi; let size = frame.rsi as usize; let cwd = b"/\0";
             if size >= cwd.len() && copy_to_user(buf, cwd).is_ok() { frame.rax = buf; } else { frame.rax = -34i64 as u64; }
         }
-        80 => { frame.rax = 0; }
+        89 => { // readlink
+            let buf = frame.rsi;
+            let bufsiz = frame.rdx as usize;
+            if bufsiz > 0 && validate_user_range(buf, 1) {
+                let dummy = b"/bin/python\0";
+                let to_copy = bufsiz.min(dummy.len());
+                let _ = copy_to_user(buf, &dummy[..to_copy]);
+                frame.rax = to_copy as u64;
+            } else {
+                frame.rax = -2i64 as u64;
+            }
+        }
         96 => { // gettimeofday
             let tv_ptr = frame.rdi;
             if validate_user_range(tv_ptr, 16) {
@@ -615,6 +591,8 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = 0;
             } else { frame.rax = -14i64 as u64; }
         }
+        102 | 104 => { frame.rax = 1000; } // getuid, getgid (march)
+        107 | 108 => { frame.rax = 1000; } // geteuid, getegid
         158 => { // arch_prctl
             match frame.rdi {
                 0x1002 => { unsafe { wrmsr(0xC0000100, frame.rsi); } frame.rax = 0; }
@@ -622,79 +600,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 _ => frame.rax = -38i64 as u64,
             }
         }
-        186 => { // gettid
-            frame.rax = cur_core as u64;
-        }
-        202 => { // futex
-            let uaddr = frame.rdi;
-            let op = frame.rsi & 0x7F;
-            let val = frame.rdx as u32;
-
-            match op {
-                0 => {
-                    if validate_user_range(uaddr, 4) {
-                        let mut current_val_buf = [0u8; 4];
-                        if copy_from_user(&mut current_val_buf, uaddr, 4).is_ok() {
-                            let cur_val = u32::from_ne_bytes(current_val_buf);
-                            if cur_val != val {
-                                frame.rax = -11i64 as u64;
-                            } else {
-                                for _ in 0..128 { core::hint::spin_loop(); }
-                                frame.rax = 0;
-                            }
-                        } else { frame.rax = -14i64 as u64; }
-                    } else { frame.rax = -14i64 as u64; }
-                }
-                1 => {
-                    frame.rax = 1;
-                }
-                _ => { frame.rax = 0; }
-            }
-        }
-        204 => { // sched_getaffinity
-            let cpusetsize = frame.rsi as usize;
-            let mask_ptr = frame.rdx;
-            if cpusetsize >= 8 && validate_user_range(mask_ptr, cpusetsize) {
-                let affinity_mask: u64 = 0x1F;
-                let _ = copy_to_user(mask_ptr, &affinity_mask.to_ne_bytes());
-                frame.rax = 8;
-            } else { frame.rax = -14i64 as u64; }
-        }
-        217 => { // getdents64
-            let fd = frame.rdi as usize; let dirp = frame.rsi; let count = frame.rdx as usize;
-            if fd < 64 {
-                let proc = get_current_process();
-                if let Some(file) = &mut proc.fd_table[fd] {
-                    match &mut file.source {
-                        crate::task::FileSource::Directory(items, off) => {
-                            let mut written = 0;
-                            let mut out_buf = alloc::vec![0u8; count];
-                            while *off < items.len() {
-                                let item = &items[*off];
-                                let name = match item { crate::fs::FsItem::Directory(n,_) => n, crate::fs::FsItem::File(n,_,_) => n };
-                                let d_type = match item { crate::fs::FsItem::Directory(_,_) => 4, _ => 8 };
-                                let name_bytes = name.as_bytes();
-                                let rec_len = (19 + name_bytes.len() + 1 + 7) & !7;
-                                if written + rec_len > count { break; }
-                                unsafe {
-                                    let out_ptr = out_buf.as_mut_ptr().add(written);
-                                    core::ptr::write_bytes(out_ptr, 0, rec_len);
-                                    core::ptr::write_unaligned(out_ptr as *mut u64, *off as u64 + 1);
-                                    core::ptr::write_unaligned(out_ptr.add(8) as *mut i64, *off as i64 + 1);
-                                    core::ptr::write_unaligned(out_ptr.add(16) as *mut u16, rec_len as u16);
-                                    core::ptr::write_unaligned(out_ptr.add(18) as *mut u8, d_type);
-                                    core::ptr::copy_nonoverlapping(name_bytes.as_ptr(), out_ptr.add(19), name_bytes.len());
-                                }
-                                written += rec_len;
-                                *off += 1;
-                            }
-                            if copy_to_user(dirp, &out_buf[..written]).is_ok() { frame.rax = written as u64; } else { frame.rax = -14i64 as u64; }
-                        }
-                        _ => frame.rax = -20i64 as u64,
-                    }
-                } else { frame.rax = -9i64 as u64; }
-            } else { frame.rax = -9i64 as u64; }
-        }
+        186 => { frame.rax = cur_core as u64; } // gettid
         218 => { // set_tid_address
             let tidptr = frame.rdi;
             THREAD_CLEAR_TID[cur_core].store(tidptr, Ordering::SeqCst);
@@ -712,11 +618,19 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             frame.rax = 0;
         }
         318 => { // getrandom
-            let mut buf = alloc::vec![0u8; frame.rsi as usize]; let mut r = pit::read_tsc();
-            for b in buf.iter_mut() { *b = (r & 0xFF) as u8; r >>= 3; }
-            if copy_to_user(frame.rdi, &buf).is_ok() { frame.rax = frame.rsi; } else { frame.rax = -14i64 as u64; }
+            let mut buf = alloc::vec![0u8; frame.rsi as usize];
+            let mut r = pit::read_tsc();
+            for b in buf.iter_mut() {
+                *b = (r & 0xFF) as u8;
+                r = r.wrapping_mul(6364136223846793005).wrapping_add(1);
+            }
+            if copy_to_user(frame.rdi, &buf).is_ok() {
+                frame.rax = frame.rsi;
+            } else {
+                frame.rax = -14i64 as u64;
+            }
         }
-        500 => { // sys_spawn_elf (Custom syscall to launch ELF via kernel on free SMP core)
+        500 => { // sys_spawn_elf
             let path_ptr = frame.rdi;
             let args_ptr = frame.rsi;
             let mut p_buf = [0u8; 128];
@@ -729,15 +643,11 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             let args_str = core::str::from_utf8(&a_buf[..args_len]).unwrap_or("");
 
             match crate::task::request_elf_execution(path_str, args_str) {
-                Ok(core_id) => {
-                    frame.rax = core_id as u64;
-                }
-                Err(_) => {
-                    frame.rax = -2i64 as u64;
-                }
+                Ok(core_id) => { frame.rax = core_id as u64; }
+                Err(_) => { frame.rax = -2i64 as u64; }
             }
         }
-        502 | 504 => { // sys_present & sys_present_rects
+        502 => { // sys_present
             let target_w = core::cmp::min(frame.r10 as usize, 1920);
             let target_h = core::cmp::min(frame.r8 as usize, 1080);
             let total_bytes = target_w * target_h * 4;
@@ -747,26 +657,8 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                         let src = frame.rdi as *const u8;
                         let dst = writer.buffer;
                         let line_bytes = target_w.min(writer.width) * 4;
-
-                        if frame.rax == 502 || frame.rdx == 0 {
-                            for y in 0..target_h.min(writer.height) {
-                                core::ptr::copy_nonoverlapping(src.add(y * target_w * 4), dst.add(y * writer.pitch), line_bytes);
-                            }
-                        } else if validate_user_range(frame.rsi, frame.rdx as usize * 16) {
-                            let rects_ptr = frame.rsi as *const u32;
-                            for i in 0..frame.rdx as usize {
-                                let rx = (*rects_ptr.add(i * 4) as usize).min(writer.width);
-                                let ry = (*rects_ptr.add(i * 4 + 1) as usize).min(writer.height);
-                                let rw = (*rects_ptr.add(i * 4 + 2) as usize).min(writer.width.saturating_sub(rx));
-                                let rh = (*rects_ptr.add(i * 4 + 3) as usize).min(writer.height.saturating_sub(ry));
-                                if rw > 0 && rh > 0 {
-                                    for cy in ry..(ry + rh) {
-                                        let s_idx = (cy * target_w + rx) * 4;
-                                        let d_idx = cy * writer.pitch + rx * 4;
-                                        core::ptr::copy_nonoverlapping(src.add(s_idx), dst.add(d_idx), rw * 4);
-                                    }
-                                }
-                            }
+                        for y in 0..target_h.min(writer.height) {
+                            core::ptr::copy_nonoverlapping(src.add(y * target_w * 4), dst.add(y * writer.pitch), line_bytes);
                         }
                     }
                 }
@@ -786,12 +678,49 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rsi = 0;
             } else { frame.rax = 0; frame.rdi = 0; frame.rsi = 0; }
         }
+        504 => { // sys_present_rects
+            let target_w = core::cmp::min(frame.r10 as usize, 1920);
+            let target_h = core::cmp::min(frame.r8 as usize, 1080);
+            let total_bytes = target_w * target_h * 4;
+            let rects_ptr = frame.rsi as *const [u32; 4];
+            let rects_len = frame.rdx as usize;
+
+            if target_w > 0 && target_h > 0 && validate_user_range(frame.rdi, total_bytes) && validate_user_range(frame.rsi, rects_len * 16) {
+                unsafe {
+                    if let Some(writer) = &mut *core::ptr::addr_of_mut!(crate::writer::WRITER) {
+                        let src = frame.rdi as *const u32;
+                        let dst = writer.buffer as *mut u32;
+                        let pitch = writer.pitch / 4;
+
+                        for i in 0..rects_len {
+                            let mut rect = [0u32; 4];
+                            if copy_from_user(core::slice::from_raw_parts_mut(rect.as_mut_ptr() as *mut u8, 16), rects_ptr as u64 + (i * 16) as u64, 16).is_ok() {
+                                let rx = rect[0] as usize;
+                                let ry = rect[1] as usize;
+                                let rw = rect[2] as usize;
+                                let rh = rect[3] as usize;
+
+                                let ex = core::cmp::min(rx + rw, target_w).min(writer.width);
+                                let ey = core::cmp::min(ry + rh, target_h).min(writer.height);
+
+                                for y in ry..ey {
+                                    let src_idx = y * target_w + rx;
+                                    let dst_idx = y * pitch + rx;
+                                    let line_len = ex - rx;
+                                    core::ptr::copy_nonoverlapping(src.add(src_idx), dst.add(dst_idx), line_len);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            frame.rax = 0;
+        }
         505 => { // sys_wait_event
             let timeout_ms = frame.rdi;
             let start_ticks = crate::arch::x86_64::pit::get_ticks();
             let mut got_event = false;
-
-            for _ in 0..10_000 {
+            loop {
                 if let Some(ev) = pop_user_event() {
                     match ev {
                         InputEvent::MouseMove { x, y } => { frame.rax = 1; frame.rdi = ((x as u32) as u64) | (((y as u32) as u64) << 32); },
@@ -801,37 +730,34 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                         InputEvent::Scroll { dy } => { frame.rax = 5; frame.rdi = dy as i64 as u64; },
                         _ => { frame.rax = 0; frame.rdi = 0; }
                     }
-                    frame.rsi = 0;
-                    got_event = true;
-                    break;
+                    frame.rsi = 0; got_event = true; break;
                 }
-
                 if timeout_ms == 0 { break; }
                 let elapsed = crate::arch::x86_64::pit::get_ticks().saturating_sub(start_ticks);
                 if timeout_ms != u64::MAX && elapsed >= timeout_ms { break; }
-
-                for _ in 0..64 {
-                    core::hint::spin_loop();
-                }
+                crate::task::yield_now();
             }
-
             if !got_event { frame.rax = 0; frame.rdi = 0; frame.rsi = 0; }
         }
         512 => { // sys_net_tx
-            if validate_user_range(frame.rdi, frame.rsi as usize) {
-                let mut buf = alloc::vec![0u8; frame.rsi as usize];
-                if copy_from_user(&mut buf, frame.rdi, frame.rsi as usize).is_ok() {
+            let data_ptr = frame.rdi;
+            let len = frame.rsi as usize;
+            if len > 0 && validate_user_range(data_ptr, len) {
+                let mut buf = alloc::vec![0u8; len];
+                if copy_from_user(&mut buf, data_ptr, len).is_ok() {
                     crate::net::enqueue_tx(buf);
-                    frame.rax = frame.rsi;
+                    frame.rax = len as u64;
                 } else { frame.rax = -14i64 as u64; }
             } else { frame.rax = -14i64 as u64; }
         }
         513 => { // sys_net_rx
-            if validate_user_range(frame.rdi, frame.rsi as usize) {
+            let buf_ptr = frame.rdi;
+            let max_len = frame.rsi as usize;
+            if max_len > 0 && validate_user_range(buf_ptr, max_len) {
                 if let Some(packet) = crate::net::dequeue_rx() {
-                    let len = core::cmp::min(packet.len(), frame.rsi as usize);
-                    if copy_to_user(frame.rdi, &packet[..len]).is_ok() {
-                        frame.rax = len as u64;
+                    let to_copy = core::cmp::min(packet.len(), max_len);
+                    if copy_to_user(buf_ptr, &packet[..to_copy]).is_ok() {
+                        frame.rax = to_copy as u64;
                     } else { frame.rax = -14i64 as u64; }
                 } else {
                     frame.rax = 0;
@@ -839,9 +765,10 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             } else { frame.rax = -14i64 as u64; }
         }
         514 => { // sys_net_mac
-            if validate_user_range(frame.rdi, 6) {
+            let buf_ptr = frame.rdi;
+            if validate_user_range(buf_ptr, 6) {
                 let mac = crate::net::get_mac();
-                if copy_to_user(frame.rdi, &mac).is_ok() {
+                if copy_to_user(buf_ptr, &mac).is_ok() {
                     frame.rax = 0;
                 } else { frame.rax = -14i64 as u64; }
             } else { frame.rax = -14i64 as u64; }

@@ -64,7 +64,7 @@ def create_demo_tar(user_elf_data):
         add_file("readme.txt", b"Welcome to EOS Kernel!\r\nThis file is read from TarFS.\r\n")
         if user_elf_data: add_file("user_app.elf", user_elf_data)
 
-        # تضمين مفسر CPython وحزمة المكتبة القياسية المجمعة
+        # تضمين ملفات مفسر CPython والمكتبة المضغوطة
         py_elf_path = "python.elf"
         if os.path.exists(py_elf_path):
             with open(py_elf_path, "rb") as pf:
@@ -255,116 +255,126 @@ def make_uefi_fat32_disk(img_path, files):
         f.write(disk)
 
 def make_ext2_disk(img_path):
-    TARGET_SIZE_MB = 512
+    TARGET_SIZE_MB = 2048 # 2 GB
     BLOCK_SIZE = 1024
-    TOTAL_BLOCKS = TARGET_SIZE_MB * 1024  # 524,288 Blocks = 512 MB
+    TOTAL_BLOCKS = TARGET_SIZE_MB * 1024
 
-    if os.path.exists(img_path) and os.path.getsize(img_path) == (TOTAL_BLOCKS * BLOCK_SIZE):
+    expected_file_size = TOTAL_BLOCKS * BLOCK_SIZE
+    if os.path.exists(img_path) and os.path.getsize(img_path) == expected_file_size:
         return
 
-    print(f"[*] Formatting 512 MB EXT2 RootFS ({img_path})...")
-    INODES_COUNT = 8192
+    print(f"[*] Formatting 2 GB Standard FHS Linux EXT2 RootFS for user 'march' ({img_path})...")
+    INODES_COUNT = 32768
     BLOCKS_PER_GROUP = 8192
     INODES_PER_GROUP = 256
     INODE_SIZE = 128
 
-    disk = bytearray(TOTAL_BLOCKS * BLOCK_SIZE)
+    HEADER_BLOCKS = 64
+    header_disk = bytearray(HEADER_BLOCKS * BLOCK_SIZE)
 
-    # 1. Superblock (Block 1, offset 1024)
+    # 1. Superblock
     sb_off = 1024
-    struct.pack_into("<I", disk, sb_off + 0, INODES_COUNT)
-    struct.pack_into("<I", disk, sb_off + 4, TOTAL_BLOCKS)
-    struct.pack_into("<I", disk, sb_off + 8, 0)
-    struct.pack_into("<I", disk, sb_off + 12, TOTAL_BLOCKS - 100)
-    struct.pack_into("<I", disk, sb_off + 16, INODES_COUNT - 15)
-    struct.pack_into("<I", disk, sb_off + 20, 1)
-    struct.pack_into("<I", disk, sb_off + 24, 0) # 1024 B
-    struct.pack_into("<I", disk, sb_off + 28, 0)
-    struct.pack_into("<I", disk, sb_off + 32, BLOCKS_PER_GROUP)
-    struct.pack_into("<I", disk, sb_off + 36, BLOCKS_PER_GROUP)
-    struct.pack_into("<I", disk, sb_off + 40, INODES_PER_GROUP)
-    struct.pack_into("<H", disk, sb_off + 56, 0xEF53)
-    struct.pack_into("<H", disk, sb_off + 58, 1)
-    struct.pack_into("<H", disk, sb_off + 62, 0)
-    struct.pack_into("<I", disk, sb_off + 76, 1)
-    struct.pack_into("<H", disk, sb_off + 84, 11)
-    struct.pack_into("<H", disk, sb_off + 88, INODE_SIZE)
+    struct.pack_into("<I", header_disk, sb_off + 0, INODES_COUNT)
+    struct.pack_into("<I", header_disk, sb_off + 4, TOTAL_BLOCKS)
+    struct.pack_into("<I", header_disk, sb_off + 8, 0)
+    struct.pack_into("<I", header_disk, sb_off + 12, TOTAL_BLOCKS - 100)
+    struct.pack_into("<I", header_disk, sb_off + 16, INODES_COUNT - 30)
+    struct.pack_into("<I", header_disk, sb_off + 20, 1)
+    struct.pack_into("<I", header_disk, sb_off + 24, 0)
+    struct.pack_into("<I", header_disk, sb_off + 28, 0)
+    struct.pack_into("<I", header_disk, sb_off + 32, BLOCKS_PER_GROUP)
+    struct.pack_into("<I", header_disk, sb_off + 36, BLOCKS_PER_GROUP)
+    struct.pack_into("<I", header_disk, sb_off + 40, INODES_PER_GROUP)
+    struct.pack_into("<H", header_disk, sb_off + 56, 0xEF53)
+    struct.pack_into("<H", header_disk, sb_off + 58, 1)
+    struct.pack_into("<I", header_disk, sb_off + 76, 1)
+    struct.pack_into("<H", header_disk, sb_off + 84, 11)
+    struct.pack_into("<H", header_disk, sb_off + 88, INODE_SIZE)
 
-    # 2. Block Group Descriptor (Block 2, offset 2048)
+    # 2. Block Group Descriptor
     bgd_off = 2048
-    struct.pack_into("<I", disk, bgd_off + 0, 3) # block bitmap
-    struct.pack_into("<I", disk, bgd_off + 4, 4) # inode bitmap
-    struct.pack_into("<I", disk, bgd_off + 8, 5) # inode table
-    struct.pack_into("<H", disk, bgd_off + 12, TOTAL_BLOCKS - 100)
-    struct.pack_into("<H", disk, bgd_off + 14, INODES_COUNT - 15)
-    struct.pack_into("<H", disk, bgd_off + 16, 2)
+    struct.pack_into("<I", header_disk, bgd_off + 0, 3)
+    struct.pack_into("<I", header_disk, bgd_off + 4, 4)
+    struct.pack_into("<I", header_disk, bgd_off + 8, 5)
+    struct.pack_into("<H", header_disk, bgd_off + 12, BLOCKS_PER_GROUP - 100)
+    struct.pack_into("<H", header_disk, bgd_off + 14, INODES_PER_GROUP - 30)
+    struct.pack_into("<H", header_disk, bgd_off + 16, 8)
 
-    # Mark allocated blocks in bitmap (0..99)
-    for b in range(100):
-        disk[(3 * BLOCK_SIZE) + (b // 8)] |= (1 << (b % 8))
+    # 3. Bitmaps
+    for b in range(64):
+        header_disk[(3 * BLOCK_SIZE) + (b // 8)] |= (1 << (b % 8))
 
-    # Mark allocated inodes (1..15)
-    for ino in range(1, 16):
-        disk[(4 * BLOCK_SIZE) + ((ino - 1) // 8)] |= (1 << ((ino - 1) % 8))
+    for ino in range(1, 31):
+        header_disk[(4 * BLOCK_SIZE) + ((ino - 1) // 8)] |= (1 << ((ino - 1) % 8))
 
     def get_inode_offset(ino):
         return (5 * BLOCK_SIZE) + ((ino - 1) * INODE_SIZE)
 
-    # Inode 2: Root Directory "/"
-    root_ino_off = get_inode_offset(2)
-    struct.pack_into("<H", disk, root_ino_off + 0, 0o040755)
-    struct.pack_into("<I", disk, root_ino_off + 4, BLOCK_SIZE)
-    struct.pack_into("<H", disk, root_ino_off + 26, 3)
-    struct.pack_into("<I", disk, root_ino_off + 28, 2)
-    struct.pack_into("<I", disk, root_ino_off + 40, 37)
+    def write_inode(ino, mode, size, block):
+        off = get_inode_offset(ino)
+        struct.pack_into("<H", header_disk, off + 0, mode)
+        struct.pack_into("<I", header_disk, off + 4, size)
+        struct.pack_into("<H", header_disk, off + 26, 1 if (mode & 0o170000) != 0o040000 else 2)
+        struct.pack_into("<I", header_disk, off + 28, 2)
+        struct.pack_into("<I", header_disk, off + 40, block)
 
-    # Inode 11: settings.ini
+    def write_dirents(block, parent_ino, current_ino, entries):
+        cur = block * BLOCK_SIZE
+        all_entries = [(".", current_ino, 2), ("..", parent_ino, 2)] + entries
+        for idx, (name, ino, ftype) in enumerate(all_entries):
+            name_b = name.encode("ascii")
+            if idx == len(all_entries) - 1:
+                rec_len = (block * BLOCK_SIZE + BLOCK_SIZE) - cur
+            else:
+                rec_len = (8 + len(name_b) + 3) & ~3
+            struct.pack_into("<I", header_disk, cur + 0, ino)
+            struct.pack_into("<H", header_disk, cur + 4, rec_len)
+            header_disk[cur + 6] = len(name_b)
+            header_disk[cur + 7] = ftype
+            header_disk[cur + 8 : cur + 8 + len(name_b)] = name_b
+            cur += rec_len
+
+    write_inode(2, 0o040755, BLOCK_SIZE, 37)
+    write_inode(11, 0o040755, BLOCK_SIZE, 38)
+    write_inode(12, 0o040755, BLOCK_SIZE, 39)
+    write_inode(13, 0o040755, BLOCK_SIZE, 40)
+    write_inode(14, 0o040755, BLOCK_SIZE, 41)
+    write_inode(15, 0o040755, BLOCK_SIZE, 42)
+    write_inode(16, 0o040700, BLOCK_SIZE, 43)
+    write_inode(17, 0o040700, BLOCK_SIZE, 44)
+
+    # Inode 18: /home/march/.bash_history
+    write_inode(18, 0o100600, 0, 45)
+
+    # Inode 19: /home/march/.config/settings.ini
     init_settings = b"dark_mode=false\nui_scale=2\nwallpaper=\n"
-    set_ino_off = get_inode_offset(11)
-    struct.pack_into("<H", disk, set_ino_off + 0, 0o100644)
-    struct.pack_into("<I", disk, set_ino_off + 4, len(init_settings))
-    struct.pack_into("<H", disk, set_ino_off + 26, 1)
-    struct.pack_into("<I", disk, set_ino_off + 28, 8)
-    for b_idx in range(4):
-        struct.pack_into("<I", disk, set_ino_off + 40 + (b_idx * 4), 38 + b_idx)
-    disk[38 * BLOCK_SIZE : (38 * BLOCK_SIZE) + len(init_settings)] = init_settings
+    write_inode(19, 0o100644, len(init_settings), 46)
+    header_disk[46 * BLOCK_SIZE : 46 * BLOCK_SIZE + len(init_settings)] = init_settings
 
-    # Inode 12: .bash_history
-    hist_ino_off = get_inode_offset(12)
-    struct.pack_into("<H", disk, hist_ino_off + 0, 0o100644)
-    struct.pack_into("<I", disk, hist_ino_off + 4, 0)
-    struct.pack_into("<H", disk, hist_ino_off + 26, 1)
-    struct.pack_into("<I", disk, hist_ino_off + 28, 8)
-    for b_idx in range(4):
-        struct.pack_into("<I", disk, hist_ino_off + 40 + (b_idx * 4), 42 + b_idx)
+    # Inode 20: /etc/os-release
+    os_rel = b'NAME="EOS Linux"\nVERSION="0.1.0"\nID=eos\nPRETTY_NAME="EOS x86_64 Monolithic"\n'
+    write_inode(20, 0o100644, len(os_rel), 47)
+    header_disk[47 * BLOCK_SIZE : 47 * BLOCK_SIZE + len(os_rel)] = os_rel
 
-    # Root Directory Data (Block 37)
-    cur = 37 * BLOCK_SIZE
-    def add_dirent(ino, name, file_type):
-        nonlocal cur
-        name_b = name.encode("ascii")
-        rec_len = (8 + len(name_b) + 3) & ~3
-        struct.pack_into("<I", disk, cur + 0, ino)
-        struct.pack_into("<H", disk, cur + 4, rec_len)
-        disk[cur + 6] = len(name_b)
-        disk[cur + 7] = file_type
-        disk[cur + 8 : cur + 8 + len(name_b)] = name_b
-        cur += rec_len
+    # Inode 21: /etc/heroers
+    heroers = b"root ALL=(ALL:ALL) ALL\nmarch ALL=(ALL:ALL) NOPASSWD: ALL\n"
+    write_inode(21, 0o100440, len(heroers), 48)
+    header_disk[48 * BLOCK_SIZE : 48 * BLOCK_SIZE + len(heroers)] = heroers
 
-    add_dirent(2, ".", 2)
-    add_dirent(2, "..", 2)
-    add_dirent(11, "settings.ini", 1)
-
-    last_name = b".bash_history"
-    rec_len = (37 * BLOCK_SIZE + BLOCK_SIZE) - cur
-    struct.pack_into("<I", disk, cur + 0, 12)
-    struct.pack_into("<H", disk, cur + 4, rec_len)
-    disk[cur + 6] = len(last_name)
-    disk[cur + 7] = 1
-    disk[cur + 8 : cur + 8 + len(last_name)] = last_name
+    write_dirents(37, 2, 2, [
+        ("bin", 11, 2), ("etc", 12, 2), ("home", 13, 2), ("var", 14, 2), ("usr", 15, 2)
+    ])
+    write_dirents(38, 2, 11, [])
+    write_dirents(39, 2, 12, [("os-release", 20, 1), ("heroers", 21, 1)])
+    write_dirents(40, 2, 13, [("march", 16, 2)])
+    write_dirents(41, 2, 14, [])
+    write_dirents(42, 2, 15, [])
+    write_dirents(43, 13, 16, [(".config", 17, 2), (".bash_history", 18, 1)])
+    write_dirents(44, 16, 17, [("settings.ini", 19, 1)])
 
     with open(img_path, "wb") as f:
-        f.write(disk)
+        f.write(header_disk)
+        f.truncate(expected_file_size)
 
 def prepare_and_run():
     share_dir = r"C:\EOS_SHARE"

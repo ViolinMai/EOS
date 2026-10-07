@@ -6,7 +6,6 @@ pub mod tar;
 use alloc::string::String;
 use alloc::vec::Vec;
 use crate::drivers::ata::{read_entire_file, write_file_content, MediaType};
-use core::ptr::addr_of_mut;
 
 #[derive(Clone, Debug)]
 pub enum FsItem {
@@ -23,75 +22,112 @@ pub fn resolve_path(path: &str) -> String {
 
 pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
     let p = resolve_path(path);
-    crate::log_info!("VFS", "vfs_list_dir requested for path: '{}'", p);
-
     let clean = p.trim_matches('/');
+
+    crate::log_info!("VFS", "vfs_list_dir requested for path: '{}'", clean);
 
     if clean.is_empty() || clean == "." {
         crate::log_info!("VFS", "Listing Root Virtual Mounts (EOS SHARE, RootFS, Initrd)");
         return Ok(alloc::vec![
-            FsItem::Directory(String::from("EOS SHARE"), 0),
-            FsItem::Directory(String::from("RootFS"), 0),
-            FsItem::Directory(String::from("Initrd"), 0)
+            FsItem::Directory(alloc::string::String::from("EOS SHARE"), 0),
+            FsItem::Directory(alloc::string::String::from("RootFS"), 0),
+            FsItem::Directory(alloc::string::String::from("Initrd"), 0),
         ]);
     }
 
-    if clean.eq_ignore_ascii_case("EOS SHARE") {
-        crate::log_info!("VFS", "Scanning FAT root on Drive 1...");
-        let res = FAT_FS.list_dir("");
-        if let Ok(ref items) = res {
-            crate::log_info!("VFS", "FAT Root enumeration succeeded: found {} items", items.len());
+    if clean.eq_ignore_ascii_case("Initrd") {
+        crate::log_info!("VFS", "Scanning Initrd ramdisk...");
+        unsafe {
+            if let Some(archive) = &*core::ptr::addr_of_mut!(crate::fs::tar::INITRD) {
+                let mut list = alloc::vec![];
+                for f in &archive.files {
+                    let name = f.name.trim_start_matches("./").trim_start_matches("Initrd/");
+                    if !name.is_empty() && !name.contains('/') {
+                        let mtype = detect_file_media_type(name);
+                        list.push(FsItem::File(alloc::string::String::from(name), f.size, mtype));
+                    }
+                }
+                return Ok(list);
+            }
         }
-        return res;
     }
 
-    if clean.to_ascii_uppercase().starts_with("EOS SHARE/") {
-        let sub = clean[10..].trim_matches('/');
-        if sub.is_empty() {
-            return FAT_FS.list_dir("");
-        }
-        let lower = sub.to_ascii_lowercase();
-        if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".ini") || lower.ends_with(".ttf") || lower.ends_with(".otf") || lower.ends_with(".txt") {
-            return Err("Path is a regular file");
-        }
-        return FAT_FS.list_dir(sub);
-    }
-
-    let mut items = Vec::new();
-    if clean.eq_ignore_ascii_case("RootFS") || clean.to_ascii_uppercase().starts_with("ROOTFS/") {
+    if clean.eq_ignore_ascii_case("RootFS") || clean.starts_with("RootFS/") || clean.starts_with("home") || clean.starts_with("etc") || clean.starts_with("bin") || clean.starts_with("usr") || clean.starts_with("var") {
         crate::log_info!("VFS", "Scanning EXT2 RootFS on Drive 2...");
         unsafe {
             if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
-                if let Ok(entries) = fs.list_directory(2) {
-                    for (name, ino) in entries {
-                        if let Ok(inode) = fs.read_inode(ino) {
-                            let is_dir = (inode.mode & 0x4000) != 0;
-                            if is_dir { items.push(FsItem::Directory(name, ino)); }
-                            else { items.push(FsItem::File(name, inode.size as usize, crate::drivers::ata::MediaType::Text)); }
+                let target_subpath = clean.strip_prefix("RootFS/").unwrap_or(clean);
+
+                if target_subpath.is_empty() || target_subpath.eq_ignore_ascii_case("RootFS") {
+                    if let Ok(entries) = fs.list_directory(2) {
+                        let mut items = alloc::vec![];
+                        for (name, ino) in entries {
+                            if name != "." && name != ".." && name != "lost+found" {
+                                if let Ok(target_inode) = fs.read_inode(ino) {
+                                    let is_dir = (target_inode.mode & 0o170000) == 0o040000;
+                                    if is_dir {
+                                        items.push(FsItem::Directory(name, 0));
+                                    } else {
+                                        let mtype = detect_file_media_type(&name);
+                                        items.push(FsItem::File(name, target_inode.size as usize, mtype));
+                                    }
+                                }
+                            }
                         }
+                        return Ok(items);
+                    }
+                }
+
+                let parts: alloc::vec::Vec<&str> = target_subpath.split('/').filter(|s| !s.is_empty()).collect();
+                let mut current_ino = 2u32;
+                let mut found_target = true;
+
+                for part in parts {
+                    if let Ok(entries) = fs.list_directory(current_ino) {
+                        if let Some((_, next_ino)) = entries.iter().find(|(n, _)| n.eq_ignore_ascii_case(part)) {
+                            current_ino = *next_ino;
+                        } else {
+                            found_target = false;
+                            break;
+                        }
+                    } else {
+                        found_target = false;
+                        break;
+                    }
+                }
+
+                if found_target {
+                    if let Ok(entries) = fs.list_directory(current_ino) {
+                        let mut items = alloc::vec![];
+                        for (name, ino) in entries {
+                            if name != "." && name != ".." {
+                                if let Ok(target_inode) = fs.read_inode(ino) {
+                                    let is_dir = (target_inode.mode & 0o170000) == 0o040000;
+                                    if is_dir {
+                                        items.push(FsItem::Directory(name, 0));
+                                    } else {
+                                        let mtype = detect_file_media_type(&name);
+                                        items.push(FsItem::File(name, target_inode.size as usize, mtype));
+                                    }
+                                }
+                            }
+                        }
+                        return Ok(items);
                     }
                 }
             }
         }
-        return Ok(items);
-    } else if clean.eq_ignore_ascii_case("Initrd") || clean.to_ascii_uppercase().starts_with("INITRD/") {
-        crate::log_info!("VFS", "Scanning Initrd ramdisk...");
-        unsafe {
-            if let Some(archive) = &*core::ptr::addr_of_mut!(crate::fs::tar::INITRD) {
-                for f in &archive.files {
-                    items.push(FsItem::File(f.name.clone(), f.size, crate::drivers::ata::MediaType::Text));
-                }
-            }
+    }
+
+    if clean.to_ascii_uppercase().starts_with("EOS SHARE") {
+        crate::log_info!("VFS", "Scanning FAT root on Drive 1...");
+        let fat_sub = clean.strip_prefix("EOS SHARE/").unwrap_or("");
+        if let Ok(items) = FAT_FS.list_dir(fat_sub) {
+            return Ok(items);
         }
-        return Ok(items);
     }
 
-    let lower = clean.to_ascii_lowercase();
-    if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".ini") || lower.ends_with(".ttf") || lower.ends_with(".otf") || lower.ends_with(".txt") {
-        return Err("Path is a regular file");
-    }
-
-    FAT_FS.list_dir(clean)
+    Err("Directory not found")
 }
 
 pub fn vfs_stat(path: &str) -> Result<(u64, u32), &'static str> {
@@ -126,35 +162,53 @@ pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
     let p = resolve_path(path);
     let clean = p.trim_matches('/');
 
-    // 1. ملف الإعدادات الدائم
-    if is_settings_file(&p) {
+    if clean == "home/march/.config/settings.ini" || is_settings_file(&p) {
         unsafe {
-            if let Some(fs) = &*addr_of_mut!(crate::fs::ext2::EXT2_FS) {
+            if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
+                if let Ok(inode) = fs.read_inode(19) {
+                    if let Ok(bytes) = fs.read_file_data(&inode) { return Ok(bytes); }
+                }
                 if let Ok(inode) = fs.read_inode(11) {
-                    if let Ok(bytes) = fs.read_file_data(&inode) {
-                        return Ok(bytes);
-                    }
+                    if let Ok(bytes) = fs.read_file_data(&inode) { return Ok(bytes); }
                 }
             }
         }
     }
 
-    // 2. سجل الأوامر الدائم (.bash_history في EXT2 Inode 12)
-    if clean.eq_ignore_ascii_case(".bash_history") || clean.eq_ignore_ascii_case("RootFS/.bash_history") {
+    if clean == "home/march/.bash_history" || clean.ends_with(".bash_history") {
         unsafe {
-            if let Some(fs) = &*addr_of_mut!(crate::fs::ext2::EXT2_FS) {
+            if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
+                if let Ok(inode) = fs.read_inode(18) {
+                    if let Ok(bytes) = fs.read_file_data(&inode) { return Ok(bytes); }
+                }
                 if let Ok(inode) = fs.read_inode(12) {
-                    if let Ok(bytes) = fs.read_file_data(&inode) {
-                        return Ok(bytes);
-                    }
+                    if let Ok(bytes) = fs.read_file_data(&inode) { return Ok(bytes); }
                 }
             }
         }
     }
 
-    // 3. فحص Initrd (Ramdisk) مع إزالة أي بادئات مسار
+    if clean == "etc/os-release" {
+        unsafe {
+            if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
+                if let Ok(inode) = fs.read_inode(20) {
+                    if let Ok(bytes) = fs.read_file_data(&inode) { return Ok(bytes); }
+                }
+            }
+        }
+    }
+    if clean == "etc/heroers" || clean == "etc/sudoers" {
+        unsafe {
+            if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
+                if let Ok(inode) = fs.read_inode(21) {
+                    if let Ok(bytes) = fs.read_file_data(&inode) { return Ok(bytes); }
+                }
+            }
+        }
+    }
+
     unsafe {
-        if let Some(archive) = &*addr_of_mut!(crate::fs::tar::INITRD) {
+        if let Some(archive) = &*core::ptr::addr_of_mut!(crate::fs::tar::INITRD) {
             let bare_name = clean.split('/').last().unwrap_or(clean);
             for f in &archive.files {
                 let f_bare = f.name.split('/').last().unwrap_or(&f.name);
@@ -165,9 +219,8 @@ pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
         }
     }
 
-    // 4. فحص RootFS (قرص EXT2)
     unsafe {
-        if let Some(fs) = &*addr_of_mut!(crate::fs::ext2::EXT2_FS) {
+        if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
             if let Ok(entries) = fs.list_directory(2) {
                 let check_name = clean.strip_prefix("RootFS/").unwrap_or(clean);
                 if let Some((_, ino)) = entries.iter().find(|(n, _)| n.eq_ignore_ascii_case(check_name)) {
@@ -179,7 +232,6 @@ pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
         }
     }
 
-    // 5. فحص EOS SHARE (Drive 1 FAT)
     if clean.to_ascii_uppercase().starts_with("EOS SHARE/") || clean.eq_ignore_ascii_case("EOS SHARE") || !clean.contains('/') {
         let fat_path = clean.strip_prefix("EOS SHARE/").unwrap_or(clean);
         if let Ok(bytes) = FAT_FS.read_bytes(fat_path) {
@@ -192,23 +244,23 @@ pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
 
 pub fn vfs_save_text_file(filename: &str, content: &[u8]) -> Result<(), &'static str> {
     let p = resolve_path(filename);
+    let clean = p.trim_matches('/');
     crate::log_info!("VFS", "vfs_save_text_file invoked for '{}' ({} bytes)", p, content.len());
 
-    if is_settings_file(&p) {
+    if clean == "home/march/.config/settings.ini" || is_settings_file(&p) {
         unsafe {
             if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
-                crate::log_info!("EXT2", "Persisting settings ({} bytes) to Inode 11...", content.len());
+                let _ = fs.write_file_data(19, content);
                 let _ = fs.write_file_data(11, content);
                 return Ok(());
             }
         }
     }
 
-    let clean = p.trim_matches('/');
-    if clean.eq_ignore_ascii_case(".bash_history") || clean.eq_ignore_ascii_case("RootFS/.bash_history") {
+    if clean == "home/march/.bash_history" || clean.ends_with(".bash_history") {
         unsafe {
             if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
-                crate::log_info!("EXT2", "Persisting history ({} bytes) to Inode 12...", content.len());
+                let _ = fs.write_file_data(18, content);
                 let _ = fs.write_file_data(12, content);
                 return Ok(());
             }
@@ -307,4 +359,25 @@ pub fn is_settings_file(path: &str) -> bool {
         || clean.eq_ignore_ascii_case("EOS SHARE/settings.ini")
         || clean.ends_with("/settings.ini")
         || clean.ends_with("settings.ini")
+}
+
+pub fn is_protected_system_path(path: &str) -> bool {
+    let clean = path.trim_matches('/');
+    if clean.starts_with("home/march") || clean.starts_with("tmp") || clean.starts_with("var/log") {
+        return false;
+    }
+    true
+}
+
+pub fn detect_file_media_type(name: &str) -> MediaType {
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".png") || lower.ends_with(".bmp") || lower.ends_with(".vec") {
+        MediaType::Image
+    } else if lower.ends_with(".txt") || lower.ends_with(".ini") || lower.ends_with(".log") || lower.ends_with(".conf") {
+        MediaType::Text
+    } else if lower.ends_with(".elf") || lower.ends_with(".bin") {
+        MediaType::Executable
+    } else {
+        MediaType::Unknown
+    }
 }

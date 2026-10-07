@@ -4,7 +4,7 @@ use crate::arch::x86_64::gdt::KERNEL_CODE_SELECTOR;
 use crate::{log_info, log_error, log_fatal, log_warn};
 use core::ptr::addr_of_mut;
 use alloc::string::String;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::AtomicBool;
 
 pub static mut IDT: InterruptDescriptorTable = InterruptDescriptorTable::new();
 static mut PENDING_COMMAND: Option<String> = None;

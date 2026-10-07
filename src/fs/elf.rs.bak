@@ -126,6 +126,22 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
     let stack_start = USER_STACK_TOP - (stack_pages * 4096);
     crate::mm::paging::map_user_pages(new_pml4_phys, stack_start, stack_pages as usize)?;
 
+    // تخصيص صفحة خاصة لـ Thread Local Storage (TLS / FS_BASE)
+    let tls_vaddr = 0x00007fffffff0000u64;
+    crate::mm::paging::map_user_pages(new_pml4_phys, tls_vaddr, 2)?;
+
+    // تهيئة بنية الـ TCB الخاصة بـ x86_64: أول 8 بايت تشير إلى عنوانها نفسه
+    unsafe {
+        let p4_idx = ((tls_vaddr >> 39) & 0x1FF) as usize; let p3_idx = ((tls_vaddr >> 30) & 0x1FF) as usize;
+        let p2_idx = ((tls_vaddr >> 21) & 0x1FF) as usize; let p1_idx = ((tls_vaddr >> 12) & 0x1FF) as usize;
+        let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let tls_base = (pt2.entries[p1_idx].physical_address() + vmm.hhdm_offset) as *mut u64;
+        core::ptr::write_bytes(tls_base as *mut u8, 0, 4096);
+        *tls_base = tls_vaddr; // Self-pointer: FS:[0] == tls_vaddr
+    }
+
     let mut args: Vec<&str> = Vec::new();
     if args_str.is_empty() {
         args.push("python");
@@ -139,6 +155,7 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         "PATH=/bin:/usr/bin",
         "PYTHONHOME=/",
         "PYTHONPATH=/python312.zip:/lib/python312.zip",
+        "PYTHONUNBUFFERED=1",
         "TERM=xterm-256color",
     ];
 
@@ -155,7 +172,6 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
 
         core::ptr::write_bytes(stack_base, 0, 4096);
 
-        // وضع نصوص الـ argv والـ envp في أعلى الصفحة (Top of page)
         let mut string_cursor = 4096 - 16;
         let mut arg_pointers: Vec<u64> = Vec::new();
         for arg in &args {
@@ -175,7 +191,6 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
             env_pointers.push(user_rsp_page + string_cursor as u64);
         }
 
-        // بناء مصفوفة المكدس وفق معيار System V بدقة
         let mut entries: Vec<u64> = Vec::new();
         entries.push(arg_pointers.len() as u64); // argc
         for ptr in arg_pointers {
@@ -200,12 +215,7 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         entries.push(9);  entries.push(entry_point);                  // AT_ENTRY
         entries.push(0);  entries.push(0);                            // AT_NULL
 
-        // محاذاة System V ABI:
-        // يجب أن يكون [rsp] هو مكان argc، مع (RSP % 16 == 0)
-        let total_bytes = entries.len() * 8;
-        // نختار موقعاً محاذياً لـ 16 بايت في منتصف الصفحة
-        let aligned_offset = (0x800usize - (total_bytes % 16)) & !0xF;
-
+        let aligned_offset = 0x800usize;
         let stack_dst = stack_base.add(aligned_offset) as *mut u64;
         core::ptr::copy_nonoverlapping(entries.as_ptr(), stack_dst, entries.len());
 
@@ -223,12 +233,13 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
 
     unsafe {
         crate::arch::x86_64::fpu::enable_sse();
-        // حجب استثناءات الـ SIMD
         let mxcsr: u32 = 0x1F80;
         core::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr, options(nostack));
 
-        crate::arch::x86_64::syscall::wrmsr(0xC0000100, 0);
+        // ضبط FS_BASE إلى مساحة الـ TLS الصالحة بدلاً من 0 لمنع #GP
+        crate::arch::x86_64::syscall::wrmsr(0xC0000100, tls_vaddr);
         crate::arch::x86_64::syscall::wrmsr(0xC0000101, 0);
+
         jump_to_ring3(entry_point, user_rsp, USER_CODE_SELECTOR as u64, USER_DATA_SELECTOR as u64, spawn_rsp_ptr, new_pml4_phys);
         core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3);
         free_user_pages(new_pml4_phys);

@@ -290,7 +290,6 @@ impl<'a> FrameworkApp<'a> {
 
                 self.update_cursor_state(x, y);
 
-                // Handle Window Dragging & Resizing Safely
                 if let Some(idx) = self.captured_window_idx {
                     if idx < self.root_widgets.len() {
                         if let Some(frame) = self.root_widgets[idx].as_any_mut().downcast_mut::<WindowFrame>() {
@@ -515,7 +514,6 @@ impl<'a> FrameworkApp<'a> {
                 self.request_full_redraw();
             }
 
-            // Cleanup closed windows cleanly
             let mut removed = Vec::new();
             for (idx, w) in self.root_widgets.iter().enumerate() {
                 if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {

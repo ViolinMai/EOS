@@ -1,131 +1,198 @@
 use crate::framework::*;
 use std::fs;
-use std::collections::HashMap;
 
 #[derive(Clone, Debug)]
-pub struct FinderEntry {
+pub struct ExplorerItem {
     pub name: String,
     pub is_dir: bool,
     pub size: usize,
+    pub ext: String,
 }
 
 pub struct FinderApp {
-    pub bounds: Rect,
-    pub current_path: String,
-    pub entries: Vec<FinderEntry>,
-    pub selected_idx: Option<usize>,
-    pub scroll_y: i32,
-    pub status_label: String,
+    bounds: Rect,
+    current_path: String,
+    history: Vec<String>,
+    history_idx: usize,
+    items: Vec<ExplorerItem>,
+    filtered_items: Vec<ExplorerItem>,
+    selected_idx: Option<usize>,
+    scroll_y: i32,
+    search_query: String,
+    is_searching: bool,
+    status_msg: String,
+    pub pending_open_text: Option<String>,
     pub pending_open_image: Option<(String, String)>,
-    pub thumb_cache: HashMap<String, (Vec<u32>, usize, usize)>,
 }
 
 impl FinderApp {
     pub fn new() -> Self {
         let mut app = Self {
             bounds: Rect::default(),
-            current_path: String::from("EOS SHARE"),
-            entries: Vec::new(),
+            current_path: "RootFS".into(),
+            history: vec!["RootFS".into()],
+            history_idx: 0,
+            items: Vec::new(),
+            filtered_items: Vec::new(),
             selected_idx: None,
             scroll_y: 0,
-            status_label: String::from("Ready"),
+            search_query: String::new(),
+            is_searching: false,
+            status_msg: "Ready".into(),
+            pending_open_text: None,
             pending_open_image: None,
-            thumb_cache: HashMap::new(),
         };
-        app.load_directory("EOS SHARE");
+        app.load_directory();
         app
     }
 
-    pub fn load_directory(&mut self, path: &str) {
-        let clean = path.trim().trim_matches('/');
-        let target_path = if clean.is_empty() {
-            String::from("EOS SHARE")
-        } else {
-            clean.to_string()
-        };
-
-        self.entries.clear();
+    pub fn load_directory(&mut self) {
+        self.items.clear();
         self.selected_idx = None;
         self.scroll_y = 0;
 
-        let mut read_success = false;
-        let candidates = [
-            target_path.clone(),
-            format!("/{}", target_path),
-            format!("{}/", target_path),
-        ];
+        let clean = self.current_path.trim().trim_matches('/');
+        let candidates = if clean.is_empty() || clean == "." {
+            vec![
+                ".".to_string(),
+                "/".to_string(),
+                "RootFS".to_string(),
+                "/RootFS".to_string(),
+            ]
+        } else {
+            vec![
+                clean.to_string(),
+                format!("/{}", clean),
+                format!("{}/", clean),
+                format!("/RootFS/{}", clean),
+                format!("RootFS/{}", clean),
+            ]
+        };
 
-        for p in &candidates {
-            if let Ok(read_dir) = fs::read_dir(p) {
-                for entry in read_dir.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string();
+        let mut success = false;
+        for cand in &candidates {
+            if let Ok(entries) = fs::read_dir(cand) {
+                let mut found_any = false;
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
                     if name == "." || name == ".." { continue; }
-                    let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
-
-                    let size = if is_dir {
-                        0
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let full_item_path = format!("{}/{}", cand.trim_end_matches('/'), name);
+                    let size = if is_dir { 0 } else { fs::metadata(&full_item_path).map(|m| m.len() as usize).unwrap_or(0) };
+                    let ext = if is_dir {
+                        "Folder".to_string()
                     } else {
-                        let full_file_path = format!("{}/{}", p.trim_end_matches('/'), name);
-                        fs::metadata(&full_file_path)
-                            .map(|m| m.len() as usize)
-                            .unwrap_or(0)
+                        name.rsplit('.').next().unwrap_or("File").to_uppercase()
                     };
-
-                    self.entries.push(FinderEntry { name, is_dir, size });
+                    self.items.push(ExplorerItem { name, is_dir, size, ext });
+                    found_any = true;
                 }
-                read_success = true;
-                break;
+                if found_any {
+                    success = true;
+                    break;
+                }
             }
         }
 
-        self.current_path = target_path;
-
-        if self.current_path.contains('/') || (self.current_path != "EOS SHARE" && self.current_path != "RootFS" && self.current_path != "Initrd") {
-            self.entries.insert(0, FinderEntry {
-                name: String::from(".."),
-                is_dir: true,
-                size: 0,
-            });
+        // إذا كان المجلد الرئيسي فارغاً في الـ root، إضافة وحدات التخزين الافتراضية
+        if !success && (clean.is_empty() || clean == ".") {
+            self.items.push(ExplorerItem { name: "RootFS".into(), is_dir: true, size: 0, ext: "Folder".into() });
+            self.items.push(ExplorerItem { name: "EOS SHARE".into(), is_dir: true, size: 0, ext: "Folder".into() });
+            self.items.push(ExplorerItem { name: "Initrd".into(), is_dir: true, size: 0, ext: "Folder".into() });
+            success = true;
         }
 
-        self.entries.sort_by(|a, b| {
-            if a.name == ".." {
+        self.items.sort_by(|a, b| {
+            if a.is_dir == b.is_dir {
+                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+            } else if a.is_dir {
                 std::cmp::Ordering::Less
-            } else if b.name == ".." {
-                std::cmp::Ordering::Greater
             } else {
-                b.is_dir.cmp(&a.is_dir).then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+                std::cmp::Ordering::Greater
             }
         });
 
-        self.status_label = if read_success {
-            format!("{} items in /{}", self.entries.len(), self.current_path)
+        self.apply_filter();
+
+        if success {
+            self.status_msg = format!("{} items | Path: /{}", self.filtered_items.len(), clean);
         } else {
-            format!("Empty or unavailable folder (/{}).", self.current_path)
-        };
+            self.status_msg = format!("Empty or unavailable folder (/{}).", clean);
+        }
     }
 
-    fn open_entry(&mut self, idx: usize) {
-        if idx >= self.entries.len() { return; }
-        let entry = self.entries[idx].clone();
-
-        if entry.is_dir {
-            if entry.name == ".." {
-                if let Some(pos) = self.current_path.rfind('/') {
-                    let parent = self.current_path[..pos].to_string();
-                    self.load_directory(&parent);
-                } else {
-                    self.load_directory("EOS SHARE");
-                }
-            } else {
-                let next_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
-                self.load_directory(&next_path);
-            }
+    fn apply_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.filtered_items = self.items.clone();
         } else {
-            let lower = entry.name.to_lowercase();
-            if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-                let full_path = format!("{}/{}", self.current_path.trim_end_matches('/'), entry.name);
-                self.pending_open_image = Some((entry.name.clone(), full_path));
+            let q = self.search_query.to_lowercase();
+            self.filtered_items = self.items
+                .iter()
+                .filter(|it| it.name.to_lowercase().contains(&q))
+                .cloned()
+                .collect();
+        }
+    }
+
+    pub fn navigate_to(&mut self, path: &str) {
+        let clean = path.trim().trim_matches('/');
+        if self.current_path == clean { return; }
+        if self.history_idx + 1 < self.history.len() {
+            self.history.truncate(self.history_idx + 1);
+        }
+        self.history.push(clean.to_string());
+        self.history_idx = self.history.len() - 1;
+        self.current_path = clean.to_string();
+        self.load_directory();
+    }
+
+    pub fn navigate_back(&mut self) {
+        if self.history_idx > 0 {
+            self.history_idx -= 1;
+            self.current_path = self.history[self.history_idx].clone();
+            self.load_directory();
+        }
+    }
+
+    pub fn navigate_forward(&mut self) {
+        if self.history_idx + 1 < self.history.len() {
+            self.history_idx += 1;
+            self.current_path = self.history[self.history_idx].clone();
+            self.load_directory();
+        }
+    }
+
+    pub fn navigate_up(&mut self) {
+        let clean = self.current_path.trim_matches('/');
+        if let Some(pos) = clean.rfind('/') {
+            let parent = clean[..pos].to_string();
+            self.navigate_to(&parent);
+        } else if !clean.is_empty() && clean != "." {
+            self.navigate_to(".");
+        }
+    }
+
+    fn open_item(&mut self, item: &ExplorerItem) {
+        let clean_cur = self.current_path.trim_matches('/');
+        if item.is_dir {
+            let next_path = if clean_cur.is_empty() || clean_cur == "." {
+                item.name.clone()
+            } else {
+                format!("{}/{}", clean_cur, item.name)
+            };
+            self.navigate_to(&next_path);
+        } else {
+            let full_path = if clean_cur.is_empty() || clean_cur == "." {
+                item.name.clone()
+            } else {
+                format!("{}/{}", clean_cur, item.name)
+            };
+
+            let lower = item.name.to_lowercase();
+            if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".bmp") {
+                self.pending_open_image = Some((item.name.clone(), full_path));
+            } else {
+                self.pending_open_text = Some(full_path);
             }
         }
     }
@@ -142,150 +209,257 @@ impl Widget for FinderApp {
 
     fn paint(&self, canvas: &mut Canvas) {
         let theme = get_theme();
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, 0);
+        // True Dark Mode Palette (No blue tint, pure dark charcoal & slate)
+        let bg_main = 0xFF121215;      // داكن نقي
+        let bg_side = 0xFF0D0D10;      // شريط جانبي أغمق
+        let bg_bar = 0xFF18181D;       // شريط أدوات محايد
+        let border_c = 0xFF27272E;     // حدود داكنة رقيقة
+        let font_body = theme.font_body();
+        let font_cap = theme.font_caption();
 
-        let tb_h = theme.pt(40.0);
-        let sb_h = theme.pt(26.0);
+        // 1. الخلفية العامة
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, bg_main, 0);
 
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, 0);
-        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
+        // 2. شريط الأدوات العلوي
+        let tb_h = theme.pt(42.0);
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, bg_bar, 0);
+        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, border_c);
 
-        let favorites = [("Root", "EOS SHARE"), ("RootFS", "RootFS"), ("Initrd", "Initrd")];
-        let mut fav_x = self.bounds.x + theme.pt(12.0);
-        for &(label, target) in &favorites {
-            let btn_w = theme.pt(58.0);
-            let is_cur = self.current_path == target || (target == "EOS SHARE" && self.current_path.starts_with("EOS SHARE/"));
-            let bg_c = if is_cur { theme.accent } else { 0xFF27272A }; // داكن محايد خالي من الأزرق
-            canvas.draw_rect(fav_x, self.bounds.y + theme.pt(7.0), btn_w, theme.pt(26.0), bg_c, theme.pt(5.0) as usize);
-            let (tw, th) = canvas.measure_text(label, theme.font_caption());
-            canvas.draw_text(fav_x + (btn_w - tw as i32) / 2, self.bounds.y + theme.pt(7.0) + (theme.pt(26.0) - th as i32) / 2, label, 0xFFFFFFFF, theme.font_caption());
-            fav_x += btn_w + theme.pt(8.0);
-        }
+        let btn_w = theme.pt(28.0);
+        let btn_h = theme.pt(26.0);
+        let btn_y = self.bounds.y + theme.pt(8.0);
 
-        let path_text = format!("Location: /{}", self.current_path);
-        canvas.draw_text_clipped(fav_x + theme.pt(8.0), self.bounds.y + theme.pt(11.0), self.bounds.w - (fav_x - self.bounds.x) - theme.pt(16.0), &path_text, theme.text_primary, theme.font_body());
+        let can_back = self.history_idx > 0;
+        let can_fwd = self.history_idx + 1 < self.history.len();
+        let c_back = if can_back { 0xFFE4E4E7 } else { 0xFF52525B };
+        let c_fwd = if can_fwd { 0xFFE4E4E7 } else { 0xFF52525B };
 
-        let list_y = self.bounds.y + tb_h + 1;
-        let list_h = (self.bounds.h - tb_h - sb_h - 1).max(0);
-        canvas.push_clip(Rect::new(self.bounds.x, list_y, self.bounds.w, list_h));
+        canvas.draw_rect(self.bounds.x + theme.pt(8.0), btn_y, btn_w, btn_h, 0xFF22222A, 4);
+        canvas.draw_text(self.bounds.x + theme.pt(16.0), btn_y + theme.pt(4.0), "<", c_back, font_body);
 
-        let row_h = theme.pt(34.0);
-        let mut cur_y = list_y + theme.pt(4.0) - self.scroll_y;
+        canvas.draw_rect(self.bounds.x + theme.pt(40.0), btn_y, btn_w, btn_h, 0xFF22222A, 4);
+        canvas.draw_text(self.bounds.x + theme.pt(48.0), btn_y + theme.pt(4.0), ">", c_fwd, font_body);
 
-        for (idx, entry) in self.entries.iter().enumerate() {
-            if cur_y + row_h >= list_y && cur_y <= list_y + list_h {
-                let is_sel = self.selected_idx == Some(idx);
-                let bg = if is_sel {
-                    theme.accent
-                } else if idx % 2 == 0 {
-                    theme.bg_window
-                } else {
-                    0xFF18181B // رمادي داكن نقي خالي من أي أزرق
-                };
+        canvas.draw_rect(self.bounds.x + theme.pt(72.0), btn_y, btn_w, btn_h, 0xFF22222A, 4);
+        canvas.draw_text(self.bounds.x + theme.pt(80.0), btn_y + theme.pt(4.0), "^", 0xFFE4E4E7, font_body);
 
-                canvas.draw_rect(self.bounds.x + theme.pt(4.0), cur_y, self.bounds.w - theme.pt(8.0), row_h, bg, theme.pt(4.0) as usize);
+        // شريط العنوان / المسار (Dark Charcoal Field)
+        let addr_x = self.bounds.x + theme.pt(108.0);
+        let search_w = theme.pt(150.0);
+        let addr_w = (self.bounds.w - theme.pt(120.0) - search_w).max(100);
+        canvas.draw_rect(addr_x, btn_y, addr_w, btn_h, 0xFF0D0D10, 4);
+        canvas.draw_rect_outline(addr_x, btn_y, addr_w, btn_h, border_c, 4);
 
-                let icon_tag = if entry.name == ".." {
-                    ":back:"
-                } else if entry.is_dir {
-                    ":folder:"
-                } else if entry.name.ends_with(".elf") {
-                    ":gear:"
-                } else if entry.name.ends_with(".png") || entry.name.ends_with(".jpg") || entry.name.ends_with(".jpeg") {
-                    ":img:"
-                } else {
-                    ":doc:"
-                };
+        let path_display = if self.current_path.is_empty() || self.current_path == "." {
+            "Computer".to_string()
+        } else {
+            format!("Computer > {}", self.current_path.replace('/', " > "))
+        };
+        canvas.draw_text_clipped(addr_x + theme.pt(10.0), btn_y + theme.pt(5.0), addr_w - theme.pt(20.0), &path_display, 0xFFD4D4D8, font_cap);
 
-                let label = if entry.is_dir {
-                    format!("{} {}", icon_tag, entry.name)
-                } else {
-                    let sz_str = if entry.size >= 1024 * 1024 {
-                        format!("{:.2} MB", (entry.size as f64) / (1024.0 * 1024.0))
-                    } else if entry.size >= 1024 {
-                        format!("{} KB", entry.size / 1024)
-                    } else {
-                        format!("{} B", entry.size)
-                    };
-                    format!("{} {} ({})", icon_tag, entry.name, sz_str)
-                };
+        // مربع البحث
+        let s_x = addr_x + addr_w + theme.pt(8.0);
+        canvas.draw_rect(s_x, btn_y, search_w - theme.pt(16.0), btn_h, 0xFF0D0D10, 4);
+        let s_border = if self.is_searching { 0xFF71717A } else { border_c };
+        canvas.draw_rect_outline(s_x, btn_y, search_w - theme.pt(16.0), btn_h, s_border, 4);
+        let s_txt = if self.search_query.is_empty() { "Search..." } else { &self.search_query };
+        let s_col = if self.search_query.is_empty() { 0xFF71717A } else { 0xFFFFFFFF };
+        canvas.draw_text_clipped(s_x + theme.pt(8.0), btn_y + theme.pt(5.0), search_w - theme.pt(32.0), s_txt, s_col, font_cap);
 
-                let txt_c = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
-                canvas.draw_text_with_icons(self.bounds.x + theme.pt(14.0), cur_y + theme.pt(8.0), &label, txt_c, theme.font_body());
+        // 3. الشريط الجانبي الأيسر (Sidebar)
+        let side_w = theme.pt(150.0);
+        let content_y = self.bounds.y + tb_h;
+        let content_h = self.bounds.h - tb_h - theme.pt(24.0);
+        canvas.draw_rect(self.bounds.x, content_y, side_w, content_h, bg_side, 0);
+        canvas.draw_line_v(self.bounds.x + side_w, content_y, content_h, border_c);
+
+        let side_items = [
+            ("RootFS", "RootFS"),
+            ("EOS SHARE", "EOS SHARE"),
+            ("Initrd", "Initrd"),
+            ("Home", "home/march"),
+        ];
+
+        let mut side_y = content_y + theme.pt(10.0);
+        canvas.draw_text(self.bounds.x + theme.pt(12.0), side_y, "QUICK ACCESS", 0xFF52525B, font_cap);
+        side_y += theme.pt(18.0);
+
+        for (label, path) in &side_items {
+            let is_cur = self.current_path == *path || self.current_path.starts_with(path);
+            if is_cur {
+                canvas.draw_rect(self.bounds.x + theme.pt(6.0), side_y, side_w - theme.pt(12.0), theme.pt(24.0), 0xFF27272E, 4);
             }
-            cur_y += row_h;
+            let item_col = if is_cur { 0xFFFFFFFF } else { 0xFFA1A1AA };
+            canvas.draw_text(self.bounds.x + theme.pt(14.0), side_y + theme.pt(4.0), label, item_col, font_cap);
+            side_y += theme.pt(28.0);
         }
 
-        let total_items_h = (self.entries.len() as i32) * row_h;
-        if total_items_h > list_h && list_h > 0 {
-            let thumb_h = ((list_h as f32 / total_items_h as f32) * list_h as f32).max(20.0);
-            let max_sc = (total_items_h - list_h).max(1) as f32;
-            let thumb_y = list_y as f32 + ((self.scroll_y as f32 / max_sc) * (list_h as f32 - thumb_h));
-            canvas.draw_rect(self.bounds.x + self.bounds.w - 6, thumb_y as i32, 4, thumb_h as i32, 0x8871717A, 2);
+        // 4. رأس جدول الملفات
+        let main_x = self.bounds.x + side_w;
+        let main_w = self.bounds.w - side_w;
+        let header_h = theme.pt(26.0);
+        canvas.draw_rect(main_x, content_y, main_w, header_h, 0xFF16161B, 0);
+        canvas.draw_line_h(main_x, content_y + header_h, main_w, border_c);
+
+        canvas.draw_text(main_x + theme.pt(16.0), content_y + theme.pt(5.0), "Name", 0xFF71717A, font_cap);
+        canvas.draw_text(main_x + main_w - theme.pt(180.0), content_y + theme.pt(5.0), "Type", 0xFF71717A, font_cap);
+        canvas.draw_text(main_x + main_w - theme.pt(90.0), content_y + theme.pt(5.0), "Size", 0xFF71717A, font_cap);
+
+        // 5. قائمة الملفات والمجلدات
+        let list_y = content_y + header_h;
+        let list_h = content_h - header_h;
+        let item_h = theme.pt(30.0);
+        let mut cur_y = list_y + theme.pt(2.0) - self.scroll_y;
+
+        canvas.push_clip(Rect::new(main_x, list_y, main_w, list_h));
+
+        for (idx, item) in self.filtered_items.iter().enumerate() {
+            if cur_y + item_h > list_y && cur_y < list_y + list_h {
+                let is_sel = self.selected_idx == Some(idx);
+                let row_bg = if is_sel {
+                    0xFF2E2E38 // رمادي داكن مميز للتحديد
+                } else if idx % 2 == 1 {
+                    0xFF141418
+                } else {
+                    bg_main
+                };
+
+                canvas.draw_rect(main_x + theme.pt(4.0), cur_y, main_w - theme.pt(8.0), item_h, row_bg, 3);
+
+                // أيقونة البادج
+                let (badge, badge_c) = if item.is_dir {
+                    ("DIR", 0xFFF59E0B) // كهرماني محايد
+                } else {
+                    match item.ext.as_str() {
+                        "PNG" | "JPG" | "JPEG" | "BMP" => ("IMG", 0xFFA1A1AA),
+                        "TXT" | "INI" | "CONF" | "LOG" => ("TXT", 0xFFD4D4D8),
+                        "ELF" | "BIN"                  => ("BIN", 0xFFE4E4E7),
+                        _                              => ("DOC", 0xFF71717A),
+                    }
+                };
+
+                canvas.draw_rect(main_x + theme.pt(10.0), cur_y + theme.pt(5.0), theme.pt(26.0), theme.pt(18.0), 0xFF1C1C22, 2);
+                canvas.draw_text(main_x + theme.pt(13.0), cur_y + theme.pt(6.0), badge, badge_c, font_cap);
+
+                // اسم الملف
+                let name_col = if is_sel { 0xFFFFFFFF } else { 0xFFE4E4E7 };
+                canvas.draw_text_clipped(
+                    main_x + theme.pt(44.0),
+                    cur_y + theme.pt(6.0),
+                    main_w - theme.pt(230.0),
+                    &item.name,
+                    name_col,
+                    font_body,
+                );
+
+                // النوع
+                canvas.draw_text(main_x + main_w - theme.pt(180.0), cur_y + theme.pt(6.0), &item.ext, 0xFF71717A, font_cap);
+
+                // الحجم
+                if !item.is_dir {
+                    let sz_str = if item.size >= 1024 * 1024 {
+                        format!("{:.1} MB", item.size as f32 / (1024.0 * 1024.0))
+                    } else if item.size >= 1024 {
+                        format!("{:.1} KB", item.size as f32 / 1024.0)
+                    } else {
+                        format!("{} B", item.size)
+                    };
+                    canvas.draw_text(main_x + main_w - theme.pt(90.0), cur_y + theme.pt(6.0), &sz_str, 0xFF71717A, font_cap);
+                }
+            }
+            cur_y += item_h;
         }
 
         canvas.pop_clip();
 
-        let sb_y = self.bounds.y + self.bounds.h - sb_h;
-        canvas.draw_rect(self.bounds.x, sb_y, self.bounds.w, sb_h, theme.bg_titlebar, 0);
-        canvas.draw_line_h(self.bounds.x, sb_y, self.bounds.w, theme.border_window);
-        canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), sb_y + theme.pt(5.0), self.bounds.w - theme.pt(28.0), &self.status_label, theme.text_muted, theme.font_caption());
+        // 6. شريط الحالة السفلي (Dark Status Bar)
+        let status_y = self.bounds.y + self.bounds.h - theme.pt(24.0);
+        canvas.draw_rect(self.bounds.x, status_y, self.bounds.w, theme.pt(24.0), bg_bar, 0);
+        canvas.draw_line_h(self.bounds.x, status_y, self.bounds.w, border_c);
+        canvas.draw_text(self.bounds.x + theme.pt(14.0), status_y + theme.pt(4.0), &self.status_msg, 0xFF71717A, font_cap);
     }
 
     fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
         if !self.bounds.contains(mx, my) { return false; }
-        let theme = get_theme();
-        let tb_h = theme.pt(40.0);
-        let sb_h = theme.pt(26.0);
+        if !pressed { return true; }
 
-        if pressed {
-            if my >= self.bounds.y && my <= self.bounds.y + tb_h {
-                let favorites = ["EOS SHARE", "RootFS", "Initrd"];
-                let mut fav_x = self.bounds.x + theme.pt(12.0);
-                for target in favorites {
-                    let btn_w = theme.pt(58.0);
-                    if mx >= fav_x && mx <= fav_x + btn_w {
-                        self.load_directory(target);
-                        return true;
-                    }
-                    fav_x += btn_w + theme.pt(8.0);
-                }
+        let theme = get_theme();
+        let tb_h = theme.pt(42.0);
+        let btn_y = self.bounds.y + theme.pt(8.0);
+        let btn_w = theme.pt(28.0);
+        let btn_h = theme.pt(26.0);
+
+        if my >= btn_y && my <= btn_y + btn_h {
+            if mx >= self.bounds.x + theme.pt(8.0) && mx <= self.bounds.x + theme.pt(8.0) + btn_w {
+                self.navigate_back();
+                return true;
+            }
+            if mx >= self.bounds.x + theme.pt(40.0) && mx <= self.bounds.x + theme.pt(40.0) + btn_w {
+                self.navigate_forward();
+                return true;
+            }
+            if mx >= self.bounds.x + theme.pt(72.0) && mx <= self.bounds.x + theme.pt(72.0) + btn_w {
+                self.navigate_up();
                 return true;
             }
 
-            let list_y = self.bounds.y + tb_h + 1;
-            let list_h = self.bounds.h - tb_h - sb_h;
-            if my >= list_y && my <= list_y + list_h {
-                let row_h = theme.pt(34.0);
-                let rel_y = (my - (list_y + theme.pt(4.0))) + self.scroll_y;
-                if rel_y >= 0 {
-                    let clicked_idx = (rel_y / row_h) as usize;
-                    if clicked_idx < self.entries.len() {
-                        if self.selected_idx == Some(clicked_idx) {
-                            self.open_entry(clicked_idx);
-                        } else {
-                            self.selected_idx = Some(clicked_idx);
-                        }
-                        return true;
-                    }
+            let search_w = theme.pt(150.0);
+            let s_x = self.bounds.x + self.bounds.w - search_w - theme.pt(8.0);
+            if mx >= s_x && mx <= s_x + search_w {
+                self.is_searching = true;
+                return true;
+            } else {
+                self.is_searching = false;
+            }
+        }
+
+        let side_w = theme.pt(150.0);
+        if mx < self.bounds.x + side_w && my > self.bounds.y + tb_h {
+            let rel_side_y = my - (self.bounds.y + tb_h + theme.pt(28.0));
+            if rel_side_y >= 0 {
+                let idx = (rel_side_y / theme.pt(28.0)) as usize;
+                let targets = ["RootFS", "EOS SHARE", "Initrd", "home/march"];
+                if idx < targets.len() {
+                    self.navigate_to(targets[idx]);
+                    return true;
                 }
             }
         }
+
+        let header_h = theme.pt(26.0);
+        let list_y = self.bounds.y + tb_h + header_h;
+        let item_h = theme.pt(30.0);
+        let rel_y = my - list_y + self.scroll_y;
+
+        if rel_y >= 0 && mx >= self.bounds.x + side_w {
+            let idx = (rel_y / item_h) as usize;
+            if idx < self.filtered_items.len() {
+                if self.selected_idx == Some(idx) {
+                    let it = self.filtered_items[idx].clone();
+                    self.open_item(&it);
+                } else {
+                    self.selected_idx = Some(idx);
+                }
+                return true;
+            }
+        }
+
         true
     }
 
     fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
         if !self.bounds.contains(mx, my) { return false; }
         let theme = get_theme();
-        let row_h = theme.pt(34.0);
-        let total_h = (self.entries.len() as i32) * row_h;
-        let view_h = self.bounds.h - theme.pt(66.0);
+        let item_h = theme.pt(30.0);
+        let total_h = (self.filtered_items.len() as i32) * item_h;
+        let view_h = self.bounds.h - theme.pt(92.0);
         let max_scroll = (total_h - view_h).max(0);
 
-        if dy > 0 {
-            self.scroll_y = (self.scroll_y + theme.pt(32.0)).min(max_scroll);
-        } else {
-            self.scroll_y = (self.scroll_y - theme.pt(32.0)).max(0);
+        let step = theme.pt(30.0);
+        if dy < 0 {
+            self.scroll_y = (self.scroll_y + step).min(max_scroll);
+        } else if dy > 0 {
+            self.scroll_y = (self.scroll_y - step).max(0);
         }
         true
     }
@@ -294,36 +468,51 @@ impl Widget for FinderApp {
         match keycode {
             0x1C => {
                 if let Some(idx) = self.selected_idx {
-                    self.open_entry(idx);
+                    if idx < self.filtered_items.len() {
+                        let it = self.filtered_items[idx].clone();
+                        self.open_item(&it);
+                        return true;
+                    }
+                }
+            }
+            0x0E => {
+                if self.is_searching {
+                    self.search_query.pop();
+                    self.apply_filter();
+                    return true;
+                } else {
+                    self.navigate_up();
                     return true;
                 }
             }
             0x48 => {
                 if let Some(idx) = self.selected_idx {
                     if idx > 0 { self.selected_idx = Some(idx - 1); return true; }
-                } else if !self.entries.is_empty() {
+                } else if !self.filtered_items.is_empty() {
                     self.selected_idx = Some(0);
                     return true;
                 }
             }
             0x50 => {
                 if let Some(idx) = self.selected_idx {
-                    if idx + 1 < self.entries.len() { self.selected_idx = Some(idx + 1); return true; }
-                } else if !self.entries.is_empty() {
+                    if idx + 1 < self.filtered_items.len() { self.selected_idx = Some(idx + 1); return true; }
+                } else if !self.filtered_items.is_empty() {
                     self.selected_idx = Some(0);
                     return true;
                 }
             }
-            0x0E => {
-                if let Some(pos) = self.current_path.rfind('/') {
-                    let parent = self.current_path[..pos].to_string();
-                    self.load_directory(&parent);
-                } else {
-                    self.load_directory("EOS SHARE");
-                }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_char(&mut self, c: char) -> bool {
+        if self.is_searching {
+            if c >= ' ' && c <= '~' {
+                self.search_query.push(c);
+                self.apply_filter();
                 return true;
             }
-            _ => {}
         }
         false
     }

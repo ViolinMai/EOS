@@ -14,6 +14,7 @@ pub enum FileSource {
     Memory(Vec<u8>),
     AtaDisk { drive: u8, first_cluster: u32, size: usize },
     Directory(Vec<crate::fs::FsItem>, usize),
+    Pipe { id: usize, is_read: bool },
 }
 
 #[derive(Clone)]
@@ -282,4 +283,39 @@ fn core_decode_dynamic_worker() {
     } else {
         DECODE_STATUS.store(-1, Ordering::Release);
     }
+}
+
+pub struct IpcPipe {
+    pub data: alloc::collections::VecDeque<u8>,
+    pub closed: bool,
+}
+
+pub struct PipeRegistryLock {
+    pub locked: core::sync::atomic::AtomicBool,
+}
+
+impl PipeRegistryLock {
+    pub const fn new() -> Self { Self { locked: core::sync::atomic::AtomicBool::new(false) } }
+    pub fn lock(&self) { while self.locked.compare_exchange_weak(false, true, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() { core::hint::spin_loop(); } }
+    pub fn unlock(&self) { self.locked.store(false, core::sync::atomic::Ordering::Release); }
+}
+
+pub static PIPE_LOCK: PipeRegistryLock = PipeRegistryLock::new();
+
+pub static mut PIPE_REGISTRY: [Option<IpcPipe>; 128] = [const { None }; 128];
+
+pub fn create_pipe() -> Option<(usize, usize)> {
+    PIPE_LOCK.lock();
+    let mut id = None;
+    unsafe {
+        for i in 0..128 {
+            if PIPE_REGISTRY[i].is_none() {
+                PIPE_REGISTRY[i] = Some(IpcPipe { data: alloc::collections::VecDeque::new(), closed: false });
+                id = Some(i);
+                break;
+            }
+        }
+    }
+    PIPE_LOCK.unlock();
+    id.map(|i| (i, i))
 }

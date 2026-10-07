@@ -1,186 +1,507 @@
-### ITEM FIX: src/fs/elf.rs
-pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str> {
-    log_info!("ELF", "Validating binary headers (Size: {} bytes)...", data.len());
-    if data.len() < core::mem::size_of::<Elf64Header>() { return Err("Binary too small for ELF Header"); }
-    let header = unsafe { *(data.as_ptr() as *const Elf64Header) };
-    if header.magic != ELF_MAGIC { return Err("Invalid ELF magic identifier"); }
-    if header.class != 2 || header.machine != 0x3E { return Err("Binary is not x86_64 64-bit"); }
+### FILE: userspace/src/apps/finder.rs
+use crate::framework::*;
+use std::fs;
 
-    reset_core2_process();
+#[derive(Clone, Debug)]
+pub struct ExplorerItem {
+    pub name: String,
+    pub is_dir: bool,
+    pub size: usize,
+    pub ext: String,
+}
 
-    let entry_point = header.entry;
-    let phoff = header.phoff as usize;
-    let phnum = header.phnum as usize;
-    let phentsize = header.phentsize as usize;
-    log_info!("ELF", "ELF Validated: Entry point {:#018x}, Program Headers: {}", entry_point, phnum);
+pub struct FinderApp {
+    bounds: Rect,
+    current_path: String,
+    history: Vec<String>,
+    history_idx: usize,
+    items: Vec<ExplorerItem>,
+    filtered_items: Vec<ExplorerItem>,
+    selected_idx: Option<usize>,
+    scroll_y: i32,
+    search_query: String,
+    is_searching: bool,
+    status_msg: String,
+    pub pending_open_text: Option<String>,
+    pub pending_open_image: Option<(String, String)>,
+}
 
-    let vmm = unsafe { (&*addr_of_mut!(VMM)).as_ref().ok_or("VMM not initialized")? };
-    let kernel_cr3 = read_cr3() & 0x000F_FFFF_FFFF_F000;
-    let new_pml4_phys = crate::mm::frame::allocate_frame_safe().ok_or("OOM: PML4")?;
-    let new_pml4 = unsafe { &mut *((new_pml4_phys + vmm.hhdm_offset) as *mut PageTable) };
-    let current_pml4 = unsafe { &*((kernel_cr3 + vmm.hhdm_offset) as *const PageTable) };
-
-    unsafe {
-        core::ptr::write_bytes(new_pml4 as *mut PageTable as *mut u8, 0, 4096);
-        for i in 256..512 { new_pml4.entries[i] = current_pml4.entries[i]; }
+impl FinderApp {
+    pub fn new() -> Self {
+        let mut app = Self {
+            bounds: Rect::default(),
+            current_path: "RootFS".into(),
+            history: vec!["RootFS".into()],
+            history_idx: 0,
+            items: Vec::new(),
+            filtered_items: Vec::new(),
+            selected_idx: None,
+            scroll_y: 0,
+            search_query: String::new(),
+            is_searching: false,
+            status_msg: "Ready".into(),
+            pending_open_text: None,
+            pending_open_image: None,
+        };
+        app.load_directory();
+        app
     }
 
-    log_info!("ELF", "Mapping program segments into new address space...");
-    for i in 0..phnum {
-        let ph_offset = phoff + (i * phentsize);
-        if ph_offset + core::mem::size_of::<Elf64ProgramHeader>() > data.len() { return Err("Program header out of bounds"); }
-        let ph = unsafe { *(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+    pub fn load_directory(&mut self) {
+        self.items.clear();
+        self.selected_idx = None;
+        self.scroll_y = 0;
 
-        if ph.p_type == PT_LOAD {
-            let vaddr = ph.p_vaddr; let mem_sz = ph.p_memsz as usize;
-            let file_sz = ph.p_filesz as usize; let file_off = ph.p_offset as usize;
+        let clean = self.current_path.trim().trim_matches('/').to_string();
+        let candidates = if clean.is_empty() || clean == "." {
+            vec![
+                ".".to_string(),
+                "/".to_string(),
+                "RootFS".to_string(),
+                "/RootFS".to_string(),
+            ]
+        } else {
+            vec![
+                clean.clone(),
+                format!("/{}", clean),
+                format!("{}/", clean),
+                format!("/RootFS/{}", clean),
+                format!("RootFS/{}", clean),
+            ]
+        };
 
-            if file_off.saturating_add(file_sz) > data.len() { return Err("PT_LOAD segment exceeds bounds"); }
-            let start_page = vaddr & !0xFFF; let end_page = (vaddr + mem_sz as u64 + 0xFFF) & !0xFFF;
-            crate::mm::paging::map_user_pages(new_pml4_phys, start_page, ((end_page - start_page) / 4096) as usize)?;
-
-            unsafe {
-                let mut remaining = file_sz; let mut data_offset = file_off; let mut dest_vaddr = vaddr;
-                while remaining > 0 {
-                    let p4_idx = ((dest_vaddr >> 39) & 0x1FF) as usize; let p3_idx = ((dest_vaddr >> 30) & 0x1FF) as usize;
-                    let p2_idx = ((dest_vaddr >> 21) & 0x1FF) as usize; let p1_idx = ((dest_vaddr >> 12) & 0x1FF) as usize;
-                    let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
-                    let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
-                    let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
-                    let frame_phys = pt2.entries[p1_idx].physical_address();
-
-                    let page_offset = (dest_vaddr & 0xFFF) as usize;
-                    let copy_size = core::cmp::min(remaining, 4096 - page_offset);
-                    core::ptr::copy_nonoverlapping(data.as_ptr().add(data_offset), ((frame_phys + vmm.hhdm_offset) as *mut u8).add(page_offset), copy_size);
-                    remaining -= copy_size; data_offset += copy_size; dest_vaddr += copy_size as u64;
+        let mut success = false;
+        for cand in &candidates {
+            if let Ok(entries) = fs::read_dir(cand) {
+                let mut found_any = false;
+                for e in entries.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    if name == "." || name == ".." { continue; }
+                    let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                    let full_item_path = format!("{}/{}", cand.trim_end_matches('/'), name);
+                    let size = if is_dir { 0 } else { fs::metadata(&full_item_path).map(|m| m.len() as usize).unwrap_or(0) };
+                    let ext = if is_dir {
+                        "Folder".to_string()
+                    } else {
+                        name.rsplit('.').next().unwrap_or("File").to_uppercase()
+                    };
+                    self.items.push(ExplorerItem { name, is_dir, size, ext });
+                    found_any = true;
+                }
+                if found_any {
+                    success = true;
+                    break;
                 }
             }
         }
-    }
 
-    let stack_pages = 512;
-    let stack_start = USER_STACK_TOP - (stack_pages * 4096);
-    crate::mm::paging::map_user_pages(new_pml4_phys, stack_start, stack_pages as usize)?;
-
-    // تخصيص صفحة خاصة لـ Thread Local Storage (TLS / FS_BASE)
-    let tls_vaddr = 0x00007fffffff0000u64;
-    crate::mm::paging::map_user_pages(new_pml4_phys, tls_vaddr, 2)?;
-
-    // تهيئة بنية الـ TCB الخاصة بـ x86_64: أول 8 بايت تشير إلى عنوانها نفسه
-    unsafe {
-        let p4_idx = ((tls_vaddr >> 39) & 0x1FF) as usize; let p3_idx = ((tls_vaddr >> 30) & 0x1FF) as usize;
-        let p2_idx = ((tls_vaddr >> 21) & 0x1FF) as usize; let p1_idx = ((tls_vaddr >> 12) & 0x1FF) as usize;
-        let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
-        let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
-        let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
-        let tls_base = (pt2.entries[p1_idx].physical_address() + vmm.hhdm_offset) as *mut u64;
-        core::ptr::write_bytes(tls_base as *mut u8, 0, 4096);
-        *tls_base = tls_vaddr; // Self-pointer: FS:[0] == tls_vaddr
-    }
-
-    let mut args: Vec<&str> = Vec::new();
-    if args_str.is_empty() { 
-        args.push("python"); 
-    } else { 
-        for part in args_str.split_whitespace() { 
-            args.push(part); 
-        } 
-    }
-
-    let default_envs = [
-        "PATH=/bin:/usr/bin",
-        "PYTHONHOME=/",
-        "PYTHONPATH=/python312.zip:/lib/python312.zip",
-        "PYTHONUNBUFFERED=1",
-        "TERM=xterm-256color",
-    ];
-
-    let user_rsp_page = USER_STACK_TOP - 0x2000;
-    let user_rsp;
-
-    unsafe {
-        let p4_idx = ((user_rsp_page >> 39) & 0x1FF) as usize; let p3_idx = ((user_rsp_page >> 30) & 0x1FF) as usize;
-        let p2_idx = ((user_rsp_page >> 21) & 0x1FF) as usize; let p1_idx = ((user_rsp_page >> 12) & 0x1FF) as usize;
-        let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
-        let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
-        let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
-        let stack_base = (pt2.entries[p1_idx].physical_address() + vmm.hhdm_offset) as *mut u8;
-
-        core::ptr::write_bytes(stack_base, 0, 4096);
-
-        let mut string_cursor = 4096 - 16;
-        let mut arg_pointers: Vec<u64> = Vec::new();
-        for arg in &args {
-            let bytes = arg.as_bytes();
-            string_cursor -= bytes.len() + 1;
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), stack_base.add(string_cursor), bytes.len());
-            *stack_base.add(string_cursor + bytes.len()) = 0;
-            arg_pointers.push(user_rsp_page + string_cursor as u64);
+        if !success && (clean.is_empty() || clean == ".") {
+            self.items.push(ExplorerItem { name: "RootFS".into(), is_dir: true, size: 0, ext: "Folder".into() });
+            self.items.push(ExplorerItem { name: "EOS SHARE".into(), is_dir: true, size: 0, ext: "Folder".into() });
+            self.items.push(ExplorerItem { name: "Initrd".into(), is_dir: true, size: 0, ext: "Folder".into() });
+            success = true;
         }
 
-        let mut env_pointers: Vec<u64> = Vec::new();
-        for env in &default_envs {
-            let bytes = env.as_bytes();
-            string_cursor -= bytes.len() + 1;
-            core::ptr::copy_nonoverlapping(bytes.as_ptr(), stack_base.add(string_cursor), bytes.len());
-            *stack_base.add(string_cursor + bytes.len()) = 0;
-            env_pointers.push(user_rsp_page + string_cursor as u64);
+        self.items.sort_by(|a, b| {
+            if a.is_dir == b.is_dir {
+                a.name.to_lowercase().cmp(&b.name.to_lowercase())
+            } else if a.is_dir {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        });
+
+        self.apply_filter();
+
+        if success {
+            self.status_msg = format!("{} items | Path: /{}", self.filtered_items.len(), clean);
+        } else {
+            self.status_msg = format!("Empty or unavailable folder (/{}).", clean);
         }
-
-        let mut entries: Vec<u64> = Vec::new();
-        entries.push(arg_pointers.len() as u64); // argc
-        for ptr in arg_pointers {
-            entries.push(ptr); // argv[i]
-        }
-        entries.push(0); // argv NULL
-
-        for ptr in env_pointers {
-            entries.push(ptr); // envp[i]
-        }
-        entries.push(0); // envp NULL
-
-        // Auxiliary Vector (Elf64_auxv_t)
-        entries.push(6);  entries.push(4096);                         // AT_PAGESZ
-        entries.push(11); entries.push(1000);                         // AT_UID
-        entries.push(12); entries.push(1000);                         // AT_EUID
-        entries.push(13); entries.push(1000);                         // AT_GID
-        entries.push(14); entries.push(1000);                         // AT_EGID
-        entries.push(17); entries.push(100);                          // AT_CLKTCK
-        entries.push(23); entries.push(0);                            // AT_SECURE
-        entries.push(25); entries.push(user_rsp_page + 0x100);        // AT_RANDOM
-        entries.push(9);  entries.push(entry_point);                  // AT_ENTRY
-        entries.push(0);  entries.push(0);                            // AT_NULL
-
-        let aligned_offset = 0x800usize;
-        let stack_dst = stack_base.add(aligned_offset) as *mut u64;
-        core::ptr::copy_nonoverlapping(entries.as_ptr(), stack_dst, entries.len());
-
-        user_rsp = user_rsp_page + aligned_offset as u64;
     }
 
-    clear_keyboard_buffer();
-    ELF_EXIT_REQUESTED.store(false, Ordering::SeqCst);
-    let core_id = crate::profiler::get_core_id();
-    let state_ptr = unsafe { addr_of_mut!(crate::arch::x86_64::syscall::CORE_SYSCALL_STATES[core_id]) };
-    let spawn_rsp_ptr = unsafe { &mut (*state_ptr).kernel_spawn_rsp as *mut u64 };
-
-    log_info!("ELF", "Jumping to Ring 3 userspace entry {:#018x} with RSP {:#018x} (Aligned 16: {}) on Core {}...", 
-        entry_point, user_rsp, (user_rsp % 16) == 0, core_id);
-
-    unsafe {
-        crate::arch::x86_64::fpu::enable_sse();
-        let mxcsr: u32 = 0x1F80;
-        core::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr, options(nostack));
-
-        // ضبط FS_BASE إلى مساحة الـ TLS الصالحة بدلاً من 0 لمنع #GP
-        crate::arch::x86_64::syscall::wrmsr(0xC0000100, tls_vaddr);
-        crate::arch::x86_64::syscall::wrmsr(0xC0000101, 0);
-
-        jump_to_ring3(entry_point, user_rsp, USER_CODE_SELECTOR as u64, USER_DATA_SELECTOR as u64, spawn_rsp_ptr, new_pml4_phys);
-        core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3);
-        free_user_pages(new_pml4_phys);
+    fn apply_filter(&mut self) {
+        if self.search_query.is_empty() {
+            self.filtered_items = self.items.clone();
+        } else {
+            let q = self.search_query.to_lowercase();
+            self.filtered_items = self.items
+                .iter()
+                .filter(|it| it.name.to_lowercase().contains(&q))
+                .cloned()
+                .collect();
+        }
     }
-    log_info!("ELF", "Ring 3 process returned cleanly to kernel.");
-    Ok(())
+
+    pub fn navigate_to(&mut self, path: &str) {
+        let clean = path.trim().trim_matches('/');
+        if self.current_path == clean { return; }
+        if self.history_idx + 1 < self.history.len() {
+            self.history.truncate(self.history_idx + 1);
+        }
+        self.history.push(clean.to_string());
+        self.history_idx = self.history.len() - 1;
+        self.current_path = clean.to_string();
+        self.load_directory();
+    }
+
+    pub fn navigate_back(&mut self) {
+        if self.history_idx > 0 {
+            self.history_idx -= 1;
+            self.current_path = self.history[self.history_idx].clone();
+            self.load_directory();
+        }
+    }
+
+    pub fn navigate_forward(&mut self) {
+        if self.history_idx + 1 < self.history.len() {
+            self.history_idx += 1;
+            self.current_path = self.history[self.history_idx].clone();
+            self.load_directory();
+        }
+    }
+
+    pub fn navigate_up(&mut self) {
+        let clean = self.current_path.trim_matches('/');
+        if let Some(pos) = clean.rfind('/') {
+            let parent = clean[..pos].to_string();
+            self.navigate_to(&parent);
+        } else if !clean.is_empty() && clean != "." {
+            self.navigate_to(".");
+        }
+    }
+
+    fn open_item(&mut self, item: &ExplorerItem) {
+        let clean_cur = self.current_path.trim_matches('/');
+        if item.is_dir {
+            let next_path = if clean_cur.is_empty() || clean_cur == "." {
+                item.name.clone()
+            } else {
+                format!("{}/{}", clean_cur, item.name)
+            };
+            self.navigate_to(&next_path);
+        } else {
+            let full_path = if clean_cur.is_empty() || clean_cur == "." {
+                item.name.clone()
+            } else {
+                format!("{}/{}", clean_cur, item.name)
+            };
+
+            let lower = item.name.to_lowercase();
+            if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") || lower.ends_with(".bmp") {
+                self.pending_open_image = Some((item.name.clone(), full_path));
+            } else {
+                self.pending_open_text = Some(full_path);
+            }
+        }
+    }
+}
+
+impl Widget for FinderApp {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect::new(x, y, w, h);
+        self.bounds
+    }
+
+    fn paint(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        let bg_main = 0xFF121215;
+        let bg_side = 0xFF0D0D10;
+        let bg_bar = 0xFF18181D;
+        let border_c = 0xFF27272E;
+        let font_body = theme.font_body();
+        let font_cap = theme.font_caption();
+
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, bg_main, 0);
+
+        let tb_h = theme.pt(42.0);
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, bg_bar, 0);
+        canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, border_c);
+
+        let btn_w = theme.pt(28.0);
+        let btn_h = theme.pt(26.0);
+        let btn_y = self.bounds.y + theme.pt(8.0);
+
+        let can_back = self.history_idx > 0;
+        let can_fwd = self.history_idx + 1 < self.history.len();
+        let c_back = if can_back { 0xFFE4E4E7 } else { 0xFF52525B };
+        let c_fwd = if can_fwd { 0xFFE4E4E7 } else { 0xFF52525B };
+
+        canvas.draw_rect(self.bounds.x + theme.pt(8.0), btn_y, btn_w, btn_h, 0xFF22222A, 4);
+        canvas.draw_text(self.bounds.x + theme.pt(16.0), btn_y + theme.pt(4.0), "<", c_back, font_body);
+
+        canvas.draw_rect(self.bounds.x + theme.pt(40.0), btn_y, btn_w, btn_h, 0xFF22222A, 4);
+        canvas.draw_text(self.bounds.x + theme.pt(48.0), btn_y + theme.pt(4.0), ">", c_fwd, font_body);
+
+        canvas.draw_rect(self.bounds.x + theme.pt(72.0), btn_y, btn_w, btn_h, 0xFF22222A, 4);
+        canvas.draw_text(self.bounds.x + theme.pt(80.0), btn_y + theme.pt(4.0), "^", 0xFFE4E4E7, font_body);
+
+        let addr_x = self.bounds.x + theme.pt(108.0);
+        let search_w = theme.pt(150.0);
+        let addr_w = (self.bounds.w - theme.pt(120.0) - search_w).max(100);
+        canvas.draw_rect(addr_x, btn_y, addr_w, btn_h, 0xFF0D0D10, 4);
+        canvas.draw_rect_outline(addr_x, btn_y, addr_w, btn_h, border_c, 4);
+
+        let path_display = if self.current_path.is_empty() || self.current_path == "." {
+            "Computer".to_string()
+        } else {
+            format!("Computer > {}", self.current_path.replace('/', " > "))
+        };
+        canvas.draw_text_clipped(addr_x + theme.pt(10.0), btn_y + theme.pt(5.0), addr_w - theme.pt(20.0), &path_display, 0xFFD4D4D8, font_cap);
+
+        let s_x = addr_x + addr_w + theme.pt(8.0);
+        canvas.draw_rect(s_x, btn_y, search_w - theme.pt(16.0), btn_h, 0xFF0D0D10, 4);
+        let s_border = if self.is_searching { 0xFF71717A } else { border_c };
+        canvas.draw_rect_outline(s_x, btn_y, search_w - theme.pt(16.0), btn_h, s_border, 4);
+        let s_txt = if self.search_query.is_empty() { "Search..." } else { &self.search_query };
+        let s_col = if self.search_query.is_empty() { 0xFF71717A } else { 0xFFFFFFFF };
+        canvas.draw_text_clipped(s_x + theme.pt(8.0), btn_y + theme.pt(5.0), search_w - theme.pt(32.0), s_txt, s_col, font_cap);
+
+        let side_w = theme.pt(150.0);
+        let content_y = self.bounds.y + tb_h;
+        let content_h = self.bounds.h - tb_h - theme.pt(24.0);
+        canvas.draw_rect(self.bounds.x, content_y, side_w, content_h, bg_side, 0);
+        canvas.draw_line_v(self.bounds.x + side_w, content_y, content_h, border_c);
+
+        let side_items = [
+            ("RootFS", "RootFS"),
+            ("EOS SHARE", "EOS SHARE"),
+            ("Initrd", "Initrd"),
+            ("Home", "home/march"),
+        ];
+
+        let mut side_y = content_y + theme.pt(10.0);
+        canvas.draw_text(self.bounds.x + theme.pt(12.0), side_y, "QUICK ACCESS", 0xFF52525B, font_cap);
+        side_y += theme.pt(18.0);
+
+        for (label, path) in &side_items {
+            let is_cur = self.current_path == *path || self.current_path.starts_with(path);
+            if is_cur {
+                canvas.draw_rect(self.bounds.x + theme.pt(6.0), side_y, side_w - theme.pt(12.0), theme.pt(24.0), 0xFF27272E, 4);
+            }
+            let item_col = if is_cur { 0xFFFFFFFF } else { 0xFFA1A1AA };
+            canvas.draw_text(self.bounds.x + theme.pt(14.0), side_y + theme.pt(4.0), label, item_col, font_cap);
+            side_y += theme.pt(28.0);
+        }
+
+        let main_x = self.bounds.x + side_w;
+        let main_w = self.bounds.w - side_w;
+        let header_h = theme.pt(26.0);
+        canvas.draw_rect(main_x, content_y, main_w, header_h, 0xFF16161B, 0);
+        canvas.draw_line_h(main_x, content_y + header_h, main_w, border_c);
+
+        canvas.draw_text(main_x + theme.pt(16.0), content_y + theme.pt(5.0), "Name", 0xFF71717A, font_cap);
+        canvas.draw_text(main_x + main_w - theme.pt(180.0), content_y + theme.pt(5.0), "Type", 0xFF71717A, font_cap);
+        canvas.draw_text(main_x + main_w - theme.pt(90.0), content_y + theme.pt(5.0), "Size", 0xFF71717A, font_cap);
+
+        let list_y = content_y + header_h;
+        let list_h = content_h - header_h;
+        let item_h = theme.pt(30.0);
+        let mut cur_y = list_y + theme.pt(2.0) - self.scroll_y;
+
+        canvas.push_clip(Rect::new(main_x, list_y, main_w, list_h));
+
+        for (idx, item) in self.filtered_items.iter().enumerate() {
+            if cur_y + item_h > list_y && cur_y < list_y + list_h {
+                let is_sel = self.selected_idx == Some(idx);
+                let row_bg = if is_sel {
+                    0xFF2E2E38
+                } else if idx % 2 == 1 {
+                    0xFF141418
+                } else {
+                    bg_main
+                };
+
+                canvas.draw_rect(main_x + theme.pt(4.0), cur_y, main_w - theme.pt(8.0), item_h, row_bg, 3);
+
+                let (badge, badge_c) = if item.is_dir {
+                    ("DIR", 0xFFF59E0B)
+                } else {
+                    match item.ext.as_str() {
+                        "PNG" | "JPG" | "JPEG" | "BMP" => ("IMG", 0xFFA1A1AA),
+                        "TXT" | "INI" | "CONF" | "LOG" => ("TXT", 0xFFD4D4D8),
+                        "ELF" | "BIN"                  => ("BIN", 0xFFE4E4E7),
+                        _                              => ("DOC", 0xFF71717A),
+                    }
+                };
+
+                canvas.draw_rect(main_x + theme.pt(10.0), cur_y + theme.pt(5.0), theme.pt(26.0), theme.pt(18.0), 0xFF1C1C22, 2);
+                canvas.draw_text(main_x + theme.pt(13.0), cur_y + theme.pt(6.0), badge, badge_c, font_cap);
+
+                let name_col = if is_sel { 0xFFFFFFFF } else { 0xFFE4E4E7 };
+                canvas.draw_text_clipped(
+                    main_x + theme.pt(44.0),
+                    cur_y + theme.pt(6.0),
+                    main_w - theme.pt(230.0),
+                    &item.name,
+                    name_col,
+                    font_body,
+                );
+
+                canvas.draw_text(main_x + main_w - theme.pt(180.0), cur_y + theme.pt(6.0), &item.ext, 0xFF71717A, font_cap);
+
+                if !item.is_dir {
+                    let sz_str = if item.size >= 1024 * 1024 {
+                        format!("{:.1} MB", item.size as f32 / (1024.0 * 1024.0))
+                    } else if item.size >= 1024 {
+                        format!("{:.1} KB", item.size as f32 / 1024.0)
+                    } else {
+                        format!("{} B", item.size)
+                    };
+                    canvas.draw_text(main_x + main_w - theme.pt(90.0), cur_y + theme.pt(6.0), &sz_str, 0xFF71717A, font_cap);
+                }
+            }
+            cur_y += item_h;
+        }
+
+        canvas.pop_clip();
+
+        let status_y = self.bounds.y + self.bounds.h - theme.pt(24.0);
+        canvas.draw_rect(self.bounds.x, status_y, self.bounds.w, theme.pt(24.0), bg_bar, 0);
+        canvas.draw_line_h(self.bounds.x, status_y, self.bounds.w, border_c);
+        canvas.draw_text(self.bounds.x + theme.pt(14.0), status_y + theme.pt(4.0), &self.status_msg, 0xFF71717A, font_cap);
+    }
+
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        if !pressed { return true; }
+
+        let theme = get_theme();
+        let tb_h = theme.pt(42.0);
+        let btn_y = self.bounds.y + theme.pt(8.0);
+        let btn_w = theme.pt(28.0);
+        let btn_h = theme.pt(26.0);
+
+        if my >= btn_y && my <= btn_y + btn_h {
+            if mx >= self.bounds.x + theme.pt(8.0) && mx <= self.bounds.x + theme.pt(8.0) + btn_w {
+                self.navigate_back();
+                return true;
+            }
+            if mx >= self.bounds.x + theme.pt(40.0) && mx <= self.bounds.x + theme.pt(40.0) + btn_w {
+                self.navigate_forward();
+                return true;
+            }
+            if mx >= self.bounds.x + theme.pt(72.0) && mx <= self.bounds.x + theme.pt(72.0) + btn_w {
+                self.navigate_up();
+                return true;
+            }
+
+            let search_w = theme.pt(150.0);
+            let s_x = self.bounds.x + self.bounds.w - search_w - theme.pt(8.0);
+            if mx >= s_x && mx <= s_x + search_w {
+                self.is_searching = true;
+                return true;
+            } else {
+                self.is_searching = false;
+            }
+        }
+
+        let side_w = theme.pt(150.0);
+        if mx < self.bounds.x + side_w && my > self.bounds.y + tb_h {
+            let rel_side_y = my - (self.bounds.y + tb_h + theme.pt(28.0));
+            if rel_side_y >= 0 {
+                let idx = (rel_side_y / theme.pt(28.0)) as usize;
+                let targets = ["RootFS", "EOS SHARE", "Initrd", "home/march"];
+                if idx < targets.len() {
+                    self.navigate_to(targets[idx]);
+                    return true;
+                }
+            }
+        }
+
+        let header_h = theme.pt(26.0);
+        let list_y = self.bounds.y + tb_h + header_h;
+        let item_h = theme.pt(30.0);
+        let rel_y = my - list_y + self.scroll_y;
+
+        if rel_y >= 0 && mx >= self.bounds.x + side_w {
+            let idx = (rel_y / item_h) as usize;
+            if idx < self.filtered_items.len() {
+                if self.selected_idx == Some(idx) {
+                    let it = self.filtered_items[idx].clone();
+                    self.open_item(&it);
+                } else {
+                    self.selected_idx = Some(idx);
+                }
+                return true;
+            }
+        }
+
+        true
+    }
+
+    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        let theme = get_theme();
+        let item_h = theme.pt(30.0);
+        let total_h = (self.filtered_items.len() as i32) * item_h;
+        let view_h = self.bounds.h - theme.pt(92.0);
+        let max_scroll = (total_h - view_h).max(0);
+
+        let step = theme.pt(30.0);
+        if dy < 0 {
+            self.scroll_y = (self.scroll_y + step).min(max_scroll);
+        } else if dy > 0 {
+            self.scroll_y = (self.scroll_y - step).max(0);
+        }
+        true
+    }
+
+    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
+        match keycode {
+            0x1C => {
+                if let Some(idx) = self.selected_idx {
+                    if idx < self.filtered_items.len() {
+                        let it = self.filtered_items[idx].clone();
+                        self.open_item(&it);
+                        return true;
+                    }
+                }
+            }
+            0x0E => {
+                if self.is_searching {
+                    self.search_query.pop();
+                    self.apply_filter();
+                    return true;
+                } else {
+                    self.navigate_up();
+                    return true;
+                }
+            }
+            0x48 => {
+                if let Some(idx) = self.selected_idx {
+                    if idx > 0 { self.selected_idx = Some(idx - 1); return true; }
+                } else if !self.filtered_items.is_empty() {
+                    self.selected_idx = Some(0);
+                    return true;
+                }
+            }
+            0x50 => {
+                if let Some(idx) = self.selected_idx {
+                    if idx + 1 < self.filtered_items.len() { self.selected_idx = Some(idx + 1); return true; }
+                } else if !self.filtered_items.is_empty() {
+                    self.selected_idx = Some(0);
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        false
+    }
+
+    fn handle_char(&mut self, c: char) -> bool {
+        if self.is_searching {
+            if c >= ' ' && c <= '~' {
+                self.search_query.push(c);
+                self.apply_filter();
+                return true;
+            }
+        }
+        false
+    }
 }
 ### END

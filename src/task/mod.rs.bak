@@ -17,7 +17,13 @@ pub enum FileSource {
 }
 
 #[derive(Clone)]
-pub struct FileDescriptor { pub path: String, pub source: FileSource, pub offset: usize }
+pub struct FileDescriptor {
+    pub path: String,
+    pub source: FileSource,
+    pub offset: usize,
+    pub is_writable: bool,
+    pub is_dirty: bool,
+}
 
 #[repr(C)]
 pub struct Task { pub id: u64, pub rsp: u64, pub name: &'static str, pub counter: u64, stack: Box<[u8; TASK_STACK_SIZE]>, pub mmap_bump: u64, pub fd_table: [Option<FileDescriptor>; 32] }

@@ -89,25 +89,33 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         for i in 256..512 { new_pml4.entries[i] = current_pml4.entries[i]; }
     }
 
-    log_info!("ELF", "Mapping program segments into new address space...");
+    log_info!("ELF", "Mapping program segments into new address space with BSS zeroing...");
     for i in 0..phnum {
         let ph_offset = phoff + (i * phentsize);
         if ph_offset + core::mem::size_of::<Elf64ProgramHeader>() > data.len() { return Err("Program header out of bounds"); }
         let ph = unsafe { *(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
         if ph.p_type == PT_LOAD {
-            let vaddr = ph.p_vaddr; let mem_sz = ph.p_memsz as usize;
-            let file_sz = ph.p_filesz as usize; let file_off = ph.p_offset as usize;
+            let vaddr = ph.p_vaddr;
+            let mem_sz = ph.p_memsz as usize;
+            let file_sz = ph.p_filesz as usize;
+            let file_off = ph.p_offset as usize;
 
             if file_off.saturating_add(file_sz) > data.len() { return Err("PT_LOAD segment exceeds bounds"); }
-            let start_page = vaddr & !0xFFF; let end_page = (vaddr + mem_sz as u64 + 0xFFF) & !0xFFF;
+            let start_page = vaddr & !0xFFF;
+            let end_page = (vaddr + mem_sz as u64 + 0xFFF) & !0xFFF;
             crate::mm::paging::map_user_pages(new_pml4_phys, start_page, ((end_page - start_page) / 4096) as usize)?;
 
             unsafe {
-                let mut remaining = file_sz; let mut data_offset = file_off; let mut dest_vaddr = vaddr;
+                // 1. نسخ بيانات الملف الفعلية
+                let mut remaining = file_sz;
+                let mut data_offset = file_off;
+                let mut dest_vaddr = vaddr;
                 while remaining > 0 {
-                    let p4_idx = ((dest_vaddr >> 39) & 0x1FF) as usize; let p3_idx = ((dest_vaddr >> 30) & 0x1FF) as usize;
-                    let p2_idx = ((dest_vaddr >> 21) & 0x1FF) as usize; let p1_idx = ((dest_vaddr >> 12) & 0x1FF) as usize;
+                    let p4_idx = ((dest_vaddr >> 39) & 0x1FF) as usize;
+                    let p3_idx = ((dest_vaddr >> 30) & 0x1FF) as usize;
+                    let p2_idx = ((dest_vaddr >> 21) & 0x1FF) as usize;
+                    let p1_idx = ((dest_vaddr >> 12) & 0x1FF) as usize;
                     let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
                     let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
                     let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
@@ -115,8 +123,36 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
 
                     let page_offset = (dest_vaddr & 0xFFF) as usize;
                     let copy_size = core::cmp::min(remaining, 4096 - page_offset);
-                    core::ptr::copy_nonoverlapping(data.as_ptr().add(data_offset), ((frame_phys + vmm.hhdm_offset) as *mut u8).add(page_offset), copy_size);
-                    remaining -= copy_size; data_offset += copy_size; dest_vaddr += copy_size as u64;
+                    core::ptr::copy_nonoverlapping(
+                        data.as_ptr().add(data_offset),
+                        ((frame_phys + vmm.hhdm_offset) as *mut u8).add(page_offset),
+                        copy_size
+                    );
+                    remaining -= copy_size;
+                    data_offset += copy_size;
+                    dest_vaddr += copy_size as u64;
+                }
+
+                // 2. تصفير الـ BSS الحتمي (من p_filesz حتى p_memsz)
+                if mem_sz > file_sz {
+                    let mut bss_remaining = mem_sz - file_sz;
+                    let mut bss_vaddr = vaddr + file_sz as u64;
+                    while bss_remaining > 0 {
+                        let p4_idx = ((bss_vaddr >> 39) & 0x1FF) as usize;
+                        let p3_idx = ((bss_vaddr >> 30) & 0x1FF) as usize;
+                        let p2_idx = ((bss_vaddr >> 21) & 0x1FF) as usize;
+                        let p1_idx = ((bss_vaddr >> 12) & 0x1FF) as usize;
+                        let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+                        let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+                        let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+                        let frame_phys = pt2.entries[p1_idx].physical_address();
+
+                        let page_offset = (bss_vaddr & 0xFFF) as usize;
+                        let zero_size = core::cmp::min(bss_remaining, 4096 - page_offset);
+                        core::ptr::write_bytes(((frame_phys + vmm.hhdm_offset) as *mut u8).add(page_offset), 0, zero_size);
+                        bss_remaining -= zero_size;
+                        bss_vaddr += zero_size as u64;
+                    }
                 }
             }
         }
@@ -126,20 +162,20 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
     let stack_start = USER_STACK_TOP - (stack_pages * 4096);
     crate::mm::paging::map_user_pages(new_pml4_phys, stack_start, stack_pages as usize)?;
 
-    // تخصيص صفحة خاصة لـ Thread Local Storage (TLS / FS_BASE)
     let tls_vaddr = 0x00007fffffff0000u64;
     crate::mm::paging::map_user_pages(new_pml4_phys, tls_vaddr, 2)?;
 
-    // تهيئة بنية الـ TCB الخاصة بـ x86_64: أول 8 بايت تشير إلى عنوانها نفسه
     unsafe {
-        let p4_idx = ((tls_vaddr >> 39) & 0x1FF) as usize; let p3_idx = ((tls_vaddr >> 30) & 0x1FF) as usize;
-        let p2_idx = ((tls_vaddr >> 21) & 0x1FF) as usize; let p1_idx = ((tls_vaddr >> 12) & 0x1FF) as usize;
+        let p4_idx = ((tls_vaddr >> 39) & 0x1FF) as usize;
+        let p3_idx = ((tls_vaddr >> 30) & 0x1FF) as usize;
+        let p2_idx = ((tls_vaddr >> 21) & 0x1FF) as usize;
+        let p1_idx = ((tls_vaddr >> 12) & 0x1FF) as usize;
         let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
         let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
         let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
         let tls_base = (pt2.entries[p1_idx].physical_address() + vmm.hhdm_offset) as *mut u64;
         core::ptr::write_bytes(tls_base as *mut u8, 0, 4096);
-        *tls_base = tls_vaddr; // Self-pointer: FS:[0] == tls_vaddr
+        *tls_base = tls_vaddr;
     }
 
     let mut args: Vec<&str> = Vec::new();
@@ -154,7 +190,7 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
     let default_envs = [
         "PATH=/bin:/usr/bin",
         "PYTHONHOME=/",
-        "PYTHONPATH=/python312.zip:/lib/python312.zip",
+        "PYTHONPATH=/python312.zip:/lib/python312.zip:/usr/lib/python3.12",
         "PYTHONUNBUFFERED=1",
         "TERM=xterm-256color",
     ];
@@ -163,8 +199,10 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
     let user_rsp;
 
     unsafe {
-        let p4_idx = ((user_rsp_page >> 39) & 0x1FF) as usize; let p3_idx = ((user_rsp_page >> 30) & 0x1FF) as usize;
-        let p2_idx = ((user_rsp_page >> 21) & 0x1FF) as usize; let p1_idx = ((user_rsp_page >> 12) & 0x1FF) as usize;
+        let p4_idx = ((user_rsp_page >> 39) & 0x1FF) as usize;
+        let p3_idx = ((user_rsp_page >> 30) & 0x1FF) as usize;
+        let p2_idx = ((user_rsp_page >> 21) & 0x1FF) as usize;
+        let p1_idx = ((user_rsp_page >> 12) & 0x1FF) as usize;
         let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
         let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
         let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
@@ -192,34 +230,35 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         }
 
         let mut entries: Vec<u64> = Vec::new();
-        entries.push(arg_pointers.len() as u64); // argc
+        entries.push(arg_pointers.len() as u64);
         for ptr in arg_pointers {
-            entries.push(ptr); // argv[i]
+            entries.push(ptr);
         }
-        entries.push(0); // argv NULL
+        entries.push(0);
 
         for ptr in env_pointers {
-            entries.push(ptr); // envp[i]
+            entries.push(ptr);
         }
-        entries.push(0); // envp NULL
+        entries.push(0);
 
-        // Auxiliary Vector (Elf64_auxv_t)
-        entries.push(6);  entries.push(4096);                         // AT_PAGESZ
-        entries.push(11); entries.push(1000);                         // AT_UID
-        entries.push(12); entries.push(1000);                         // AT_EUID
-        entries.push(13); entries.push(1000);                         // AT_GID
-        entries.push(14); entries.push(1000);                         // AT_EGID
-        entries.push(17); entries.push(100);                          // AT_CLKTCK
-        entries.push(23); entries.push(0);                            // AT_SECURE
-        entries.push(25); entries.push(user_rsp_page + 0x100);        // AT_RANDOM
-        entries.push(9);  entries.push(entry_point);                  // AT_ENTRY
-        entries.push(0);  entries.push(0);                            // AT_NULL
+        // Auxiliary Vector (System V AMD64 ABI)
+        entries.push(6);  entries.push(4096);
+        entries.push(11); entries.push(1000);
+        entries.push(12); entries.push(1000);
+        entries.push(13); entries.push(1000);
+        entries.push(14); entries.push(1000);
+        entries.push(17); entries.push(100);
+        entries.push(23); entries.push(0);
+        entries.push(25); entries.push(user_rsp_page + 0x100);
+        entries.push(9);  entries.push(entry_point);
+        entries.push(0);  entries.push(0);
 
-        let aligned_offset = 0x800usize;
-        let stack_dst = stack_base.add(aligned_offset) as *mut u64;
-        core::ptr::copy_nonoverlapping(entries.as_ptr(), stack_dst, entries.len());
+        let total_words = entries.len();
+        let target_offset = if total_words % 2 != 0 { 0x800usize } else { 0x7F8usize };
+        let stack_dst = stack_base.add(target_offset) as *mut u64;
+        core::ptr::copy_nonoverlapping(entries.as_ptr(), stack_dst, total_words);
 
-        user_rsp = user_rsp_page + aligned_offset as u64;
+        user_rsp = user_rsp_page + target_offset as u64;
     }
 
     clear_keyboard_buffer();
@@ -236,7 +275,6 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         let mxcsr: u32 = 0x1F80;
         core::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr, options(nostack));
 
-        // ضبط FS_BASE إلى مساحة الـ TLS الصالحة بدلاً من 0 لمنع #GP
         crate::arch::x86_64::syscall::wrmsr(0xC0000100, tls_vaddr);
         crate::arch::x86_64::syscall::wrmsr(0xC0000101, 0);
 
