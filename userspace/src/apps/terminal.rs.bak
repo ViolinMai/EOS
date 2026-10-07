@@ -1,241 +1,417 @@
 use crate::framework::*;
-use crate::net_manager::{NET, poll_network, TcpState};
+use std::fs;
+use std::sync::Mutex;
+
+pub static CLIPBOARD: Mutex<String> = Mutex::new(String::new());
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextPos {
+    line: usize,
+    col: usize,
+}
 
 pub struct TerminalApp {
     bounds: Rect,
     history: Vec<(String, u32)>,
     input: String,
-    cwd: String,
-    next_dns_id: u16,
+    cursor_idx: usize,
+    cmd_history: Vec<String>,
+    history_idx: Option<usize>,
+    scroll_y: i32,
+    current_dir: String,
+    is_selecting: bool,
+    sel_start: Option<TextPos>,
+    sel_end: Option<TextPos>,
 }
 
 impl TerminalApp {
     pub fn new() -> Self {
-        Self {
+        let mut app = Self {
             bounds: Rect::default(),
             history: vec![
-                ("EOS Terminal v2.0 (x86_64-unknown-linux-musl)".into(), 0xFF94A3B8),
-                ("Type 'help' for commands. Try 'ping 10.0.2.2' or 'curl 10.0.2.2'".into(), 0xFF64748B),
+                ("EOS Interactive POSIX Shell v0.2".into(), 0xFF38BDF8),
+                ("Persistent history loaded from RootFS/.bash_history".into(), 0xFF94A3B8),
+                ("".into(), 0xFFFFFFFF),
             ],
             input: String::new(),
-            cwd: "/EOS SHARE".into(),
-            next_dns_id: 100,
-        }
+            cursor_idx: 0,
+            cmd_history: Vec::new(),
+            history_idx: None,
+            scroll_y: 0,
+            current_dir: "/".into(),
+            is_selecting: false,
+            sel_start: None,
+            sel_end: None,
+        };
+        app.load_history_from_disk();
+        app
     }
 
-    fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
-        let parts: Vec<&str> = s.split('.').collect();
-        if parts.len() != 4 { return None; }
-        let mut ip = [0u8; 4];
-        for i in 0..4 {
-            ip[i] = parts[i].parse().ok()?;
-        }
-        Some(ip)
-    }
-
-    fn resolve_host(&mut self, host: &str) -> Result<[u8; 4], String> {
-        if let Some(ip) = Self::parse_ipv4(host) {
-            return Ok(ip);
-        }
-
-        let qid = self.next_dns_id;
-        self.next_dns_id = self.next_dns_id.wrapping_add(1);
-
-        {
-            let mut lock = NET.lock().unwrap();
-            let net = lock.as_mut().ok_or("Network subsystem not initialized")?;
-            net.dns_replies.remove(&qid);
-            net.resolve_dns(host, qid);
-        }
-
-        let t_start = std::time::Instant::now();
-        while t_start.elapsed().as_millis() < 2500 {
-            poll_network();
-            {
-                let mut lock = NET.lock().unwrap();
-                if let Some(net) = lock.as_mut() {
-                    if let Some(res) = net.dns_replies.remove(&qid) {
-                        return res.ok_or_else(|| format!("ping: cannot resolve {}: Unknown host (NXDOMAIN)", host));
+    fn load_history_from_disk(&mut self) {
+        let candidates = ["RootFS/.bash_history", ".bash_history", "/RootFS/.bash_history"];
+        for p in &candidates {
+            if let Ok(content) = fs::read_to_string(p) {
+                for line in content.lines() {
+                    let tr = line.trim();
+                    if !tr.is_empty() && !self.cmd_history.contains(&tr.to_string()) {
+                        self.cmd_history.push(tr.to_string());
                     }
                 }
+                break;
             }
-            std::thread::yield_now();
         }
+    }
 
-        Err(format!("ping: cannot resolve {}: DNS request timed out", host))
+    fn save_history_to_disk(&self) {
+        let payload = self.cmd_history.join("\n") + "\n";
+        let paths = ["RootFS/.bash_history", ".bash_history"];
+        for p in &paths {
+            let _ = fs::write(p, payload.as_bytes());
+        }
+    }
+
+    fn print_to_host(&self, text: &str) {
+        println!("{}", text);
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        let theme = get_theme();
+        let line_h = theme.pt(28.0);
+        let total_lines = self.history.len() + 1;
+        let total_h = (total_lines as i32) * line_h;
+        let visible_h = self.bounds.h - theme.pt(28.0);
+        self.scroll_y = (total_h - visible_h).max(0);
     }
 
     fn execute(&mut self) {
-        let cmd = self.input.trim().to_string();
-        let echo = format!("{}> {}", self.cwd, cmd);
-        self.history.push((echo.clone(), 0xFF38BDF8));
-        println!("[TERM] {}", echo);
+        let raw_cmd = self.input.trim().to_string();
+        let prompt_line = format!("eos:{}$ {}", self.current_dir, self.input);
+        self.history.push((prompt_line.clone(), 0xFF38BDF8));
+        self.print_to_host(&prompt_line);
+
+        if !raw_cmd.is_empty() {
+            self.cmd_history.retain(|x| x != &raw_cmd);
+            self.cmd_history.push(raw_cmd.clone());
+            self.save_history_to_disk();
+        }
+        self.history_idx = None;
         self.input.clear();
+        self.cursor_idx = 0;
+        self.sel_start = None;
+        self.sel_end = None;
 
-        let parts: Vec<&str> = cmd.split_whitespace().collect();
-        if parts.is_empty() { return; }
+        if raw_cmd.is_empty() {
+            self.scroll_to_bottom();
+            return;
+        }
 
-        match parts[0] {
+        let parts = self.parse_command_args(&raw_cmd);
+        if parts.is_empty() {
+            self.scroll_to_bottom();
+            return;
+        }
+
+        let program = &parts[0];
+        let args = &parts[1..];
+
+        match program.as_str() {
             "help" => {
-                self.history.push(("Available commands:".into(), 0xFFF8FAFC));
-                self.history.push(("  ping <host/ip> - Real ICMP packets with DNS resolution".into(), 0xFFCBD5E1));
-                self.history.push(("  ipconfig       - Display IP, MAC, Gateway, and ARP table".into(), 0xFFCBD5E1));
-                self.history.push(("  curl <host/ip> - Real HTTP/1.1 client with TCP handshake".into(), 0xFFCBD5E1));
-                self.history.push(("  ls [path]      - List directory entries".into(), 0xFFCBD5E1));
-                self.history.push(("  cat <file>     - Display file contents".into(), 0xFFCBD5E1));
-                self.history.push(("  clear          - Clear console screen".into(), 0xFFCBD5E1));
-            }
-            "ipconfig" | "ifconfig" => {
-                poll_network();
-                let lock = NET.lock().unwrap();
-                if let Some(net) = lock.as_ref() {
-                    self.history.push(("eth0: flags=UP,BROADCAST,RUNNING".into(), 0xFF22C55E));
-                    self.history.push((format!("      inet {}.{}.{}.{}  netmask 255.255.255.0", net.ip[0], net.ip[1], net.ip[2], net.ip[3]), 0xFFFFFFFF));
-                    self.history.push((format!("      gateway {}.{}.{}.{}  dns {}.{}.{}.{}", net.gateway[0], net.gateway[1], net.gateway[2], net.gateway[3], net.dns_server[0], net.dns_server[1], net.dns_server[2], net.dns_server[3]), 0xFF94A3B8));
-                    self.history.push((format!("      ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", net.mac[0], net.mac[1], net.mac[2], net.mac[3], net.mac[4], net.mac[5]), 0xFF38BDF8));
-                    self.history.push((format!("ARP Table ({} entries):", net.arp_cache.len()), 0xFFCBD5E1));
-                    for (ip, mac) in &net.arp_cache {
-                        self.history.push((format!("  {}.{}.{}.{} at {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}", ip[0], ip[1], ip[2], ip[3], mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]), 0xFFCBD5E1));
-                    }
+                let msgs = [
+                    ("Built-in commands:", 0xFFFCD34D),
+                    ("  help           - Display command overview", 0xFFE2E8F0),
+                    ("  clear          - Clear terminal history buffer", 0xFFE2E8F0),
+                    ("  history        - View saved commands across reboots", 0xFFE2E8F0),
+                    ("  ls [path]      - List directory contents", 0xFFE2E8F0),
+                    ("  cd <path>      - Change working directory", 0xFFE2E8F0),
+                    ("  cat <file>     - Print file contents", 0xFFE2E8F0),
+                    ("  uname -a       - Print system & kernel information", 0xFFE2E8F0),
+                    ("  net / ipconfig - Print network status", 0xFFE2E8F0),
+                    ("Supported Binaries:", 0xFFFCD34D),
+                    ("  python.elf <args> - CPython 3.12 Runtime", 0xFF34D399),
+                ];
+                for (m, c) in msgs {
+                    self.history.push((m.into(), c));
+                    self.print_to_host(m);
                 }
             }
-            "ping" => {
-                if parts.len() < 2 {
-                    self.history.push(("usage: ping <hostname or IP address>".into(), 0xFFEF4444));
-                    return;
-                }
-                let target_host = parts[1];
-                let target_ip = match self.resolve_host(target_host) {
-                    Ok(ip) => ip,
-                    Err(e) => {
-                        self.history.push((e, 0xFFEF4444));
-                        return;
-                    }
-                };
-
-                self.history.push((format!("PING {} ({}.{}.{}.{}): 56 data bytes", target_host, target_ip[0], target_ip[1], target_ip[2], target_ip[3]), 0xFFF8FAFC));
-
-                {
-                    let mut lock = NET.lock().unwrap();
-                    if let Some(net) = lock.as_mut() {
-                        net.ping_replies.clear();
-                        net.ping(target_ip, 1);
-                    }
-                }
-
-                let t_start = std::time::Instant::now();
-                let mut got_reply = false;
-                while t_start.elapsed().as_millis() < 1200 {
-                    poll_network();
-                    {
-                        let mut lock = NET.lock().unwrap();
-                        if let Some(net) = lock.as_mut() {
-                            if let Some((from, seq, len)) = net.ping_replies.pop() {
-                                let rtt = t_start.elapsed().as_millis();
-                                self.history.push((format!("{} bytes from {}.{}.{}.{}: icmp_seq={} time={} ms", len, from[0], from[1], from[2], from[3], seq, rtt), 0xFF22C55E));
-                                got_reply = true;
-                                break;
-                            }
-                        }
-                    }
-                    std::thread::yield_now();
-                }
-                if !got_reply {
-                    self.history.push(("Request timeout for icmp_seq 1".into(), 0xFFEF4444));
+            "history" => {
+                for (i, h) in self.cmd_history.iter().enumerate() {
+                    let msg = format!("  {:3}  {}", i + 1, h);
+                    self.history.push((msg.clone(), 0xFFE2E8F0));
+                    self.print_to_host(&msg);
                 }
             }
-            "curl" => {
-                if parts.len() < 2 {
-                    self.history.push(("usage: curl <hostname or IP address> [path]".into(), 0xFFEF4444));
-                    return;
-                }
-                let target_host = parts[1];
-                let req_path = if parts.len() > 2 { parts[2] } else { "/" };
-                let target_ip = match self.resolve_host(target_host) {
-                    Ok(ip) => ip,
-                    Err(e) => {
-                        self.history.push((e, 0xFFEF4444));
-                        return;
-                    }
-                };
-
-                self.history.push((format!("Connecting to http://{}{} ({}.{}.{}.{}):80 ...", target_host, req_path, target_ip[0], target_ip[1], target_ip[2], target_ip[3]), 0xFF38BDF8));
-                let sock_port = {
-                    let mut lock = NET.lock().unwrap();
-                    let net = lock.as_mut().unwrap();
-                    net.http_get(target_ip, target_host, req_path)
-                };
-
-                let t_start = std::time::Instant::now();
-                let mut received = false;
-                while t_start.elapsed().as_millis() < 3000 {
-                    poll_network();
-                    {
-                        let mut lock = NET.lock().unwrap();
-                        if let Some(net) = lock.as_mut() {
-                            if let Some(sock) = net.tcp_sockets.get_mut(&sock_port) {
-                                if !sock.rx_buffer.is_empty() {
-                                    let content = String::from_utf8_lossy(&sock.rx_buffer).to_string();
-                                    for line in content.lines().take(15) {
-                                        self.history.push((line.to_string(), 0xFF22C55E));
-                                    }
-                                    if content.lines().count() > 15 {
-                                        self.history.push(("... [truncated response]".into(), 0xFF94A3B8));
-                                    }
-                                    received = true;
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    std::thread::yield_now();
-                }
-
-                if !received {
-                    let lock = NET.lock().unwrap();
-                    let state = lock.as_ref().and_then(|n| n.tcp_sockets.get(&sock_port)).map(|s| s.state);
-                    self.history.push((format!("curl: Connection timed out (TCP state: {:?})", state.unwrap_or(TcpState::Closed)), 0xFFEF4444));
-                }
+            "clear" => {
+                self.history.clear();
+                self.scroll_y = 0;
             }
-            "clear" => self.history.clear(),
-            "pwd" => {
-                self.history.push((self.cwd.clone(), 0xFF22C55E));
+            "uname" => {
+                let msg = "EOS 0.1.0 x86_64 SMP Monolithic + Ring 3 UI (musl libc)";
+                self.history.push((msg.into(), 0xFFE2E8F0));
+                self.print_to_host(msg);
             }
-            "cd" => {
-                if parts.len() > 1 { self.cwd = parts[1].to_string(); } else { self.cwd = "/EOS SHARE".into(); }
+            "ipconfig" | "net" => {
+                let msg = "eth0 (Intel E1000): IP=10.0.2.15 Subnet=255.255.255.0 Gateway=10.0.2.2 [UP]";
+                self.history.push((msg.into(), 0xFF10B981));
+                self.print_to_host(msg);
             }
             "ls" => {
-                let target_dir = if parts.len() > 1 { parts[1] } else { &self.cwd };
-                if let Ok(entries) = std::fs::read_dir(target_dir).or_else(|_| std::fs::read_dir(target_dir.trim_start_matches('/'))) {
-                    let mut line = String::new();
-                    for e in entries.flatten() {
-                        let is_d = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                        let name = e.file_name().to_string_lossy().to_string();
-                        let label = format!("{} {}   ", if is_d { "📁" } else { "📄" }, name);
-                        line.push_str(&label);
-                    }
-                    if !line.is_empty() { self.history.push((line, 0xFFFFFFFF)); } else { self.history.push(("(empty directory)".into(), 0xFF94A3B8)); }
+                let target = if args.is_empty() {
+                    if self.current_dir == "/" { "".into() } else { self.current_dir.clone() }
                 } else {
-                    self.history.push((format!("ls: cannot access '{}': No such file", target_dir), 0xFFEF4444));
+                    args[0].clone()
+                };
+
+                let clean = target.trim_matches('/').to_string();
+                let candidates = [
+                    clean.clone(),
+                    format!("/{}", clean),
+                    if clean.is_empty() { ".".into() } else { clean.clone() }
+                ];
+                let mut found = false;
+                for p in &candidates {
+                    if let Ok(entries) = fs::read_dir(p) {
+                        let mut out = String::new();
+                        for e in entries.flatten() {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                            if is_dir {
+                                out.push_str(&format!("{}/  ", name));
+                            } else {
+                                out.push_str(&format!("{}  ", name));
+                            }
+                        }
+                        if out.is_empty() {
+                            let empty = "(empty directory)";
+                            self.history.push((empty.into(), 0xFF94A3B8));
+                            self.print_to_host(empty);
+                        } else {
+                            self.history.push((out.clone(), 0xFFE2E8F0));
+                            self.print_to_host(&out);
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    let err = format!("ls: cannot access '{}': No such file or directory", target);
+                    self.history.push((err.clone(), 0xFFEF4444));
+                    self.print_to_host(&err);
+                }
+            }
+            "cd" => {
+                if args.is_empty() || args[0] == "/" || args[0] == "~" {
+                    self.current_dir = "/".into();
+                } else {
+                    let target = &args[0];
+                    if target == ".." {
+                        if let Some(pos) = self.current_dir.trim_end_matches('/').rfind('/') {
+                            let parent = &self.current_dir[..pos];
+                            self.current_dir = if parent.is_empty() { "/".into() } else { parent.into() };
+                        } else {
+                            self.current_dir = "/".into();
+                        }
+                    } else {
+                        let next = if target.starts_with('/') {
+                            target.clone()
+                        } else if self.current_dir == "/" {
+                            format!("/{}", target)
+                        } else {
+                            format!("{}/{}", self.current_dir, target)
+                        };
+
+                        let clean_check = next.trim_matches('/');
+                        if clean_check.is_empty() || fs::read_dir(clean_check).is_ok() || fs::read_dir(&format!("/{}", clean_check)).is_ok() {
+                            self.current_dir = next;
+                        } else {
+                            let err = format!("cd: no such directory: {}", target);
+                            self.history.push((err.clone(), 0xFFEF4444));
+                            self.print_to_host(&err);
+                        }
+                    }
                 }
             }
             "cat" => {
-                if parts.len() < 2 {
-                    self.history.push(("Usage: cat <filename>".into(), 0xFFEF4444));
+                if args.is_empty() {
+                    let err = "cat: missing operand";
+                    self.history.push((err.into(), 0xFFEF4444));
+                    self.print_to_host(err);
                 } else {
-                    let p = parts[1];
-                    let full_path = if p.starts_with('/') { p.to_string() } else { format!("{}/{}", self.cwd, p) };
-                    if let Ok(content) = std::fs::read_to_string(&full_path).or_else(|_| std::fs::read_to_string(p)) {
-                        for l in content.lines() {
-                            self.history.push((l.replace('\t', "    "), 0xFFE2E8F0));
-                        }
+                    let fpath = if self.current_dir == "/" {
+                        args[0].clone()
                     } else {
-                        self.history.push((format!("cat: {}: No such file", p), 0xFFEF4444));
+                        format!("{}/{}", self.current_dir.trim_matches('/'), args[0])
+                    };
+                    let candidates = [fpath.clone(), args[0].clone(), format!("/{}", fpath)];
+                    let mut read_ok = false;
+                    for p in &candidates {
+                        if let Ok(content) = fs::read_to_string(p) {
+                            for line in content.lines() {
+                                self.history.push((line.to_string(), 0xFFE2E8F0));
+                                self.print_to_host(line);
+                            }
+                            read_ok = true;
+                            break;
+                        }
+                    }
+                    if !read_ok {
+                        let err = format!("cat: {}: No such file", args[0]);
+                        self.history.push((err.clone(), 0xFFEF4444));
+                        self.print_to_host(&err);
                     }
                 }
             }
             _ => {
-                self.history.push((format!("command not found: {}", parts[0]), 0xFFEF4444));
+                self.execute_elf(program, args);
+            }
+        }
+        self.scroll_to_bottom();
+    }
+
+    fn execute_elf(&mut self, prog: &str, args: &[String]) {
+        let clean_prog = prog.trim().trim_start_matches('/');
+        let cur = self.current_dir.trim_matches('/');
+        let candidates = [
+            clean_prog.to_string(),
+            format!("{}.elf", clean_prog),
+            if cur.is_empty() { clean_prog.to_string() } else { format!("{}/{}", cur, clean_prog) },
+            format!("Initrd/{}", clean_prog),
+            format!("Initrd/{}.elf", clean_prog),
+            format!("EOS SHARE/{}", clean_prog),
+            format!("EOS SHARE/{}.elf", clean_prog),
+            format!("RootFS/{}", clean_prog),
+        ];
+
+        let mut found_path = None;
+        for c in &candidates {
+            if fs::metadata(c).is_ok() || fs::read(c).is_ok() {
+                found_path = Some(c.clone());
+                break;
+            }
+        }
+
+        let target_elf = found_path.unwrap_or_else(|| clean_prog.to_string());
+        let msg = format!("Spawning ELF '{}' on hardware SMP core...", target_elf);
+        self.history.push((msg.clone(), 0xFF34D399));
+        self.print_to_host(&msg);
+
+        let mut arg_str = String::new();
+        for a in args {
+            arg_str.push_str(a);
+            arg_str.push(' ');
+        }
+
+        let mut path_bytes = [0u8; 128];
+        let mut args_bytes = [0u8; 128];
+        let p_src = target_elf.as_bytes();
+        let a_src = arg_str.trim().as_bytes();
+        path_bytes[..p_src.len().min(127)].copy_from_slice(&p_src[..p_src.len().min(127)]);
+        args_bytes[..a_src.len().min(127)].copy_from_slice(&a_src[..a_src.len().min(127)]);
+
+        let ret: i64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") 500u64 => ret,
+                in("rdi") path_bytes.as_ptr() as u64,
+                in("rsi") args_bytes.as_ptr() as u64,
+                out("rcx") _, out("r11") _
+            );
+        }
+
+        if ret >= 0 {
+            let success = format!("Process dispatched to Core {}. Execution started.", ret);
+            self.history.push((success.clone(), 0xFF10B981));
+            self.print_to_host(&success);
+        } else {
+            let err = format!("Kernel failed to execute process (Error: {})", ret);
+            self.history.push((err.clone(), 0xFFEF4444));
+            self.print_to_host(&err);
+        }
+    }
+
+    fn parse_command_args(&self, line: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut cur = String::new();
+        let mut in_quotes = false;
+        let mut quote_char = ' ';
+
+        for c in line.chars() {
+            if in_quotes {
+                if c == quote_char {
+                    in_quotes = false;
+                } else {
+                    cur.push(c);
+                }
+            } else if c == '"' || c == '\'' {
+                in_quotes = true;
+                quote_char = c;
+            } else if c.is_whitespace() {
+                if !cur.is_empty() {
+                    tokens.push(cur.clone());
+                    cur.clear();
+                }
+            } else {
+                cur.push(c);
+            }
+        }
+        if !cur.is_empty() {
+            tokens.push(cur);
+        }
+        tokens
+    }
+
+    fn get_selected_text(&self) -> Option<String> {
+        let (s, e) = match (self.sel_start, self.sel_end) {
+            (Some(a), Some(b)) => {
+                if a.line < b.line || (a.line == b.line && a.col <= b.col) { (a, b) } else { (b, a) }
+            }
+            _ => return None,
+        };
+
+        if s == e { return None; }
+
+        let mut lines = Vec::new();
+        for l_idx in s.line..=e.line {
+            let line_str = if l_idx < self.history.len() {
+                &self.history[l_idx].0
+            } else if l_idx == self.history.len() {
+                &self.input
+            } else {
+                continue;
+            };
+
+            let start_c = if l_idx == s.line { s.col } else { 0 };
+            let end_c = if l_idx == e.line { e.col } else { line_str.len() };
+
+            if start_c < line_str.len() {
+                let clamped_end = end_c.min(line_str.len());
+                if start_c <= clamped_end {
+                    lines.push(line_str[start_c..clamped_end].to_string());
+                }
+            }
+        }
+
+        if lines.is_empty() { None } else { Some(lines.join("\n")) }
+    }
+
+    fn copy_selection(&self) -> bool {
+        if let Some(text) = self.get_selected_text() {
+            if let Ok(mut clip) = CLIPBOARD.lock() {
+                *clip = text;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn paste_clipboard(&mut self) {
+        if let Ok(clip) = CLIPBOARD.lock() {
+            if !clip.is_empty() {
+                self.input.insert_str(self.cursor_idx, &clip);
+                self.cursor_idx += clip.len();
+                self.sel_start = None;
+                self.sel_end = None;
             }
         }
     }
@@ -244,43 +420,278 @@ impl TerminalApp {
 impl Widget for TerminalApp {
     fn as_any(&self) -> &dyn std::any::Any { self }
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
-    fn layout(&mut self, x: usize, y: usize, w: usize, h: usize) -> Rect {
-        self.bounds = Rect { x, y, w, h };
+
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect::new(x, y, w, h);
         self.bounds
     }
 
     fn paint(&self, canvas: &mut Canvas) {
         let theme = get_theme();
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF090D16, 0);
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF0D1117, 0);
 
-        let line_h = theme.pt(24.0);
-        let max_lines = self.bounds.h.saturating_sub(theme.pt(36.0)) / line_h;
-        let start = if self.history.len() > max_lines { self.history.len() - max_lines } else { 0 };
+        let font_size = theme.font_title();
+        let line_h = theme.pt(28.0);
+        let pad_x = theme.pt(16.0);
+        let scrollbar_w = theme.pt(8.0);
 
-        let mut cy = self.bounds.y + theme.pt(12.0);
-        for (line, color) in &self.history[start..] {
-            canvas.draw_text(self.bounds.x + theme.pt(18.0), cy, line, *color, theme.font_body());
+        let mut cy = self.bounds.y + theme.pt(14.0) - self.scroll_y;
+
+        let (s_pos, e_pos) = match (self.sel_start, self.sel_end) {
+            (Some(a), Some(b)) => {
+                if a.line < b.line || (a.line == b.line && a.col <= b.col) { (Some(a), Some(b)) } else { (Some(b), Some(a)) }
+            }
+            _ => (None, None),
+        };
+
+        for (idx, (line, color)) in self.history.iter().enumerate() {
+            if cy + line_h > self.bounds.y && cy < self.bounds.y + self.bounds.h - line_h {
+                if let (Some(s), Some(e)) = (s_pos, e_pos) {
+                    if idx >= s.line && idx <= e.line {
+                        let start_col = if idx == s.line { s.col } else { 0 };
+                        let end_col = if idx == e.line { e.col } else { line.len() };
+                        let pre_text = &line[..start_col.min(line.len())];
+                        let sel_text = &line[start_col.min(line.len())..end_col.min(line.len())];
+                        let (px_off, _) = canvas.measure_text(pre_text, font_size);
+                        let (sel_w, _) = canvas.measure_text(sel_text, font_size);
+                        if sel_w > 0 {
+                            canvas.draw_rect(self.bounds.x + pad_x + px_off as i32, cy, sel_w as i32, line_h, 0xFF1E3A8A, 2);
+                        }
+                    }
+                }
+
+                canvas.draw_text_clipped(
+                    self.bounds.x + pad_x,
+                    cy,
+                    self.bounds.w - (pad_x * 2) - scrollbar_w,
+                    line,
+                    *color,
+                    font_size,
+                );
+            }
             cy += line_h;
         }
-        let prompt = format!("{}> {}_", self.cwd, self.input);
-        canvas.draw_text(self.bounds.x + theme.pt(18.0), cy, &prompt, 0xFFFFFFFF, theme.font_body());
+
+        let prompt_prefix = format!("eos:{}$ ", self.current_dir);
+        let (pw, _) = canvas.measure_text(&prompt_prefix, font_size);
+        canvas.draw_text(self.bounds.x + pad_x, cy, &prompt_prefix, 0xFF38BDF8, font_size);
+
+        let input_before_cursor = &self.input[..self.cursor_idx.min(self.input.len())];
+        let (cx_offset, _) = canvas.measure_text(input_before_cursor, font_size);
+
+        canvas.draw_text_clipped(
+            self.bounds.x + pad_x + pw as i32,
+            cy,
+            self.bounds.w - (pad_x * 2) - pw as i32 - scrollbar_w,
+            &self.input,
+            0xFFF8FAFC,
+            font_size,
+        );
+
+        let cur_x = self.bounds.x + pad_x + pw as i32 + cx_offset as i32;
+        let cursor_w = theme.pt(2.5).max(2);
+        canvas.draw_rect(cur_x, cy + theme.pt(2.0), cursor_w, line_h - theme.pt(6.0), 0xFF38BDF8, 1);
+
+        let total_lines = self.history.len() + 1;
+        let total_h = (total_lines as i32) * line_h;
+        let view_h = self.bounds.h;
+        if total_h > view_h {
+            let sb_x = self.bounds.x + self.bounds.w - scrollbar_w - 2;
+            let thumb_h = ((view_h as f32 / total_h as f32) * view_h as f32).max(24.0) as i32;
+            let max_scroll = (total_h - view_h).max(1);
+            let thumb_y = self.bounds.y + ((self.scroll_y as f32 / max_scroll as f32) * (view_h - thumb_h) as f32) as i32;
+            canvas.draw_rect(sb_x, self.bounds.y, scrollbar_w, view_h, 0x221E293B, 0);
+            canvas.draw_rect(sb_x, thumb_y, scrollbar_w, thumb_h, 0x8894A3B8, (scrollbar_w / 2) as usize);
+        }
     }
 
-    fn handle_mouse(&mut self, mx: usize, my: usize, _p: bool) -> bool {
-        self.bounds.contains(mx, my)
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        if !self.bounds.contains(mx, my) {
+            if self.is_selecting { self.is_selecting = false; }
+            return false;
+        }
+
+        let theme = get_theme();
+        let font_size = theme.font_title();
+        let line_h = theme.pt(28.0);
+        let pad_x = theme.pt(16.0);
+
+        let rel_y = my - (self.bounds.y + theme.pt(14.0)) + self.scroll_y;
+        let line_idx = if rel_y >= 0 { (rel_y / line_h) as usize } else { 0 };
+
+        let char_w = ((font_size as i32 * 5) / 9).max(1);
+        let rel_x = (mx - (self.bounds.x + pad_x)).max(0);
+        let col_idx = (rel_x / char_w) as usize;
+
+        let current_pos = TextPos { line: line_idx, col: col_idx };
+
+        if pressed {
+            if !self.is_selecting {
+                self.is_selecting = true;
+                self.sel_start = Some(current_pos);
+                self.sel_end = Some(current_pos);
+            } else {
+                self.sel_end = Some(current_pos);
+            }
+        } else {
+            if self.is_selecting {
+                self.sel_end = Some(current_pos);
+                self.is_selecting = false;
+            }
+        }
+        true
+    }
+
+    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        let theme = get_theme();
+        let line_h = theme.pt(28.0);
+        let total_lines = self.history.len() + 1;
+        let total_h = (total_lines as i32) * line_h;
+        let max_scroll = (total_h - self.bounds.h).max(0);
+
+        let step = theme.pt(32.0);
+        if dy < 0 {
+            self.scroll_y = (self.scroll_y + step).min(max_scroll);
+        } else if dy > 0 {
+            self.scroll_y = (self.scroll_y - step).max(0);
+        }
+        true
+    }
+
+    fn handle_key(&mut self, keycode: u8, mods: u8) -> bool {
+        match keycode {
+            0x1C => {
+                self.execute();
+                return true;
+            }
+            0x2E if (mods & 0x02) != 0 => {
+                if self.copy_selection() {
+                    return true;
+                }
+                self.history.push((format!("eos:{}$ {}^C", self.current_dir, self.input), 0xFFF87171));
+                self.input.clear();
+                self.cursor_idx = 0;
+                self.sel_start = None;
+                self.sel_end = None;
+                self.scroll_to_bottom();
+                return true;
+            }
+            0x2F if (mods & 0x02) != 0 => {
+                self.paste_clipboard();
+                return true;
+            }
+            0x48 => {
+                if !self.cmd_history.is_empty() {
+                    let next_idx = match self.history_idx {
+                        Some(i) => if i > 0 { i - 1 } else { 0 },
+                        None => self.cmd_history.len() - 1,
+                    };
+                    self.history_idx = Some(next_idx);
+                    self.input = self.cmd_history[next_idx].clone();
+                    self.cursor_idx = self.input.len();
+                    self.scroll_to_bottom();
+                    return true;
+                }
+            }
+            0x50 => {
+                if let Some(i) = self.history_idx {
+                    if i + 1 < self.cmd_history.len() {
+                        self.history_idx = Some(i + 1);
+                        self.input = self.cmd_history[i + 1].clone();
+                        self.cursor_idx = self.input.len();
+                    } else {
+                        self.history_idx = None;
+                        self.input.clear();
+                        self.cursor_idx = 0;
+                    }
+                    self.scroll_to_bottom();
+                    return true;
+                }
+            }
+            0x4B => {
+                if self.cursor_idx > 0 {
+                    self.cursor_idx -= 1;
+                    return true;
+                }
+            }
+            0x4D => {
+                if self.cursor_idx < self.input.len() {
+                    self.cursor_idx += 1;
+                    return true;
+                }
+            }
+            0x47 => {
+                self.cursor_idx = 0;
+                return true;
+            }
+            0x4F => {
+                self.cursor_idx = self.input.len();
+                return true;
+            }
+            _ => {}
+        }
+        false
     }
 
     fn handle_char(&mut self, c: char) -> bool {
-        if c == '\n' {
-            self.execute();
-            return true;
-        } else if c == '\x08' {
-            self.input.pop();
-            return true;
-        } else if c >= ' ' && c <= '~' {
-            self.input.push(c);
+        if c == '\x08' {
+            if self.cursor_idx > 0 {
+                self.cursor_idx -= 1;
+                self.input.remove(self.cursor_idx);
+                self.sel_start = None;
+                self.sel_end = None;
+                return true;
+            }
+            return false;
+        }
+
+        match c {
+            '"' | '\'' => {
+                if self.cursor_idx < self.input.len() && self.input.chars().nth(self.cursor_idx) == Some(c) {
+                    self.cursor_idx += 1;
+                    return true;
+                }
+                self.input.insert(self.cursor_idx, c);
+                self.input.insert(self.cursor_idx + 1, c);
+                self.cursor_idx += 1;
+                return true;
+            }
+            '(' => {
+                self.input.insert(self.cursor_idx, '(');
+                self.input.insert(self.cursor_idx + 1, ')');
+                self.cursor_idx += 1;
+                return true;
+            }
+            '[' => {
+                self.input.insert(self.cursor_idx, '[');
+                self.input.insert(self.cursor_idx + 1, ']');
+                self.cursor_idx += 1;
+                return true;
+            }
+            '{' => {
+                self.input.insert(self.cursor_idx, '{');
+                self.input.insert(self.cursor_idx + 1, '}');
+                self.cursor_idx += 1;
+                return true;
+            }
+            ')' | ']' | '}' => {
+                if self.cursor_idx < self.input.len() && self.input.chars().nth(self.cursor_idx) == Some(c) {
+                    self.cursor_idx += 1;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        if c >= ' ' && c <= '~' {
+            self.input.insert(self.cursor_idx, c);
+            self.cursor_idx += 1;
+            self.sel_start = None;
+            self.sel_end = None;
             return true;
         }
+
         false
     }
 }

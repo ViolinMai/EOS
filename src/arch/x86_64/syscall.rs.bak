@@ -29,7 +29,7 @@ pub fn push_user_event(ev: InputEvent) {
     if let InputEvent::MouseMove { x: new_dx, y: new_dy } = ev {
         if head != tail {
             let prev_idx = if head == 0 { 127 } else { head - 1 };
-            if let Some(InputEvent::MouseMove { ref mut x, ref mut y }) = unsafe { USERSPACE_EVENTS[prev_idx].as_mut() } {
+            if let Some(InputEvent::MouseMove { x, y }) = unsafe { USERSPACE_EVENTS[prev_idx].as_mut() } {
                 *x += new_dx;
                 *y += new_dy;
                 return;
@@ -382,7 +382,21 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = addr;
             }
         }
-        16 => { frame.rax = 0; }
+        16 => { // ioctl
+            let req = frame.rsi;
+            if req == 0x5413 { // TIOCGWINSZ
+                let ws_ptr = frame.rdx;
+                if validate_user_range(ws_ptr, 8) {
+                    let winsize: [u16; 4] = [25, 80, 0, 0];
+                    let _ = copy_to_user(ws_ptr, unsafe { core::slice::from_raw_parts(winsize.as_ptr() as *const u8, 8) });
+                    frame.rax = 0;
+                } else {
+                    frame.rax = -14i64 as u64;
+                }
+            } else {
+                frame.rax = -25i64 as u64; // ENOTTY
+            }
+        }
         20 => { // writev
             let fd = frame.rdi; let iov_ptr = frame.rsi as *const [u64; 2]; let iovcnt = frame.rdx as usize;
             if fd == 1 || fd == 2 {
@@ -433,6 +447,35 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             } else {
                 frame.rax = old_addr;
             }
+        }
+        32 => { // dup
+            let old_fd = frame.rdi as usize;
+            if old_fd < 64 {
+                let proc = get_current_process();
+                if let Some(file) = proc.fd_table[old_fd].clone() {
+                    let mut allocated = false;
+                    for (new_fd, slot) in proc.fd_table.iter_mut().enumerate().skip(3) {
+                        if slot.is_none() {
+                            *slot = Some(file);
+                            frame.rax = new_fd as u64;
+                            allocated = true;
+                            break;
+                        }
+                    }
+                    if !allocated { frame.rax = -24i64 as u64; } // EMFILE
+                } else { frame.rax = -9i64 as u64; } // EBADF
+            } else { frame.rax = -9i64 as u64; }
+        }
+        33 => { // dup2
+            let old_fd = frame.rdi as usize;
+            let new_fd = frame.rsi as usize;
+            if old_fd < 64 && new_fd < 64 {
+                let proc = get_current_process();
+                if let Some(file) = proc.fd_table[old_fd].clone() {
+                    proc.fd_table[new_fd] = Some(file);
+                    frame.rax = new_fd as u64;
+                } else { frame.rax = -9i64 as u64; }
+            } else { frame.rax = -9i64 as u64; }
         }
         35 | 226 | 230 => { // nanosleep & clock_nanosleep
             let req = if frame.rax == 230 { frame.rdx } else { frame.rdi } as *const [u64; 2];
@@ -514,7 +557,33 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = 0;
             } else { frame.rax = -14i64 as u64; }
         }
-        72 => { frame.rax = 0; }
+        72 => { // fcntl
+            let cmd = frame.rsi;
+            match cmd {
+                0 => { // F_DUPFD
+                    let old_fd = frame.rdi as usize;
+                    if old_fd < 64 {
+                        let proc = get_current_process();
+                        if let Some(file) = proc.fd_table[old_fd].clone() {
+                            let mut allocated = false;
+                            for (new_fd, slot) in proc.fd_table.iter_mut().enumerate().skip(3) {
+                                if slot.is_none() {
+                                    *slot = Some(file);
+                                    frame.rax = new_fd as u64;
+                                    allocated = true;
+                                    break;
+                                }
+                            }
+                            if !allocated { frame.rax = -24i64 as u64; }
+                        } else { frame.rax = -9i64 as u64; }
+                    } else { frame.rax = -9i64 as u64; }
+                }
+                1 | 2 => frame.rax = 0, // F_GETFD, F_SETFD
+                3 => frame.rax = 2,     // F_GETFL -> O_RDWR
+                4 => frame.rax = 0,     // F_SETFL
+                _ => frame.rax = 0,
+            }
+        }
         74 => { // fsync
             let fd = frame.rdi as usize;
             if fd < 64 {

@@ -7,3 +7,5 @@ pub mod pit;
 pub mod power;
 pub mod smp;
 pub mod syscall;
+
+pub mod fpu;

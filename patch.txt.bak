@@ -1,126 +1,186 @@
-### FILE: userspace/src/framework/theme.rs
-#[derive(Clone, Debug)]
-pub struct Theme {
-    pub scale: f32,
-    pub is_dark: bool,
-    pub bg_desktop: u32,
-    pub bg_window: u32,
-    pub bg_titlebar: u32,
-    pub border_window: u32,
-    pub text_primary: u32,
-    pub text_secondary: u32,
-    pub text_muted: u32,
-    pub accent: u32,
-    pub accent_hover: u32,
-    pub btn_close: u32,
-    pub btn_minimize: u32,
-    pub btn_maximize: u32,
-}
+### ITEM FIX: src/fs/elf.rs
+pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str> {
+    log_info!("ELF", "Validating binary headers (Size: {} bytes)...", data.len());
+    if data.len() < core::mem::size_of::<Elf64Header>() { return Err("Binary too small for ELF Header"); }
+    let header = unsafe { *(data.as_ptr() as *const Elf64Header) };
+    if header.magic != ELF_MAGIC { return Err("Invalid ELF magic identifier"); }
+    if header.class != 2 || header.machine != 0x3E { return Err("Binary is not x86_64 64-bit"); }
 
-impl Theme {
-    pub fn dark() -> Self {
-        Self {
-            scale: 3.0,                  // 3X UI Scale افتراضي
-            is_dark: true,
-            bg_desktop: 0xFF0A0A0C,      // أسود فحمي نقي
-            bg_window: 0xFF121215,       // رمادي مسود داكن وفخم
-            bg_titlebar: 0xFF1A1A1E,     // شريط عنوان داكن ومحايد
-            border_window: 0xFF2A2A30,   // حدود ناعمة ومظلمة
-            text_primary: 0xFFF4F4F5,
-            text_secondary: 0xFFA1A1AA,
-            text_muted: 0xFF71717A,
-            accent: 0xFF2563EB,          // أزرق عصري للمحددات
-            accent_hover: 0xFF3B82F6,
-            btn_close: 0xFFEF4444,
-            btn_minimize: 0xFFF59E0B,
-            btn_maximize: 0xFF10B981,
+    reset_core2_process();
+
+    let entry_point = header.entry;
+    let phoff = header.phoff as usize;
+    let phnum = header.phnum as usize;
+    let phentsize = header.phentsize as usize;
+    log_info!("ELF", "ELF Validated: Entry point {:#018x}, Program Headers: {}", entry_point, phnum);
+
+    let vmm = unsafe { (&*addr_of_mut!(VMM)).as_ref().ok_or("VMM not initialized")? };
+    let kernel_cr3 = read_cr3() & 0x000F_FFFF_FFFF_F000;
+    let new_pml4_phys = crate::mm::frame::allocate_frame_safe().ok_or("OOM: PML4")?;
+    let new_pml4 = unsafe { &mut *((new_pml4_phys + vmm.hhdm_offset) as *mut PageTable) };
+    let current_pml4 = unsafe { &*((kernel_cr3 + vmm.hhdm_offset) as *const PageTable) };
+
+    unsafe {
+        core::ptr::write_bytes(new_pml4 as *mut PageTable as *mut u8, 0, 4096);
+        for i in 256..512 { new_pml4.entries[i] = current_pml4.entries[i]; }
+    }
+
+    log_info!("ELF", "Mapping program segments into new address space...");
+    for i in 0..phnum {
+        let ph_offset = phoff + (i * phentsize);
+        if ph_offset + core::mem::size_of::<Elf64ProgramHeader>() > data.len() { return Err("Program header out of bounds"); }
+        let ph = unsafe { *(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+
+        if ph.p_type == PT_LOAD {
+            let vaddr = ph.p_vaddr; let mem_sz = ph.p_memsz as usize;
+            let file_sz = ph.p_filesz as usize; let file_off = ph.p_offset as usize;
+
+            if file_off.saturating_add(file_sz) > data.len() { return Err("PT_LOAD segment exceeds bounds"); }
+            let start_page = vaddr & !0xFFF; let end_page = (vaddr + mem_sz as u64 + 0xFFF) & !0xFFF;
+            crate::mm::paging::map_user_pages(new_pml4_phys, start_page, ((end_page - start_page) / 4096) as usize)?;
+
+            unsafe {
+                let mut remaining = file_sz; let mut data_offset = file_off; let mut dest_vaddr = vaddr;
+                while remaining > 0 {
+                    let p4_idx = ((dest_vaddr >> 39) & 0x1FF) as usize; let p3_idx = ((dest_vaddr >> 30) & 0x1FF) as usize;
+                    let p2_idx = ((dest_vaddr >> 21) & 0x1FF) as usize; let p1_idx = ((dest_vaddr >> 12) & 0x1FF) as usize;
+                    let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+                    let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+                    let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+                    let frame_phys = pt2.entries[p1_idx].physical_address();
+
+                    let page_offset = (dest_vaddr & 0xFFF) as usize;
+                    let copy_size = core::cmp::min(remaining, 4096 - page_offset);
+                    core::ptr::copy_nonoverlapping(data.as_ptr().add(data_offset), ((frame_phys + vmm.hhdm_offset) as *mut u8).add(page_offset), copy_size);
+                    remaining -= copy_size; data_offset += copy_size; dest_vaddr += copy_size as u64;
+                }
+            }
         }
     }
 
-    pub fn pt(&self, val: f32) -> i32 {
-        let factor = (self.scale / 2.0).max(1.0);
-        (val * factor).round() as i32
-    }
+    let stack_pages = 512;
+    let stack_start = USER_STACK_TOP - (stack_pages * 4096);
+    crate::mm::paging::map_user_pages(new_pml4_phys, stack_start, stack_pages as usize)?;
 
-    pub fn font_caption(&self) -> usize {
-        let factor = (self.scale / 2.0).max(1.0);
-        (13.0 * factor).round() as usize
-    }
+    // تخصيص صفحة خاصة لـ Thread Local Storage (TLS / FS_BASE)
+    let tls_vaddr = 0x00007fffffff0000u64;
+    crate::mm::paging::map_user_pages(new_pml4_phys, tls_vaddr, 2)?;
 
-    pub fn font_body(&self) -> usize {
-        let factor = (self.scale / 2.0).max(1.0);
-        (15.0 * factor).round() as usize
-    }
-
-    pub fn font_title(&self) -> usize {
-        let factor = (self.scale / 2.0).max(1.0);
-        (18.0 * factor).round() as usize
-    }
-
-    pub fn font_large(&self) -> usize {
-        let factor = (self.scale / 2.0).max(1.0);
-        (22.0 * factor).round() as usize
-    }
-}
-
-pub static mut CURRENT_THEME: Option<Theme> = None;
-pub static mut DESKTOP_WALLPAPER: Option<(Vec<u32>, usize, usize)> = None;
-pub static mut WALLPAPER_CHANGED: bool = false;
-pub static mut FULL_REDRAW_REQUESTED: bool = false;
-
-pub fn get_theme() -> &'static Theme {
+    // تهيئة بنية الـ TCB الخاصة بـ x86_64: أول 8 بايت تشير إلى عنوانها نفسه
     unsafe {
-        if CURRENT_THEME.is_none() {
-            CURRENT_THEME = Some(Theme::dark());
+        let p4_idx = ((tls_vaddr >> 39) & 0x1FF) as usize; let p3_idx = ((tls_vaddr >> 30) & 0x1FF) as usize;
+        let p2_idx = ((tls_vaddr >> 21) & 0x1FF) as usize; let p1_idx = ((tls_vaddr >> 12) & 0x1FF) as usize;
+        let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let tls_base = (pt2.entries[p1_idx].physical_address() + vmm.hhdm_offset) as *mut u64;
+        core::ptr::write_bytes(tls_base as *mut u8, 0, 4096);
+        *tls_base = tls_vaddr; // Self-pointer: FS:[0] == tls_vaddr
+    }
+
+    let mut args: Vec<&str> = Vec::new();
+    if args_str.is_empty() { 
+        args.push("python"); 
+    } else { 
+        for part in args_str.split_whitespace() { 
+            args.push(part); 
+        } 
+    }
+
+    let default_envs = [
+        "PATH=/bin:/usr/bin",
+        "PYTHONHOME=/",
+        "PYTHONPATH=/python312.zip:/lib/python312.zip",
+        "PYTHONUNBUFFERED=1",
+        "TERM=xterm-256color",
+    ];
+
+    let user_rsp_page = USER_STACK_TOP - 0x2000;
+    let user_rsp;
+
+    unsafe {
+        let p4_idx = ((user_rsp_page >> 39) & 0x1FF) as usize; let p3_idx = ((user_rsp_page >> 30) & 0x1FF) as usize;
+        let p2_idx = ((user_rsp_page >> 21) & 0x1FF) as usize; let p1_idx = ((user_rsp_page >> 12) & 0x1FF) as usize;
+        let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let stack_base = (pt2.entries[p1_idx].physical_address() + vmm.hhdm_offset) as *mut u8;
+
+        core::ptr::write_bytes(stack_base, 0, 4096);
+
+        let mut string_cursor = 4096 - 16;
+        let mut arg_pointers: Vec<u64> = Vec::new();
+        for arg in &args {
+            let bytes = arg.as_bytes();
+            string_cursor -= bytes.len() + 1;
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), stack_base.add(string_cursor), bytes.len());
+            *stack_base.add(string_cursor + bytes.len()) = 0;
+            arg_pointers.push(user_rsp_page + string_cursor as u64);
         }
-        CURRENT_THEME.as_ref().unwrap()
-    }
-}
 
-pub fn get_theme_mut() -> &'static mut Theme {
-    unsafe {
-        if CURRENT_THEME.is_none() {
-            CURRENT_THEME = Some(Theme::dark());
+        let mut env_pointers: Vec<u64> = Vec::new();
+        for env in &default_envs {
+            let bytes = env.as_bytes();
+            string_cursor -= bytes.len() + 1;
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), stack_base.add(string_cursor), bytes.len());
+            *stack_base.add(string_cursor + bytes.len()) = 0;
+            env_pointers.push(user_rsp_page + string_cursor as u64);
         }
-        CURRENT_THEME.as_mut().unwrap()
+
+        let mut entries: Vec<u64> = Vec::new();
+        entries.push(arg_pointers.len() as u64); // argc
+        for ptr in arg_pointers {
+            entries.push(ptr); // argv[i]
+        }
+        entries.push(0); // argv NULL
+
+        for ptr in env_pointers {
+            entries.push(ptr); // envp[i]
+        }
+        entries.push(0); // envp NULL
+
+        // Auxiliary Vector (Elf64_auxv_t)
+        entries.push(6);  entries.push(4096);                         // AT_PAGESZ
+        entries.push(11); entries.push(1000);                         // AT_UID
+        entries.push(12); entries.push(1000);                         // AT_EUID
+        entries.push(13); entries.push(1000);                         // AT_GID
+        entries.push(14); entries.push(1000);                         // AT_EGID
+        entries.push(17); entries.push(100);                          // AT_CLKTCK
+        entries.push(23); entries.push(0);                            // AT_SECURE
+        entries.push(25); entries.push(user_rsp_page + 0x100);        // AT_RANDOM
+        entries.push(9);  entries.push(entry_point);                  // AT_ENTRY
+        entries.push(0);  entries.push(0);                            // AT_NULL
+
+        let aligned_offset = 0x800usize;
+        let stack_dst = stack_base.add(aligned_offset) as *mut u64;
+        core::ptr::copy_nonoverlapping(entries.as_ptr(), stack_dst, entries.len());
+
+        user_rsp = user_rsp_page + aligned_offset as u64;
     }
-}
 
-pub fn set_theme_scale(scale: f32) {
-    let t = get_theme_mut();
-    t.scale = scale.clamp(2.0, 4.0);
-}
+    clear_keyboard_buffer();
+    ELF_EXIT_REQUESTED.store(false, Ordering::SeqCst);
+    let core_id = crate::profiler::get_core_id();
+    let state_ptr = unsafe { addr_of_mut!(crate::arch::x86_64::syscall::CORE_SYSCALL_STATES[core_id]) };
+    let spawn_rsp_ptr = unsafe { &mut (*state_ptr).kernel_spawn_rsp as *mut u64 };
 
-pub fn set_theme_accent(color: u32) {
-    let t = get_theme_mut();
-    t.accent = color;
-    let r = (((color >> 16) & 0xFF) as f32 * 1.18).min(255.0) as u32;
-    let g = (((color >> 8) & 0xFF) as f32 * 1.18).min(255.0) as u32;
-    let b = ((color & 0xFF) as f32 * 1.18).min(255.0) as u32;
-    t.accent_hover = 0xFF000000 | (r << 16) | (g << 8) | b;
-}
+    log_info!("ELF", "Jumping to Ring 3 userspace entry {:#018x} with RSP {:#018x} (Aligned 16: {}) on Core {}...", 
+        entry_point, user_rsp, (user_rsp % 16) == 0, core_id);
 
-pub fn redraw_fullscreen() {
-    unsafe { FULL_REDRAW_REQUESTED = true; }
-}
-
-pub fn take_full_redraw_requested() -> bool {
     unsafe {
-        let val = FULL_REDRAW_REQUESTED;
-        FULL_REDRAW_REQUESTED = false;
-        val
-    }
-}
+        crate::arch::x86_64::fpu::enable_sse();
+        let mxcsr: u32 = 0x1F80;
+        core::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr, options(nostack));
 
-pub fn notify_wallpaper_changed() {
-    unsafe { WALLPAPER_CHANGED = true; }
-}
+        // ضبط FS_BASE إلى مساحة الـ TLS الصالحة بدلاً من 0 لمنع #GP
+        crate::arch::x86_64::syscall::wrmsr(0xC0000100, tls_vaddr);
+        crate::arch::x86_64::syscall::wrmsr(0xC0000101, 0);
 
-pub fn take_wallpaper_changed() -> bool {
-    unsafe {
-        let val = WALLPAPER_CHANGED;
-        WALLPAPER_CHANGED = false;
-        val
+        jump_to_ring3(entry_point, user_rsp, USER_CODE_SELECTOR as u64, USER_DATA_SELECTOR as u64, spawn_rsp_ptr, new_pml4_phys);
+        core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3);
+        free_user_pages(new_pml4_phys);
     }
+    log_info!("ELF", "Ring 3 process returned cleanly to kernel.");
+    Ok(())
 }
 ### END

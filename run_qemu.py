@@ -64,6 +64,22 @@ def create_demo_tar(user_elf_data):
         add_file("readme.txt", b"Welcome to EOS Kernel!\r\nThis file is read from TarFS.\r\n")
         if user_elf_data: add_file("user_app.elf", user_elf_data)
 
+        # تضمين ملفات مفسر CPython والمكتبة المضغوطة
+        py_elf_path = "python.elf"
+        if os.path.exists(py_elf_path):
+            with open(py_elf_path, "rb") as pf:
+                p_data = pf.read()
+                add_file("python.elf", p_data)
+                add_file("Initrd/python.elf", p_data)
+
+        py_zip_path = "python312.zip"
+        if os.path.exists(py_zip_path):
+            with open(py_zip_path, "rb") as zf:
+                z_data = zf.read()
+                add_file("python312.zip", z_data)
+                add_file("lib/python312.zip", z_data)
+                add_file("Initrd/python312.zip", z_data)
+
         share_dir = r"C:\EOS_SHARE"
         settings_file = os.path.join(share_dir, "settings.ini")
         if os.path.exists(settings_file):
@@ -239,114 +255,123 @@ def make_uefi_fat32_disk(img_path, files):
         f.write(disk)
 
 def make_ext2_disk(img_path):
-    if os.path.exists(img_path) and os.path.getsize(img_path) >= (10 * 1024 * 1024):
+    TARGET_SIZE_MB = 2048 # 2 GB
+    BLOCK_SIZE = 1024
+    TOTAL_BLOCKS = TARGET_SIZE_MB * 1024  # 2,097,152 Blocks
+
+    expected_file_size = TOTAL_BLOCKS * BLOCK_SIZE
+    if os.path.exists(img_path) and os.path.getsize(img_path) == expected_file_size:
         return
 
-    BLOCK_SIZE = 1024
-    TOTAL_BLOCKS = 10240  # 10 MB
-    INODES_COUNT = 256
+    print(f"[*] Formatting 2 GB EXT2 RootFS ({img_path})...")
+    INODES_COUNT = 32768
     BLOCKS_PER_GROUP = 8192
     INODES_PER_GROUP = 256
     INODE_SIZE = 128
 
-    disk = bytearray(TOTAL_BLOCKS * BLOCK_SIZE)
+    # تخصيص وترميز أول 64 كتلة (تحتوي Superblock, BGDs, Bitmaps, Inode Table, Root Data)
+    HEADER_BLOCKS = 64
+    header_disk = bytearray(HEADER_BLOCKS * BLOCK_SIZE)
 
     # 1. Superblock (Block 1, offset 1024)
     sb_off = 1024
-    struct.pack_into("<I", disk, sb_off + 0, INODES_COUNT)      # s_inodes_count
-    struct.pack_into("<I", disk, sb_off + 4, TOTAL_BLOCKS)      # s_blocks_count
-    struct.pack_into("<I", disk, sb_off + 8, 0)                 # s_r_blocks_count
-    struct.pack_into("<I", disk, sb_off + 12, TOTAL_BLOCKS - 35) # s_free_blocks_count
-    struct.pack_into("<I", disk, sb_off + 16, INODES_COUNT - 12) # s_free_inodes_count
-    struct.pack_into("<I", disk, sb_off + 20, 1)                # s_first_data_block (1 for 1KB blocks)
-    struct.pack_into("<I", disk, sb_off + 24, 0)                # s_log_block_size (0 = 1024)
-    struct.pack_into("<I", disk, sb_off + 28, 0)                # s_log_frag_size
-    struct.pack_into("<I", disk, sb_off + 32, BLOCKS_PER_GROUP) # s_blocks_per_group
-    struct.pack_into("<I", disk, sb_off + 36, BLOCKS_PER_GROUP) # s_frags_per_group
-    struct.pack_into("<I", disk, sb_off + 40, INODES_PER_GROUP) # s_inodes_per_group
-    struct.pack_into("<H", disk, sb_off + 56, 0xEF53)           # s_magic
-    struct.pack_into("<H", disk, sb_off + 58, 1)                # s_state (Clean)
-    struct.pack_into("<H", disk, sb_off + 62, 0)                # s_minor_rev_level
-    struct.pack_into("<I", disk, sb_off + 76, 1)                # s_rev_level (Dynamic rev)
-    struct.pack_into("<H", disk, sb_off + 84, 11)               # s_first_ino
-    struct.pack_into("<H", disk, sb_off + 88, INODE_SIZE)       # s_inode_size
+    struct.pack_into("<I", header_disk, sb_off + 0, INODES_COUNT)
+    struct.pack_into("<I", header_disk, sb_off + 4, TOTAL_BLOCKS)
+    struct.pack_into("<I", header_disk, sb_off + 8, 0)
+    struct.pack_into("<I", header_disk, sb_off + 12, TOTAL_BLOCKS - 100)
+    struct.pack_into("<I", header_disk, sb_off + 16, INODES_COUNT - 15)
+    struct.pack_into("<I", header_disk, sb_off + 20, 1)
+    struct.pack_into("<I", header_disk, sb_off + 24, 0) # 1024 B block
+    struct.pack_into("<I", header_disk, sb_off + 28, 0)
+    struct.pack_into("<I", header_disk, sb_off + 32, BLOCKS_PER_GROUP)
+    struct.pack_into("<I", header_disk, sb_off + 36, BLOCKS_PER_GROUP)
+    struct.pack_into("<I", header_disk, sb_off + 40, INODES_PER_GROUP)
+    struct.pack_into("<H", header_disk, sb_off + 56, 0xEF53)
+    struct.pack_into("<H", header_disk, sb_off + 58, 1)
+    struct.pack_into("<H", header_disk, sb_off + 62, 0)
+    struct.pack_into("<I", header_disk, sb_off + 76, 1)
+    struct.pack_into("<H", header_disk, sb_off + 84, 11)
+    struct.pack_into("<H", header_disk, sb_off + 88, INODE_SIZE)
 
     # 2. Block Group Descriptor (Block 2, offset 2048)
     bgd_off = 2048
-    struct.pack_into("<I", disk, bgd_off + 0, 3)                # bg_block_bitmap
-    struct.pack_into("<I", disk, bgd_off + 4, 4)                # bg_inode_bitmap
-    struct.pack_into("<I", disk, bgd_off + 8, 5)                # bg_inode_table (Blocks 5..36)
-    struct.pack_into("<H", disk, bgd_off + 12, TOTAL_BLOCKS - 35) # bg_free_blocks_count
-    struct.pack_into("<H", disk, bgd_off + 14, INODES_COUNT - 12) # bg_free_inodes_count
-    struct.pack_into("<H", disk, bgd_off + 16, 2)               # bg_used_dirs_count
+    struct.pack_into("<I", header_disk, bgd_off + 0, 3) # block bitmap
+    struct.pack_into("<I", header_disk, bgd_off + 4, 4) # inode bitmap
+    struct.pack_into("<I", header_disk, bgd_off + 8, 5) # inode table
+    # الحقل هنا يمثل الكتل الحرة في المجموعة الأولى فقط (أقل من 65535 دائماً)
+    struct.pack_into("<H", header_disk, bgd_off + 12, BLOCKS_PER_GROUP - 100)
+    struct.pack_into("<H", header_disk, bgd_off + 14, INODES_PER_GROUP - 15)
+    struct.pack_into("<H", header_disk, bgd_off + 16, 2)
 
     # 3. Bitmaps
-    # Block bitmap (Block 3): Mark blocks 0..36 as used
-    for b in range(37):
-        disk[(3 * BLOCK_SIZE) + (b // 8)] |= (1 << (b % 8))
+    # حجز الكتل 0..63 في Block Bitmap (Block 3)
+    for b in range(64):
+        header_disk[(3 * BLOCK_SIZE) + (b // 8)] |= (1 << (b % 8))
 
-    # Inode bitmap (Block 4): Mark Inodes 1..12 as used
-    for ino in range(1, 13):
-        disk[(4 * BLOCK_SIZE) + ((ino - 1) // 8)] |= (1 << ((ino - 1) % 8))
+    # حجز Inodes 1..15 في Inode Bitmap (Block 4)
+    for ino in range(1, 16):
+        header_disk[(4 * BLOCK_SIZE) + ((ino - 1) // 8)] |= (1 << ((ino - 1) % 8))
 
-    # Helper: Inode Table offset
     def get_inode_offset(ino):
         return (5 * BLOCK_SIZE) + ((ino - 1) * INODE_SIZE)
 
-    # 4. Inode 2: Root Directory "/"
+    # Inode 2: Root Directory "/"
     root_ino_off = get_inode_offset(2)
-    struct.pack_into("<H", disk, root_ino_off + 0, 0o040755)    # i_mode (Directory)
-    struct.pack_into("<I", disk, root_ino_off + 4, BLOCK_SIZE)  # i_size
-    struct.pack_into("<H", disk, root_ino_off + 26, 3)          # i_links_count
-    struct.pack_into("<I", disk, root_ino_off + 28, 2)          # i_blocks (512-byte units)
-    struct.pack_into("<I", disk, root_ino_off + 40, 37)         # i_block[0] = Block 37 (Dir contents)
-    disk[(3 * BLOCK_SIZE) + (37 // 8)] |= (1 << (37 % 8))
+    struct.pack_into("<H", header_disk, root_ino_off + 0, 0o040755)
+    struct.pack_into("<I", header_disk, root_ino_off + 4, BLOCK_SIZE)
+    struct.pack_into("<H", header_disk, root_ino_off + 26, 3)
+    struct.pack_into("<I", header_disk, root_ino_off + 28, 2)
+    struct.pack_into("<I", header_disk, root_ino_off + 40, 37)
 
-    # 5. Inode 11: settings.ini (Pre-allocated regular file)
+    # Inode 11: settings.ini
     init_settings = b"dark_mode=false\nui_scale=2\nwallpaper=\n"
     set_ino_off = get_inode_offset(11)
-    struct.pack_into("<H", disk, set_ino_off + 0, 0o100644)     # i_mode (Regular file)
-    struct.pack_into("<I", disk, set_ino_off + 4, len(init_settings)) # i_size
-    struct.pack_into("<H", disk, set_ino_off + 26, 1)          # i_links_count
-    struct.pack_into("<I", disk, set_ino_off + 28, 8)          # i_blocks (4 blocks allocated)
+    struct.pack_into("<H", header_disk, set_ino_off + 0, 0o100644)
+    struct.pack_into("<I", header_disk, set_ino_off + 4, len(init_settings))
+    struct.pack_into("<H", header_disk, set_ino_off + 26, 1)
+    struct.pack_into("<I", header_disk, set_ino_off + 28, 8)
     for b_idx in range(4):
-        struct.pack_into("<I", disk, set_ino_off + 40 + (b_idx * 4), 38 + b_idx)
-        disk[(3 * BLOCK_SIZE) + ((38 + b_idx) // 8)] |= (1 << ((38 + b_idx) % 8))
-    # Write initial settings payload
-    disk[38 * BLOCK_SIZE : (38 * BLOCK_SIZE) + len(init_settings)] = init_settings
+        struct.pack_into("<I", header_disk, set_ino_off + 40 + (b_idx * 4), 38 + b_idx)
+    header_disk[38 * BLOCK_SIZE : (38 * BLOCK_SIZE) + len(init_settings)] = init_settings
 
-    # 6. Root Directory Data (Block 37)
-    # Entries: "." (ino 2), ".." (ino 2), "settings.ini" (ino 11)
-    dir_blk_off = 37 * BLOCK_SIZE
-    cur = dir_blk_off
+    # Inode 12: .bash_history
+    hist_ino_off = get_inode_offset(12)
+    struct.pack_into("<H", header_disk, hist_ino_off + 0, 0o100644)
+    struct.pack_into("<I", header_disk, hist_ino_off + 4, 0)
+    struct.pack_into("<H", header_disk, hist_ino_off + 26, 1)
+    struct.pack_into("<I", header_disk, hist_ino_off + 28, 8)
+    for b_idx in range(4):
+        struct.pack_into("<I", header_disk, hist_ino_off + 40 + (b_idx * 4), 42 + b_idx)
 
-    # "."
-    struct.pack_into("<I", disk, cur + 0, 2)
-    struct.pack_into("<H", disk, cur + 4, 12)
-    disk[cur + 6] = 1
-    disk[cur + 7] = 2
-    disk[cur + 8 : cur + 9] = b"."
-    cur += 12
+    # Directory Entries in Block 37
+    cur = 37 * BLOCK_SIZE
+    def add_dirent(ino, name, file_type):
+        nonlocal cur
+        name_b = name.encode("ascii")
+        rec_len = (8 + len(name_b) + 3) & ~3
+        struct.pack_into("<I", header_disk, cur + 0, ino)
+        struct.pack_into("<H", header_disk, cur + 4, rec_len)
+        header_disk[cur + 6] = len(name_b)
+        header_disk[cur + 7] = file_type
+        header_disk[cur + 8 : cur + 8 + len(name_b)] = name_b
+        cur += rec_len
 
-    # ".."
-    struct.pack_into("<I", disk, cur + 0, 2)
-    struct.pack_into("<H", disk, cur + 4, 12)
-    disk[cur + 6] = 2
-    disk[cur + 7] = 2
-    disk[cur + 8 : cur + 10] = b".."
-    cur += 12
+    add_dirent(2, ".", 2)
+    add_dirent(2, "..", 2)
+    add_dirent(11, "settings.ini", 1)
 
-    # "settings.ini"
-    name_bytes = b"settings.ini"
-    rec_len = BLOCK_SIZE - (cur - dir_blk_off)
-    struct.pack_into("<I", disk, cur + 0, 11)
-    struct.pack_into("<H", disk, cur + 4, rec_len)
-    disk[cur + 6] = len(name_bytes)
-    disk[cur + 7] = 1
-    disk[cur + 8 : cur + 8 + len(name_bytes)] = name_bytes
+    last_name = b".bash_history"
+    rec_len = (37 * BLOCK_SIZE + BLOCK_SIZE) - cur
+    struct.pack_into("<I", header_disk, cur + 0, 12)
+    struct.pack_into("<H", header_disk, cur + 4, rec_len)
+    header_disk[cur + 6] = len(last_name)
+    header_disk[cur + 7] = 1
+    header_disk[cur + 8 : cur + 8 + len(last_name)] = last_name
 
+    # كتابة أول 64 كتلة وتوسيع الملف لحظياً إلى 2GB (Sparse allocation)
     with open(img_path, "wb") as f:
-        f.write(disk)
+        f.write(header_disk)
+        f.truncate(expected_file_size)
 
 def prepare_and_run():
     share_dir = r"C:\EOS_SHARE"
@@ -393,9 +418,9 @@ def prepare_and_run():
 
         sec0 = bytearray(512)
         sec0[0:4] = b"EOSS"
-        struct.pack_into("<H", sec0, 4, 1) # version
-        struct.pack_into("<H", sec0, 6, len(default_payload)) # length
-        struct.pack_into("<I", sec0, 8, crc) # checksum
+        struct.pack_into("<H", sec0, 4, 1)
+        struct.pack_into("<H", sec0, 6, len(default_payload))
+        struct.pack_into("<I", sec0, 8, crc)
         sec0[20:20 + len(default_payload)] = default_payload
 
         with open(settings_img_path, "wb") as f:

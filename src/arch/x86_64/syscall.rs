@@ -382,7 +382,21 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = addr;
             }
         }
-        16 => { frame.rax = 0; }
+        16 => { // ioctl
+            let req = frame.rsi;
+            if req == 0x5413 { // TIOCGWINSZ
+                let ws_ptr = frame.rdx;
+                if validate_user_range(ws_ptr, 8) {
+                    let winsize: [u16; 4] = [25, 80, 0, 0];
+                    let _ = copy_to_user(ws_ptr, unsafe { core::slice::from_raw_parts(winsize.as_ptr() as *const u8, 8) });
+                    frame.rax = 0;
+                } else {
+                    frame.rax = -14i64 as u64;
+                }
+            } else {
+                frame.rax = -25i64 as u64; // ENOTTY
+            }
+        }
         20 => { // writev
             let fd = frame.rdi; let iov_ptr = frame.rsi as *const [u64; 2]; let iovcnt = frame.rdx as usize;
             if fd == 1 || fd == 2 {
@@ -433,6 +447,35 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             } else {
                 frame.rax = old_addr;
             }
+        }
+        32 => { // dup
+            let old_fd = frame.rdi as usize;
+            if old_fd < 64 {
+                let proc = get_current_process();
+                if let Some(file) = proc.fd_table[old_fd].clone() {
+                    let mut allocated = false;
+                    for (new_fd, slot) in proc.fd_table.iter_mut().enumerate().skip(3) {
+                        if slot.is_none() {
+                            *slot = Some(file);
+                            frame.rax = new_fd as u64;
+                            allocated = true;
+                            break;
+                        }
+                    }
+                    if !allocated { frame.rax = -24i64 as u64; }
+                } else { frame.rax = -9i64 as u64; }
+            } else { frame.rax = -9i64 as u64; }
+        }
+        33 => { // dup2
+            let old_fd = frame.rdi as usize;
+            let new_fd = frame.rsi as usize;
+            if old_fd < 64 && new_fd < 64 {
+                let proc = get_current_process();
+                if let Some(file) = proc.fd_table[old_fd].clone() {
+                    proc.fd_table[new_fd] = Some(file);
+                    frame.rax = new_fd as u64;
+                } else { frame.rax = -9i64 as u64; }
+            } else { frame.rax = -9i64 as u64; }
         }
         35 | 226 | 230 => { // nanosleep & clock_nanosleep
             let req = if frame.rax == 230 { frame.rdx } else { frame.rdi } as *const [u64; 2];
@@ -514,7 +557,33 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = 0;
             } else { frame.rax = -14i64 as u64; }
         }
-        72 => { frame.rax = 0; }
+        72 => { // fcntl
+            let cmd = frame.rsi;
+            match cmd {
+                0 => { // F_DUPFD
+                    let old_fd = frame.rdi as usize;
+                    if old_fd < 64 {
+                        let proc = get_current_process();
+                        if let Some(file) = proc.fd_table[old_fd].clone() {
+                            let mut allocated = false;
+                            for (new_fd, slot) in proc.fd_table.iter_mut().enumerate().skip(3) {
+                                if slot.is_none() {
+                                    *slot = Some(file);
+                                    frame.rax = new_fd as u64;
+                                    allocated = true;
+                                    break;
+                                }
+                            }
+                            if !allocated { frame.rax = -24i64 as u64; }
+                        } else { frame.rax = -9i64 as u64; }
+                    } else { frame.rax = -9i64 as u64; }
+                }
+                1 | 2 => frame.rax = 0,
+                3 => frame.rax = 2,
+                4 => frame.rax = 0,
+                _ => frame.rax = 0,
+            }
+        }
         74 => { // fsync
             let fd = frame.rdi as usize;
             if fd < 64 {
@@ -646,6 +715,27 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             let mut buf = alloc::vec![0u8; frame.rsi as usize]; let mut r = pit::read_tsc();
             for b in buf.iter_mut() { *b = (r & 0xFF) as u8; r >>= 3; }
             if copy_to_user(frame.rdi, &buf).is_ok() { frame.rax = frame.rsi; } else { frame.rax = -14i64 as u64; }
+        }
+        500 => { // sys_spawn_elf (Custom syscall to launch ELF via kernel on free SMP core)
+            let path_ptr = frame.rdi;
+            let args_ptr = frame.rsi;
+            let mut p_buf = [0u8; 128];
+            let mut a_buf = [0u8; 128];
+            let _ = copy_from_user(&mut p_buf, path_ptr, 127);
+            let _ = copy_from_user(&mut a_buf, args_ptr, 127);
+            let path_len = p_buf.iter().position(|&b| b == 0).unwrap_or(127);
+            let args_len = a_buf.iter().position(|&b| b == 0).unwrap_or(127);
+            let path_str = core::str::from_utf8(&p_buf[..path_len]).unwrap_or("");
+            let args_str = core::str::from_utf8(&a_buf[..args_len]).unwrap_or("");
+
+            match crate::task::request_elf_execution(path_str, args_str) {
+                Ok(core_id) => {
+                    frame.rax = core_id as u64;
+                }
+                Err(_) => {
+                    frame.rax = -2i64 as u64;
+                }
+            }
         }
         502 | 504 => { // sys_present & sys_present_rects
             let target_w = core::cmp::min(frame.r10 as usize, 1920);

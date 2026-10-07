@@ -1,46 +1,417 @@
 use crate::framework::*;
+use std::fs;
+use std::sync::Mutex;
+
+pub static CLIPBOARD: Mutex<String> = Mutex::new(String::new());
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct TextPos {
+    line: usize,
+    col: usize,
+}
 
 pub struct TerminalApp {
     bounds: Rect,
-    history: Vec<String>,
+    history: Vec<(String, u32)>,
     input: String,
+    cursor_idx: usize,
+    cmd_history: Vec<String>,
+    history_idx: Option<usize>,
     scroll_y: i32,
+    current_dir: String,
+    is_selecting: bool,
+    sel_start: Option<TextPos>,
+    sel_end: Option<TextPos>,
 }
 
 impl TerminalApp {
     pub fn new() -> Self {
-        Self {
+        let mut app = Self {
             bounds: Rect::default(),
             history: vec![
-                "EOS POSIX Ring 3 Terminal".into(),
-                "Type 'help' or 'clear' to test shell execution.".into(),
+                ("EOS Interactive POSIX Shell v0.2".into(), 0xFF38BDF8),
+                ("Persistent history loaded from RootFS/.bash_history".into(), 0xFF94A3B8),
+                ("".into(), 0xFFFFFFFF),
             ],
             input: String::new(),
+            cursor_idx: 0,
+            cmd_history: Vec::new(),
+            history_idx: None,
             scroll_y: 0,
+            current_dir: "/".into(),
+            is_selecting: false,
+            sel_start: None,
+            sel_end: None,
+        };
+        app.load_history_from_disk();
+        app
+    }
+
+    fn load_history_from_disk(&mut self) {
+        let candidates = ["RootFS/.bash_history", ".bash_history", "/RootFS/.bash_history"];
+        for p in &candidates {
+            if let Ok(content) = fs::read_to_string(p) {
+                for line in content.lines() {
+                    let tr = line.trim();
+                    if !tr.is_empty() && !self.cmd_history.contains(&tr.to_string()) {
+                        self.cmd_history.push(tr.to_string());
+                    }
+                }
+                break;
+            }
         }
     }
 
-    fn execute(&mut self) {
-        let cmd = self.input.trim().to_string();
-        self.history.push(format!("eos$ {}", cmd));
-        self.input.clear();
+    fn save_history_to_disk(&self) {
+        let payload = self.cmd_history.join("\n") + "\n";
+        let paths = ["RootFS/.bash_history", ".bash_history"];
+        for p in &paths {
+            let _ = fs::write(p, payload.as_bytes());
+        }
+    }
 
-        match cmd.as_str() {
+    fn print_to_host(&self, text: &str) {
+        println!("{}", text);
+    }
+
+    fn scroll_to_bottom(&mut self) {
+        let theme = get_theme();
+        let line_h = theme.pt(28.0);
+        let total_lines = self.history.len() + 1;
+        let total_h = (total_lines as i32) * line_h;
+        let visible_h = self.bounds.h - theme.pt(28.0);
+        self.scroll_y = (total_h - visible_h).max(0);
+    }
+
+    fn execute(&mut self) {
+        let raw_cmd = self.input.trim().to_string();
+        let prompt_line = format!("eos:{}$ {}", self.current_dir, self.input);
+        self.history.push((prompt_line.clone(), 0xFF38BDF8));
+        self.print_to_host(&prompt_line);
+
+        if !raw_cmd.is_empty() {
+            self.cmd_history.retain(|x| x != &raw_cmd);
+            self.cmd_history.push(raw_cmd.clone());
+            self.save_history_to_disk();
+        }
+        self.history_idx = None;
+        self.input.clear();
+        self.cursor_idx = 0;
+        self.sel_start = None;
+        self.sel_end = None;
+
+        if raw_cmd.is_empty() {
+            self.scroll_to_bottom();
+            return;
+        }
+
+        let parts = self.parse_command_args(&raw_cmd);
+        if parts.is_empty() {
+            self.scroll_to_bottom();
+            return;
+        }
+
+        let program = &parts[0];
+        let args = &parts[1..];
+
+        match program.as_str() {
             "help" => {
-                self.history.push("Commands: help, clear, uname, ping, ipconfig".into());
+                let msgs = [
+                    ("Built-in commands:", 0xFFFCD34D),
+                    ("  help           - Display command overview", 0xFFE2E8F0),
+                    ("  clear          - Clear terminal history buffer", 0xFFE2E8F0),
+                    ("  history        - View saved commands across reboots", 0xFFE2E8F0),
+                    ("  ls [path]      - List directory contents", 0xFFE2E8F0),
+                    ("  cd <path>      - Change working directory", 0xFFE2E8F0),
+                    ("  cat <file>     - Print file contents", 0xFFE2E8F0),
+                    ("  uname -a       - Print system & kernel information", 0xFFE2E8F0),
+                    ("  net / ipconfig - Print network status", 0xFFE2E8F0),
+                    ("Supported Binaries:", 0xFFFCD34D),
+                    ("  python.elf <args> - CPython 3.12 Runtime", 0xFF34D399),
+                ];
+                for (m, c) in msgs {
+                    self.history.push((m.into(), c));
+                    self.print_to_host(m);
+                }
+            }
+            "history" => {
+                for (i, h) in self.cmd_history.iter().enumerate() {
+                    let msg = format!("  {:3}  {}", i + 1, h);
+                    self.history.push((msg.clone(), 0xFFE2E8F0));
+                    self.print_to_host(&msg);
+                }
             }
             "clear" => {
                 self.history.clear();
+                self.scroll_y = 0;
             }
             "uname" => {
-                self.history.push("EOS 0.1.0 x86_64 SMP Monolithic + Ring 3 UI".into());
+                let msg = "EOS 0.1.0 x86_64 SMP Monolithic + Ring 3 UI (musl libc)";
+                self.history.push((msg.into(), 0xFFE2E8F0));
+                self.print_to_host(msg);
             }
             "ipconfig" | "net" => {
-                self.history.push("eth0: IP=10.0.2.15 Subnet=255.255.255.0 Gateway=10.0.2.2".into());
+                let msg = "eth0 (Intel E1000): IP=10.0.2.15 Subnet=255.255.255.0 Gateway=10.0.2.2 [UP]";
+                self.history.push((msg.into(), 0xFF10B981));
+                self.print_to_host(msg);
             }
-            "" => {}
+            "ls" => {
+                let target = if args.is_empty() {
+                    if self.current_dir == "/" { "".into() } else { self.current_dir.clone() }
+                } else {
+                    args[0].clone()
+                };
+
+                let clean = target.trim_matches('/').to_string();
+                let candidates = [
+                    clean.clone(),
+                    format!("/{}", clean),
+                    if clean.is_empty() { ".".into() } else { clean.clone() }
+                ];
+                let mut found = false;
+                for p in &candidates {
+                    if let Ok(entries) = fs::read_dir(p) {
+                        let mut out = String::new();
+                        for e in entries.flatten() {
+                            let name = e.file_name().to_string_lossy().to_string();
+                            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                            if is_dir {
+                                out.push_str(&format!("{}/  ", name));
+                            } else {
+                                out.push_str(&format!("{}  ", name));
+                            }
+                        }
+                        if out.is_empty() {
+                            let empty = "(empty directory)";
+                            self.history.push((empty.into(), 0xFF94A3B8));
+                            self.print_to_host(empty);
+                        } else {
+                            self.history.push((out.clone(), 0xFFE2E8F0));
+                            self.print_to_host(&out);
+                        }
+                        found = true;
+                        break;
+                    }
+                }
+                if !found {
+                    let err = format!("ls: cannot access '{}': No such file or directory", target);
+                    self.history.push((err.clone(), 0xFFEF4444));
+                    self.print_to_host(&err);
+                }
+            }
+            "cd" => {
+                if args.is_empty() || args[0] == "/" || args[0] == "~" {
+                    self.current_dir = "/".into();
+                } else {
+                    let target = &args[0];
+                    if target == ".." {
+                        if let Some(pos) = self.current_dir.trim_end_matches('/').rfind('/') {
+                            let parent = &self.current_dir[..pos];
+                            self.current_dir = if parent.is_empty() { "/".into() } else { parent.into() };
+                        } else {
+                            self.current_dir = "/".into();
+                        }
+                    } else {
+                        let next = if target.starts_with('/') {
+                            target.clone()
+                        } else if self.current_dir == "/" {
+                            format!("/{}", target)
+                        } else {
+                            format!("{}/{}", self.current_dir, target)
+                        };
+
+                        let clean_check = next.trim_matches('/');
+                        if clean_check.is_empty() || fs::read_dir(clean_check).is_ok() || fs::read_dir(&format!("/{}", clean_check)).is_ok() {
+                            self.current_dir = next;
+                        } else {
+                            let err = format!("cd: no such directory: {}", target);
+                            self.history.push((err.clone(), 0xFFEF4444));
+                            self.print_to_host(&err);
+                        }
+                    }
+                }
+            }
+            "cat" => {
+                if args.is_empty() {
+                    let err = "cat: missing operand";
+                    self.history.push((err.into(), 0xFFEF4444));
+                    self.print_to_host(err);
+                } else {
+                    let fpath = if self.current_dir == "/" {
+                        args[0].clone()
+                    } else {
+                        format!("{}/{}", self.current_dir.trim_matches('/'), args[0])
+                    };
+                    let candidates = [fpath.clone(), args[0].clone(), format!("/{}", fpath)];
+                    let mut read_ok = false;
+                    for p in &candidates {
+                        if let Ok(content) = fs::read_to_string(p) {
+                            for line in content.lines() {
+                                self.history.push((line.to_string(), 0xFFE2E8F0));
+                                self.print_to_host(line);
+                            }
+                            read_ok = true;
+                            break;
+                        }
+                    }
+                    if !read_ok {
+                        let err = format!("cat: {}: No such file", args[0]);
+                        self.history.push((err.clone(), 0xFFEF4444));
+                        self.print_to_host(&err);
+                    }
+                }
+            }
             _ => {
-                self.history.push(format!("Command not found: {}", cmd));
+                self.execute_elf(program, args);
+            }
+        }
+        self.scroll_to_bottom();
+    }
+
+    fn execute_elf(&mut self, prog: &str, args: &[String]) {
+        let clean_prog = prog.trim().trim_start_matches('/');
+        let cur = self.current_dir.trim_matches('/');
+        let candidates = [
+            clean_prog.to_string(),
+            format!("{}.elf", clean_prog),
+            if cur.is_empty() { clean_prog.to_string() } else { format!("{}/{}", cur, clean_prog) },
+            format!("Initrd/{}", clean_prog),
+            format!("Initrd/{}.elf", clean_prog),
+            format!("EOS SHARE/{}", clean_prog),
+            format!("EOS SHARE/{}.elf", clean_prog),
+            format!("RootFS/{}", clean_prog),
+        ];
+
+        let mut found_path = None;
+        for c in &candidates {
+            if fs::metadata(c).is_ok() || fs::read(c).is_ok() {
+                found_path = Some(c.clone());
+                break;
+            }
+        }
+
+        let target_elf = found_path.unwrap_or_else(|| clean_prog.to_string());
+        let msg = format!("Spawning ELF '{}' on hardware SMP core...", target_elf);
+        self.history.push((msg.clone(), 0xFF34D399));
+        self.print_to_host(&msg);
+
+        let mut arg_str = String::new();
+        for a in args {
+            arg_str.push_str(a);
+            arg_str.push(' ');
+        }
+
+        let mut path_bytes = [0u8; 128];
+        let mut args_bytes = [0u8; 128];
+        let p_src = target_elf.as_bytes();
+        let a_src = arg_str.trim().as_bytes();
+        path_bytes[..p_src.len().min(127)].copy_from_slice(&p_src[..p_src.len().min(127)]);
+        args_bytes[..a_src.len().min(127)].copy_from_slice(&a_src[..a_src.len().min(127)]);
+
+        let ret: i64;
+        unsafe {
+            core::arch::asm!(
+                "syscall",
+                inout("rax") 500u64 => ret,
+                in("rdi") path_bytes.as_ptr() as u64,
+                in("rsi") args_bytes.as_ptr() as u64,
+                out("rcx") _, out("r11") _
+            );
+        }
+
+        if ret >= 0 {
+            let success = format!("Process dispatched to Core {}. Execution started.", ret);
+            self.history.push((success.clone(), 0xFF10B981));
+            self.print_to_host(&success);
+        } else {
+            let err = format!("Kernel failed to execute process (Error: {})", ret);
+            self.history.push((err.clone(), 0xFFEF4444));
+            self.print_to_host(&err);
+        }
+    }
+
+    fn parse_command_args(&self, line: &str) -> Vec<String> {
+        let mut tokens = Vec::new();
+        let mut cur = String::new();
+        let mut in_quotes = false;
+        let mut quote_char = ' ';
+
+        for c in line.chars() {
+            if in_quotes {
+                if c == quote_char {
+                    in_quotes = false;
+                } else {
+                    cur.push(c);
+                }
+            } else if c == '"' || c == '\'' {
+                in_quotes = true;
+                quote_char = c;
+            } else if c.is_whitespace() {
+                if !cur.is_empty() {
+                    tokens.push(cur.clone());
+                    cur.clear();
+                }
+            } else {
+                cur.push(c);
+            }
+        }
+        if !cur.is_empty() {
+            tokens.push(cur);
+        }
+        tokens
+    }
+
+    fn get_selected_text(&self) -> Option<String> {
+        let (s, e) = match (self.sel_start, self.sel_end) {
+            (Some(a), Some(b)) => {
+                if a.line < b.line || (a.line == b.line && a.col <= b.col) { (a, b) } else { (b, a) }
+            }
+            _ => return None,
+        };
+
+        if s == e { return None; }
+
+        let mut lines = Vec::new();
+        for l_idx in s.line..=e.line {
+            let line_str = if l_idx < self.history.len() {
+                &self.history[l_idx].0
+            } else if l_idx == self.history.len() {
+                &self.input
+            } else {
+                continue;
+            };
+
+            let start_c = if l_idx == s.line { s.col } else { 0 };
+            let end_c = if l_idx == e.line { e.col } else { line_str.len() };
+
+            if start_c < line_str.len() {
+                let clamped_end = end_c.min(line_str.len());
+                if start_c <= clamped_end {
+                    lines.push(line_str[start_c..clamped_end].to_string());
+                }
+            }
+        }
+
+        if lines.is_empty() { None } else { Some(lines.join("\n")) }
+    }
+
+    fn copy_selection(&self) -> bool {
+        if let Some(text) = self.get_selected_text() {
+            if let Ok(mut clip) = CLIPBOARD.lock() {
+                *clip = text;
+                return true;
+            }
+        }
+        false
+    }
+
+    fn paste_clipboard(&mut self) {
+        if let Ok(clip) = CLIPBOARD.lock() {
+            if !clip.is_empty() {
+                self.input.insert_str(self.cursor_idx, &clip);
+                self.cursor_idx += clip.len();
+                self.sel_start = None;
+                self.sel_end = None;
             }
         }
     }
@@ -57,52 +428,270 @@ impl Widget for TerminalApp {
 
     fn paint(&self, canvas: &mut Canvas) {
         let theme = get_theme();
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF18181B, 0);
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xFF0D1117, 0);
 
-        let line_h = theme.pt(20.0);
-        let mut cy = self.bounds.y + theme.pt(12.0) - self.scroll_y;
+        let font_size = theme.font_title();
+        let line_h = theme.pt(28.0);
+        let pad_x = theme.pt(16.0);
+        let scrollbar_w = theme.pt(8.0);
 
-        for line in &self.history {
+        let mut cy = self.bounds.y + theme.pt(14.0) - self.scroll_y;
+
+        let (s_pos, e_pos) = match (self.sel_start, self.sel_end) {
+            (Some(a), Some(b)) => {
+                if a.line < b.line || (a.line == b.line && a.col <= b.col) { (Some(a), Some(b)) } else { (Some(b), Some(a)) }
+            }
+            _ => (None, None),
+        };
+
+        for (idx, (line, color)) in self.history.iter().enumerate() {
             if cy + line_h > self.bounds.y && cy < self.bounds.y + self.bounds.h - line_h {
-                canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), cy, self.bounds.w - theme.pt(28.0), line, 0xFFE2E8F0, theme.font_body());
+                if let (Some(s), Some(e)) = (s_pos, e_pos) {
+                    if idx >= s.line && idx <= e.line {
+                        let start_col = if idx == s.line { s.col } else { 0 };
+                        let end_col = if idx == e.line { e.col } else { line.len() };
+                        let pre_text = &line[..start_col.min(line.len())];
+                        let sel_text = &line[start_col.min(line.len())..end_col.min(line.len())];
+                        let (px_off, _) = canvas.measure_text(pre_text, font_size);
+                        let (sel_w, _) = canvas.measure_text(sel_text, font_size);
+                        if sel_w > 0 {
+                            canvas.draw_rect(self.bounds.x + pad_x + px_off as i32, cy, sel_w as i32, line_h, 0xFF1E3A8A, 2);
+                        }
+                    }
+                }
+
+                canvas.draw_text_clipped(
+                    self.bounds.x + pad_x,
+                    cy,
+                    self.bounds.w - (pad_x * 2) - scrollbar_w,
+                    line,
+                    *color,
+                    font_size,
+                );
             }
             cy += line_h;
         }
 
-        let prompt = format!("eos$ {}_", self.input);
-        canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), cy, self.bounds.w - theme.pt(28.0), &prompt, 0xFF38BDF8, theme.font_body());
+        let prompt_prefix = format!("eos:{}$ ", self.current_dir);
+        let (pw, _) = canvas.measure_text(&prompt_prefix, font_size);
+        canvas.draw_text(self.bounds.x + pad_x, cy, &prompt_prefix, 0xFF38BDF8, font_size);
+
+        let input_before_cursor = &self.input[..self.cursor_idx.min(self.input.len())];
+        let (cx_offset, _) = canvas.measure_text(input_before_cursor, font_size);
+
+        canvas.draw_text_clipped(
+            self.bounds.x + pad_x + pw as i32,
+            cy,
+            self.bounds.w - (pad_x * 2) - pw as i32 - scrollbar_w,
+            &self.input,
+            0xFFF8FAFC,
+            font_size,
+        );
+
+        let cur_x = self.bounds.x + pad_x + pw as i32 + cx_offset as i32;
+        let cursor_w = theme.pt(2.5).max(2);
+        canvas.draw_rect(cur_x, cy + theme.pt(2.0), cursor_w, line_h - theme.pt(6.0), 0xFF38BDF8, 1);
+
+        let total_lines = self.history.len() + 1;
+        let total_h = (total_lines as i32) * line_h;
+        let view_h = self.bounds.h;
+        if total_h > view_h {
+            let sb_x = self.bounds.x + self.bounds.w - scrollbar_w - 2;
+            let thumb_h = ((view_h as f32 / total_h as f32) * view_h as f32).max(24.0) as i32;
+            let max_scroll = (total_h - view_h).max(1);
+            let thumb_y = self.bounds.y + ((self.scroll_y as f32 / max_scroll as f32) * (view_h - thumb_h) as f32) as i32;
+            canvas.draw_rect(sb_x, self.bounds.y, scrollbar_w, view_h, 0x221E293B, 0);
+            canvas.draw_rect(sb_x, thumb_y, scrollbar_w, thumb_h, 0x8894A3B8, (scrollbar_w / 2) as usize);
+        }
     }
 
-    fn handle_mouse(&mut self, mx: i32, my: i32, _pressed: bool) -> bool {
-        self.bounds.contains(mx, my)
-    }
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        if !self.bounds.contains(mx, my) {
+            if self.is_selecting { self.is_selecting = false; }
+            return false;
+        }
 
-    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
-        if !self.bounds.contains(mx, my) { return false; }
-        if dy < 0 {
-            self.scroll_y = (self.scroll_y + 24).min(2000);
+        let theme = get_theme();
+        let font_size = theme.font_title();
+        let line_h = theme.pt(28.0);
+        let pad_x = theme.pt(16.0);
+
+        let rel_y = my - (self.bounds.y + theme.pt(14.0)) + self.scroll_y;
+        let line_idx = if rel_y >= 0 { (rel_y / line_h) as usize } else { 0 };
+
+        let char_w = ((font_size as i32 * 5) / 9).max(1);
+        let rel_x = (mx - (self.bounds.x + pad_x)).max(0);
+        let col_idx = (rel_x / char_w) as usize;
+
+        let current_pos = TextPos { line: line_idx, col: col_idx };
+
+        if pressed {
+            if !self.is_selecting {
+                self.is_selecting = true;
+                self.sel_start = Some(current_pos);
+                self.sel_end = Some(current_pos);
+            } else {
+                self.sel_end = Some(current_pos);
+            }
         } else {
-            self.scroll_y = (self.scroll_y - 24).max(0);
+            if self.is_selecting {
+                self.sel_end = Some(current_pos);
+                self.is_selecting = false;
+            }
         }
         true
     }
 
-    fn handle_key(&mut self, keycode: u8, _mods: u8) -> bool {
-        if keycode == 0x1C { // Enter
-            self.execute();
-            return true;
+    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        let theme = get_theme();
+        let line_h = theme.pt(28.0);
+        let total_lines = self.history.len() + 1;
+        let total_h = (total_lines as i32) * line_h;
+        let max_scroll = (total_h - self.bounds.h).max(0);
+
+        let step = theme.pt(32.0);
+        if dy < 0 {
+            self.scroll_y = (self.scroll_y + step).min(max_scroll);
+        } else if dy > 0 {
+            self.scroll_y = (self.scroll_y - step).max(0);
+        }
+        true
+    }
+
+    fn handle_key(&mut self, keycode: u8, mods: u8) -> bool {
+        match keycode {
+            0x1C => {
+                self.execute();
+                return true;
+            }
+            0x2E if (mods & 0x02) != 0 => {
+                if self.copy_selection() {
+                    return true;
+                }
+                self.history.push((format!("eos:{}$ {}^C", self.current_dir, self.input), 0xFFF87171));
+                self.input.clear();
+                self.cursor_idx = 0;
+                self.sel_start = None;
+                self.sel_end = None;
+                self.scroll_to_bottom();
+                return true;
+            }
+            0x2F if (mods & 0x02) != 0 => {
+                self.paste_clipboard();
+                return true;
+            }
+            0x48 => {
+                if !self.cmd_history.is_empty() {
+                    let next_idx = match self.history_idx {
+                        Some(i) => if i > 0 { i - 1 } else { 0 },
+                        None => self.cmd_history.len() - 1,
+                    };
+                    self.history_idx = Some(next_idx);
+                    self.input = self.cmd_history[next_idx].clone();
+                    self.cursor_idx = self.input.len();
+                    self.scroll_to_bottom();
+                    return true;
+                }
+            }
+            0x50 => {
+                if let Some(i) = self.history_idx {
+                    if i + 1 < self.cmd_history.len() {
+                        self.history_idx = Some(i + 1);
+                        self.input = self.cmd_history[i + 1].clone();
+                        self.cursor_idx = self.input.len();
+                    } else {
+                        self.history_idx = None;
+                        self.input.clear();
+                        self.cursor_idx = 0;
+                    }
+                    self.scroll_to_bottom();
+                    return true;
+                }
+            }
+            0x4B => {
+                if self.cursor_idx > 0 {
+                    self.cursor_idx -= 1;
+                    return true;
+                }
+            }
+            0x4D => {
+                if self.cursor_idx < self.input.len() {
+                    self.cursor_idx += 1;
+                    return true;
+                }
+            }
+            0x47 => {
+                self.cursor_idx = 0;
+                return true;
+            }
+            0x4F => {
+                self.cursor_idx = self.input.len();
+                return true;
+            }
+            _ => {}
         }
         false
     }
 
     fn handle_char(&mut self, c: char) -> bool {
         if c == '\x08' {
-            self.input.pop();
-            return true;
-        } else if c >= ' ' && c <= '~' {
-            self.input.push(c);
+            if self.cursor_idx > 0 {
+                self.cursor_idx -= 1;
+                self.input.remove(self.cursor_idx);
+                self.sel_start = None;
+                self.sel_end = None;
+                return true;
+            }
+            return false;
+        }
+
+        match c {
+            '"' | '\'' => {
+                if self.cursor_idx < self.input.len() && self.input.chars().nth(self.cursor_idx) == Some(c) {
+                    self.cursor_idx += 1;
+                    return true;
+                }
+                self.input.insert(self.cursor_idx, c);
+                self.input.insert(self.cursor_idx + 1, c);
+                self.cursor_idx += 1;
+                return true;
+            }
+            '(' => {
+                self.input.insert(self.cursor_idx, '(');
+                self.input.insert(self.cursor_idx + 1, ')');
+                self.cursor_idx += 1;
+                return true;
+            }
+            '[' => {
+                self.input.insert(self.cursor_idx, '[');
+                self.input.insert(self.cursor_idx + 1, ']');
+                self.cursor_idx += 1;
+                return true;
+            }
+            '{' => {
+                self.input.insert(self.cursor_idx, '{');
+                self.input.insert(self.cursor_idx + 1, '}');
+                self.cursor_idx += 1;
+                return true;
+            }
+            ')' | ']' | '}' => {
+                if self.cursor_idx < self.input.len() && self.input.chars().nth(self.cursor_idx) == Some(c) {
+                    self.cursor_idx += 1;
+                    return true;
+                }
+            }
+            _ => {}
+        }
+
+        if c >= ' ' && c <= '~' {
+            self.input.insert(self.cursor_idx, c);
+            self.cursor_idx += 1;
+            self.sel_start = None;
+            self.sel_end = None;
             return true;
         }
+
         false
     }
 }

@@ -126,8 +126,38 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
     let stack_start = USER_STACK_TOP - (stack_pages * 4096);
     crate::mm::paging::map_user_pages(new_pml4_phys, stack_start, stack_pages as usize)?;
 
+    // تخصيص صفحة خاصة لـ Thread Local Storage (TLS / FS_BASE)
+    let tls_vaddr = 0x00007fffffff0000u64;
+    crate::mm::paging::map_user_pages(new_pml4_phys, tls_vaddr, 2)?;
+
+    // تهيئة بنية الـ TCB الخاصة بـ x86_64: أول 8 بايت تشير إلى عنوانها نفسه
+    unsafe {
+        let p4_idx = ((tls_vaddr >> 39) & 0x1FF) as usize; let p3_idx = ((tls_vaddr >> 30) & 0x1FF) as usize;
+        let p2_idx = ((tls_vaddr >> 21) & 0x1FF) as usize; let p1_idx = ((tls_vaddr >> 12) & 0x1FF) as usize;
+        let pt4 = &*((new_pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let pt3 = &*((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let pt2 = &*((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *const PageTable);
+        let tls_base = (pt2.entries[p1_idx].physical_address() + vmm.hhdm_offset) as *mut u64;
+        core::ptr::write_bytes(tls_base as *mut u8, 0, 4096);
+        *tls_base = tls_vaddr; // Self-pointer: FS:[0] == tls_vaddr
+    }
+
     let mut args: Vec<&str> = Vec::new();
-    if args_str.is_empty() { args.push("user_app"); } else { for part in args_str.split_whitespace() { args.push(part); } }
+    if args_str.is_empty() {
+        args.push("python");
+    } else {
+        for part in args_str.split_whitespace() {
+            args.push(part);
+        }
+    }
+
+    let default_envs = [
+        "PATH=/bin:/usr/bin",
+        "PYTHONHOME=/",
+        "PYTHONPATH=/python312.zip:/lib/python312.zip",
+        "PYTHONUNBUFFERED=1",
+        "TERM=xterm-256color",
+    ];
 
     let user_rsp_page = USER_STACK_TOP - 0x2000;
     let user_rsp;
@@ -142,7 +172,7 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
 
         core::ptr::write_bytes(stack_base, 0, 4096);
 
-        let mut string_cursor = 4096 - 256;
+        let mut string_cursor = 4096 - 16;
         let mut arg_pointers: Vec<u64> = Vec::new();
         for arg in &args {
             let bytes = arg.as_bytes();
@@ -152,29 +182,44 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
             arg_pointers.push(user_rsp_page + string_cursor as u64);
         }
 
+        let mut env_pointers: Vec<u64> = Vec::new();
+        for env in &default_envs {
+            let bytes = env.as_bytes();
+            string_cursor -= bytes.len() + 1;
+            core::ptr::copy_nonoverlapping(bytes.as_ptr(), stack_base.add(string_cursor), bytes.len());
+            *stack_base.add(string_cursor + bytes.len()) = 0;
+            env_pointers.push(user_rsp_page + string_cursor as u64);
+        }
+
         let mut entries: Vec<u64> = Vec::new();
         entries.push(arg_pointers.len() as u64); // argc
         for ptr in arg_pointers {
             entries.push(ptr); // argv[i]
         }
         entries.push(0); // argv NULL
+
+        for ptr in env_pointers {
+            entries.push(ptr); // envp[i]
+        }
         entries.push(0); // envp NULL
 
-        // Auxiliary Vector (elf_auxv_t)
+        // Auxiliary Vector (Elf64_auxv_t)
         entries.push(6);  entries.push(4096);                         // AT_PAGESZ
+        entries.push(11); entries.push(1000);                         // AT_UID
+        entries.push(12); entries.push(1000);                         // AT_EUID
+        entries.push(13); entries.push(1000);                         // AT_GID
+        entries.push(14); entries.push(1000);                         // AT_EGID
+        entries.push(17); entries.push(100);                          // AT_CLKTCK
+        entries.push(23); entries.push(0);                            // AT_SECURE
         entries.push(25); entries.push(user_rsp_page + 0x100);        // AT_RANDOM
         entries.push(9);  entries.push(entry_point);                  // AT_ENTRY
         entries.push(0);  entries.push(0);                            // AT_NULL
 
-        if entries.len() % 2 != 0 {
-            entries.push(0);
-        }
-
-        let stack_offset = 0x800usize;
-        let stack_dst = stack_base.add(stack_offset) as *mut u64;
+        let aligned_offset = 0x800usize;
+        let stack_dst = stack_base.add(aligned_offset) as *mut u64;
         core::ptr::copy_nonoverlapping(entries.as_ptr(), stack_dst, entries.len());
 
-        user_rsp = user_rsp_page + stack_offset as u64;
+        user_rsp = user_rsp_page + aligned_offset as u64;
     }
 
     clear_keyboard_buffer();
@@ -183,11 +228,18 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
     let state_ptr = unsafe { addr_of_mut!(crate::arch::x86_64::syscall::CORE_SYSCALL_STATES[core_id]) };
     let spawn_rsp_ptr = unsafe { &mut (*state_ptr).kernel_spawn_rsp as *mut u64 };
 
-    log_info!("ELF", "Jumping to Ring 3 userspace entry {:#018x} with RSP {:#018x} on Core {}...", entry_point, user_rsp, core_id);
+    log_info!("ELF", "Jumping to Ring 3 userspace entry {:#018x} with RSP {:#018x} (Aligned 16: {}) on Core {}...",
+        entry_point, user_rsp, (user_rsp % 16) == 0, core_id);
 
     unsafe {
-        crate::arch::x86_64::syscall::wrmsr(0xC0000100, 0); // FS_BASE = 0
-        crate::arch::x86_64::syscall::wrmsr(0xC0000101, 0); // GS_BASE = 0
+        crate::arch::x86_64::fpu::enable_sse();
+        let mxcsr: u32 = 0x1F80;
+        core::arch::asm!("ldmxcsr [{}]", in(reg) &mxcsr, options(nostack));
+
+        // ضبط FS_BASE إلى مساحة الـ TLS الصالحة بدلاً من 0 لمنع #GP
+        crate::arch::x86_64::syscall::wrmsr(0xC0000100, tls_vaddr);
+        crate::arch::x86_64::syscall::wrmsr(0xC0000101, 0);
+
         jump_to_ring3(entry_point, user_rsp, USER_CODE_SELECTOR as u64, USER_DATA_SELECTOR as u64, spawn_rsp_ptr, new_pml4_phys);
         core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3);
         free_user_pages(new_pml4_phys);

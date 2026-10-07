@@ -126,13 +126,12 @@ pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
     let p = resolve_path(path);
     let clean = p.trim_matches('/');
 
-    // 1. فحص ملف الإعدادات المباشر على قرص EXT2
+    // 1. ملف الإعدادات الدائم
     if is_settings_file(&p) {
         unsafe {
             if let Some(fs) = &*addr_of_mut!(crate::fs::ext2::EXT2_FS) {
                 if let Ok(inode) = fs.read_inode(11) {
                     if let Ok(bytes) = fs.read_file_data(&inode) {
-                        crate::log_info!("VFS", "Read {} bytes from persistent settings (Inode 11)", bytes.len());
                         return Ok(bytes);
                     }
                 }
@@ -140,7 +139,33 @@ pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
         }
     }
 
-    // 2. فحص RootFS (قرص EXT2 الدائم)
+    // 2. سجل الأوامر الدائم (.bash_history في EXT2 Inode 12)
+    if clean.eq_ignore_ascii_case(".bash_history") || clean.eq_ignore_ascii_case("RootFS/.bash_history") {
+        unsafe {
+            if let Some(fs) = &*addr_of_mut!(crate::fs::ext2::EXT2_FS) {
+                if let Ok(inode) = fs.read_inode(12) {
+                    if let Ok(bytes) = fs.read_file_data(&inode) {
+                        return Ok(bytes);
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. فحص Initrd (Ramdisk) مع إزالة أي بادئات مسار
+    unsafe {
+        if let Some(archive) = &*addr_of_mut!(crate::fs::tar::INITRD) {
+            let bare_name = clean.split('/').last().unwrap_or(clean);
+            for f in &archive.files {
+                let f_bare = f.name.split('/').last().unwrap_or(&f.name);
+                if f.name.eq_ignore_ascii_case(clean) || f_bare.eq_ignore_ascii_case(bare_name) {
+                    return Ok(core::slice::from_raw_parts(f.data_ptr, f.size).to_vec());
+                }
+            }
+        }
+    }
+
+    // 4. فحص RootFS (قرص EXT2)
     unsafe {
         if let Some(fs) = &*addr_of_mut!(crate::fs::ext2::EXT2_FS) {
             if let Ok(entries) = fs.list_directory(2) {
@@ -154,21 +179,11 @@ pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
         }
     }
 
-    // 3. فحص EOS SHARE (Drive 1 FAT)
+    // 5. فحص EOS SHARE (Drive 1 FAT)
     if clean.to_ascii_uppercase().starts_with("EOS SHARE/") || clean.eq_ignore_ascii_case("EOS SHARE") || !clean.contains('/') {
         let fat_path = clean.strip_prefix("EOS SHARE/").unwrap_or(clean);
         if let Ok(bytes) = FAT_FS.read_bytes(fat_path) {
             return Ok(bytes);
-        }
-    }
-
-    // 4. فحص Initrd
-    unsafe {
-        if let Some(archive) = &*addr_of_mut!(crate::fs::tar::INITRD) {
-            let tar_name = clean.strip_prefix("Initrd/").unwrap_or(clean);
-            if let Some(f) = archive.files.iter().find(|x| x.name.eq_ignore_ascii_case(tar_name)) {
-                return Ok(core::slice::from_raw_parts(f.data_ptr, f.size).to_vec());
-            }
         }
     }
 
@@ -177,16 +192,17 @@ pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
 
 pub fn vfs_save_text_file(filename: &str, content: &[u8]) -> Result<(), &'static str> {
     let p = resolve_path(filename);
+    crate::log_info!("VFS", "vfs_save_text_file invoked for '{}' ({} bytes)", p, content.len());
 
     if is_settings_file(&p) {
         unsafe {
             if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
-                crate::log_info!("EXT2", "Attempting to persist settings ({} bytes) to Inode 11...", content.len());
+                crate::log_info!("EXT2", "Persisting settings ({} bytes) to Inode 11...", content.len());
                 if let Err(e) = fs.write_file_data(11, content) {
-                    crate::log_error!("EXT2", "Failed writing settings to Inode 11: {}", e);
+                    crate::log_error!("EXT2", "Failed writing to Inode 11: {}", e);
                     return Err("EXT2 write error");
                 }
-                crate::log_info!("EXT2", "Settings persisted successfully ({} bytes to Inode 11)", content.len());
+                crate::log_info!("EXT2", "Settings successfully written to Inode 11!");
                 return Ok(());
             }
         }
@@ -283,4 +299,5 @@ pub fn is_settings_file(path: &str) -> bool {
         || clean.eq_ignore_ascii_case("RootFS/settings.ini")
         || clean.eq_ignore_ascii_case("EOS SHARE/settings.ini")
         || clean.ends_with("/settings.ini")
+        || clean.ends_with("settings.ini")
 }
