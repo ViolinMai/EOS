@@ -67,3 +67,37 @@ pub mod gfx {
         0xFF000000 | rb | g
     }
 }
+pub use agent::*;
+pub mod agent {
+    use core::arch::asm;
+
+    /// بروتوكول تحكم معزول لوكلاء الذكاء الاصطناعي (Agent Command Protocol)
+    #[inline(always)]
+    pub fn dispatch_agent_command(cmd_id: u32, arg_ptr: *const u8, len: usize) -> i64 {
+        let ret: i64;
+        unsafe {
+            asm!(
+                "syscall",
+                inout("rax") 520i64 => ret,
+                in("rdi") cmd_id as u64,
+                in("rsi") arg_ptr as u64,
+                in("rdx") len as u64,
+                out("rcx") _, out("r11") _
+            );
+        }
+        ret
+    }
+
+    pub fn audit_log(message: &str) {
+        let bytes = message.as_bytes();
+        let _ = dispatch_agent_command(3, bytes.as_ptr(), bytes.len());
+    }
+
+    pub fn trigger_kernel_audit() -> i64 {
+        dispatch_agent_command(4, core::ptr::null(), 0)
+    }
+
+    pub fn query_kernel_heap_used() -> usize {
+        dispatch_agent_command(6, core::ptr::null(), 0).max(0) as usize
+    }
+}

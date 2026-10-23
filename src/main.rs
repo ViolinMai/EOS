@@ -1,9 +1,11 @@
 #![no_std]
 #![no_main]
 #![feature(abi_x86_interrupt)]
+#![allow(dead_code, static_mut_refs)]
 
 extern crate alloc;
 
+pub mod audit;
 pub mod config;
 pub mod input;
 pub mod profiler;
@@ -151,6 +153,8 @@ pub extern "C" fn _start() -> ! {
 
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
+    audit::run_kernel_self_audit();
+
     crate::log_info!("DESKTOP", "Delegating Desktop & GUI to Userspace process 'user_app.elf' on Core 2...");
     match task::request_elf_execution("user_app.elf", "") {
         Ok(core_id) => crate::log_info!("DESKTOP", "ELF task assigned to Core {}", core_id),
@@ -207,6 +211,7 @@ extern "C" fn ap_startup_entry(info: &limine::mp::MpInfo) -> ! {
 #[panic_handler]
 fn panic(info: &PanicInfo) -> ! {
     unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+    crate::serial_println!("\n[EOS_AUDIT] {{\"ts\":0,\"subsys\":\"KERNEL\",\"event\":\"PANIC\",\"status\":\"FATAL\",\"details\":\"Kernel panic triggered\"}}");
     crate::serial_println!("\n\x1b[31;1m[KERNEL PANIC]\x1b[0m {}", info);
     loop { core::hint::spin_loop(); }
 }

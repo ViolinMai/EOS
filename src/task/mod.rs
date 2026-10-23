@@ -77,17 +77,17 @@ pub fn start_multicore_decode(data: Vec<u8>) {
     }
     DECODE_STATUS.store(1, Ordering::SeqCst);
 
-    // البحث ديناميكياً عن أول نواة SMP حرة من Core 3 حتى Core 7
-    let mut target_core = None;
+    // البحث ديناميكياً عن أول نواة SMP حرة وجاهزة من Core 3 حتى Core 7
     for c in 3..8 {
         if crate::CORE_READY[c].load(Ordering::Acquire) && !CORE_IS_BUSY[c].load(Ordering::Acquire) {
-            target_core = Some(c);
-            break;
+            if dispatch_job(c, core_decode_dynamic_worker).is_ok() {
+                crate::log_info!("SMP", "Dispatching async image decode task to dynamic Core {}", c);
+                return;
+            }
         }
     }
-    let chosen_core = target_core.unwrap_or(3);
-    crate::log_info!("SMP", "Dispatching async image decode task to dynamic Core {}", chosen_core);
-    let _ = dispatch_job(chosen_core, core_decode_dynamic_worker);
+    crate::log_error!("SMP", "No free SMP worker core (3..7) available for async image decode.");
+    DECODE_STATUS.store(-1, Ordering::Release);
 }
 
 pub fn poll_multicore_decode() -> (i32, usize, usize, Option<Vec<u32>>) {
@@ -133,7 +133,10 @@ pub fn request_elf_execution(filename: &str, argument: &str) -> Result<usize, &'
             break;
         }
     }
-    let core_id = selected_core.unwrap_or(2);
+    let core_id = match selected_core {
+        Some(c) => c,
+        None => return Err("No free SMP cores (2..7) available for ELF execution"),
+    };
     unsafe {
         core::ptr::write_bytes(addr_of_mut!(ELF_TARGET_FILE) as *mut u8, 0, 128);
         core::ptr::write_bytes(addr_of_mut!(ELF_TARGET_ARG) as *mut u8, 0, 128);

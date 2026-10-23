@@ -99,7 +99,10 @@ impl BitmapFrameAllocator {
 
     pub fn allocate_frame(&mut self) -> Option<u64> {
         let start_byte = self.last_alloc_byte;
-        let total_bytes = self.total_frames / 8;
+        let total_bytes = (self.total_frames + 7) / 8;
+        if total_bytes == 0 {
+            return None;
+        }
         for i in 0..total_bytes {
             let byte_idx = (start_byte + i) % total_bytes;
             unsafe {
@@ -108,6 +111,9 @@ impl BitmapFrameAllocator {
                     for bit_idx in 0..8 {
                         if (*byte & (1 << bit_idx)) == 0 {
                             let frame_idx = byte_idx * 8 + bit_idx;
+                            if frame_idx >= self.total_frames {
+                                break;
+                            }
                             self.mark_frame_used(frame_idx);
                             self.last_alloc_byte = byte_idx;
                             return Some((frame_idx * PAGE_SIZE) as u64);

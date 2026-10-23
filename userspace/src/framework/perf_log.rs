@@ -6,9 +6,29 @@ use std::sync::Mutex;
 pub struct SmartLogger;
 
 static LAST_FLUSH_TICKS: AtomicU64 = AtomicU64::new(0);
+static RENDERED_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+static TOTAL_FRAME_TIME_US: AtomicU64 = AtomicU64::new(0);
 pub static RECENT_LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 impl SmartLogger {
+    pub fn record_frame_render(frame_cycles: u64, dirty_rects: usize) -> u64 {
+        let dur_us = Self::cycles_to_us(frame_cycles);
+        TOTAL_FRAME_TIME_US.fetch_add(dur_us, Ordering::Relaxed);
+        let count = RENDERED_FRAME_COUNT.fetch_add(1, Ordering::Relaxed) + 1;
+        if dur_us > 16_667 {
+            Self::record_operation("compositor", &format!("frame_rects_{}", dirty_rects), frame_cycles, 16_667);
+        }
+        count
+    }
+
+    pub fn average_frame_us() -> u64 {
+        let count = RENDERED_FRAME_COUNT.load(Ordering::Relaxed);
+        if count == 0 {
+            0
+        } else {
+            TOTAL_FRAME_TIME_US.load(Ordering::Relaxed) / count
+        }
+    }
     #[inline(always)]
     pub fn read_tsc() -> u64 {
         let lo: u32;

@@ -121,7 +121,11 @@ pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
 
     if clean.to_ascii_uppercase().starts_with("EOS SHARE") {
         crate::log_info!("VFS", "Scanning FAT root on Drive 1...");
-        let fat_sub = clean.strip_prefix("EOS SHARE/").unwrap_or("");
+        let fat_sub = if clean.len() > 9 {
+            clean[9..].trim_matches('/')
+        } else {
+            ""
+        };
         if let Ok(items) = FAT_FS.list_dir(fat_sub) {
             return Ok(items);
         }
@@ -221,11 +225,29 @@ pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
 
     unsafe {
         if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
-            if let Ok(entries) = fs.list_directory(2) {
-                let check_name = clean.strip_prefix("RootFS/").unwrap_or(clean);
-                if let Some((_, ino)) = entries.iter().find(|(n, _)| n.eq_ignore_ascii_case(check_name)) {
-                    if let Ok(inode) = fs.read_inode(*ino) {
-                        return fs.read_file_data(&inode);
+            let check_path = clean.strip_prefix("RootFS/").unwrap_or(clean);
+            let parts: alloc::vec::Vec<&str> = check_path.split('/').filter(|s| !s.is_empty()).collect();
+            if !parts.is_empty() {
+                let mut curr_ino = 2u32;
+                let mut found = true;
+                for part in &parts {
+                    if let Ok(entries) = fs.list_directory(curr_ino) {
+                        if let Some((_, next_ino)) = entries.iter().find(|(n, _)| n.eq_ignore_ascii_case(part)) {
+                            curr_ino = *next_ino;
+                        } else {
+                            found = false;
+                            break;
+                        }
+                    } else {
+                        found = false;
+                        break;
+                    }
+                }
+                if found {
+                    if let Ok(inode) = fs.read_inode(curr_ino) {
+                        if (inode.mode & 0o170000) != 0o040000 {
+                            return fs.read_file_data(&inode);
+                        }
                     }
                 }
             }
@@ -299,8 +321,12 @@ impl FileSystem for FatFileSystem {
                 return Err("Path segment not found");
             }
         }
+        let target_name = match parts.last() {
+            Some(&name) => name,
+            None => return Err("Invalid path"),
+        };
         let files = crate::drivers::ata::scan_dir_cluster(self.drive, curr_cluster)?;
-        if let Some(f) = files.iter().find(|x| !x.is_dir && x.name.eq_ignore_ascii_case(parts.last().unwrap())) {
+        if let Some(f) = files.iter().find(|x| !x.is_dir && x.name.eq_ignore_ascii_case(target_name)) {
             read_entire_file(self.drive, f)
         } else {
             Err("File not found on FAT disk")
@@ -337,8 +363,12 @@ impl FileSystem for FatFileSystem {
                 curr_cluster = dir.first_cluster;
             }
         }
+        let target_name = match parts.last() {
+            Some(&name) => name,
+            None => return Err("Invalid path"),
+        };
         let files = crate::drivers::ata::scan_dir_cluster(self.drive, curr_cluster)?;
-        if let Some(target) = files.iter().find(|x| x.name.eq_ignore_ascii_case(parts.last().unwrap())) {
+        if let Some(target) = files.iter().find(|x| x.name.eq_ignore_ascii_case(target_name)) {
             let mode = if target.is_dir { 0o040755 } else { 0o100644 };
             Ok((target.size as u64, mode))
         } else {

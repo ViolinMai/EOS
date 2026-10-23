@@ -6,7 +6,6 @@ pub mod tar;
 use alloc::string::String;
 use alloc::vec::Vec;
 use crate::drivers::ata::{read_entire_file, write_file_content, MediaType};
-use core::ptr::addr_of_mut;
 
 #[derive(Clone, Debug)]
 pub enum FsItem {

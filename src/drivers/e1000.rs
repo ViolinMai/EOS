@@ -184,10 +184,29 @@ pub fn init() {
 
             unsafe { pci_enable_bus_mastering(dev.bus, dev.device, dev.function); }
 
-            let hhdm = unsafe { (*core::ptr::addr_of!(VMM)).unwrap().hhdm_offset };
+            let hhdm = match unsafe { (*core::ptr::addr_of!(VMM)).as_ref() } {
+                Some(v) => v.hhdm_offset,
+                None => {
+                    crate::log_error!("E1000", "VMM not initialized; aborting E1000 setup.");
+                    return;
+                }
+            };
 
-            let tx_ring_phys = allocate_frame_safe().expect("OOM E1000 TX Ring");
-            let rx_ring_phys = allocate_frame_safe().expect("OOM E1000 RX Ring");
+            let tx_ring_phys = match allocate_frame_safe() {
+                Some(f) => f,
+                None => {
+                    crate::log_error!("E1000", "OOM allocating E1000 TX Ring; disabling NIC.");
+                    return;
+                }
+            };
+            let rx_ring_phys = match allocate_frame_safe() {
+                Some(f) => f,
+                None => {
+                    crate::mm::frame::free_frame_safe(tx_ring_phys);
+                    crate::log_error!("E1000", "OOM allocating E1000 RX Ring; disabling NIC.");
+                    return;
+                }
+            };
 
             let tx_descs = (tx_ring_phys + hhdm) as *mut E1000TxDesc;
             let rx_descs = (rx_ring_phys + hhdm) as *mut E1000RxDesc;
@@ -201,7 +220,13 @@ pub fn init() {
             let mut rx_buffers = [core::ptr::null_mut(); NUM_RX_DESC];
 
             for i in 0..NUM_TX_DESC {
-                let frame_phys = allocate_frame_safe().expect("OOM E1000 TX Buffer");
+                let frame_phys = match allocate_frame_safe() {
+                    Some(f) => f,
+                    None => {
+                        crate::log_error!("E1000", "OOM allocating E1000 TX Buffer {}; disabling NIC.", i);
+                        return;
+                    }
+                };
                 tx_buffers[i] = (frame_phys + hhdm) as *mut u8;
                 unsafe {
                     let desc = &mut *tx_descs.add(i);
@@ -212,7 +237,13 @@ pub fn init() {
             }
 
             for i in 0..NUM_RX_DESC {
-                let frame_phys = allocate_frame_safe().expect("OOM E1000 RX Buffer");
+                let frame_phys = match allocate_frame_safe() {
+                    Some(f) => f,
+                    None => {
+                        crate::log_error!("E1000", "OOM allocating E1000 RX Buffer {}; disabling NIC.", i);
+                        return;
+                    }
+                };
                 rx_buffers[i] = (frame_phys + hhdm) as *mut u8;
                 unsafe {
                     let desc = &mut *rx_descs.add(i);

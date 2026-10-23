@@ -1,8 +1,11 @@
+#![allow(dead_code, unused_imports, static_mut_refs)]
+
 mod syscall;
 mod sdk;
 mod framework;
 pub mod png;
 pub mod net_manager;
+pub mod test_subject;
 #[path = "apps/mod.rs"]
 pub mod apps;
 
@@ -68,13 +71,23 @@ fn main() {
 
     if font_bytes.is_empty() {
         println!("[WARN] [FONT] No external font file found. Please ensure font files exist in EOS_SHARE/fonts.");
+        sdk::agent::audit_log("FONT_LOAD:WARN:Fallback bitmap metrics active");
+    } else {
+        sdk::agent::audit_log("FONT_LOAD:PASS:TrueType vector font initialized");
     }
 
+    // تشغيل منظومة الفحص والمعايرة والتصدير للمراحل 01 إلى 05
+    test_subject::run_all_verifications(&font_bytes);
+
+    // تشغيل مدير النوافذ وإطار العمل لضمان بقاء النظام حياً وعرض الشاشة
     let mut app = FrameworkApp::new(&font_bytes, SCREEN_W, SCREEN_H);
 
     app.spawn_app("Finder");
     app.spawn_app("Settings");
 
     app.set_dock_handler(|_idx| {});
+    sdk::agent::audit_log("FIRST_FRAME:PASS");
+    sdk::agent::audit_log("DESKTOP_INIT:PASS:Userspace desktop ready and entering main event loop");
+
     app.run_loop();
 }

@@ -7,8 +7,9 @@ import tarfile
 import io
 import sys
 import time
+import argparse
 
-LIMINE_BOOTX64_URL = "https://raw.githubusercontent.com/limine-bootloader/limine/v5.x-branch-binary/BOOTX64.EFI"
+LIMINE_BOOTX64_URL = "https://raw.githubusercontent.com/limine-bootloader/limine/v10.x-binary/BOOTX64.EFI"
 
 USER_CARGO_DIR = os.path.expanduser(r"~\.cargo\bin")
 if USER_CARGO_DIR not in os.environ.get("PATH", ""):
@@ -62,34 +63,8 @@ def create_demo_tar(user_elf_data):
             tar.addfile(ti, io.BytesIO(data))
 
         add_file("readme.txt", b"Welcome to EOS Kernel!\r\nThis file is read from TarFS.\r\n")
-        if user_elf_data: add_file("user_app.elf", user_elf_data)
-
-        # Ramdisk خفيف جداً: لا نضع بايثون هنا لتفادي بطء إقلاع Limine
-        share_dir = r"C:\EOS_SHARE"
-        settings_file = os.path.join(share_dir, "settings.ini")
-        if os.path.exists(settings_file):
-            try:
-                with open(settings_file, "rb") as sf:
-                    sdata = sf.read()
-                    add_file("settings.ini", sdata)
-            except Exception:
-                pass
-
-        share_fonts_dir = r"C:\EOS_SHARE\fonts"
-        scan_dirs = [share_fonts_dir, share_dir]
-        for sdir in scan_dirs:
-            if os.path.exists(sdir):
-                for fname in os.listdir(sdir):
-                    lower = fname.lower()
-                    if lower.endswith(".ttf") or lower.endswith(".otf"):
-                        fpath = os.path.join(sdir, fname)
-                        if os.path.isfile(fpath):
-                            try:
-                                with open(fpath, "rb") as ff: fb = ff.read()
-                                add_file(fname, fb)
-                                add_file("fonts/" + fname, fb)
-                            except Exception:
-                                pass
+        if user_elf_data:
+            add_file("user_app.elf", user_elf_data)
 
         png_magic = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDAT\x08\x1d\x01\x05\x00\xfa\xff\x89P\x4E\x47\x00\x00\x00\x00IEND\xaeB`\x82"
         add_file("sample.png", png_magic)
@@ -102,16 +77,13 @@ def make_uefi_fat32_disk(img_path, files):
     CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE
     RESERVED_SECTORS = 32
     NUM_FATS = 2
-    PART_START_SECTOR = 2048
-    PART_SECTORS = 262144
-    TOTAL_SECTORS = PART_START_SECTOR + PART_SECTORS
-    FAT_SIZE_SECTORS = 2048
+    TOTAL_SECTORS = 131072 # 64 MB Superfloppy
+    FAT_SIZE_SECTORS = 1024
     ROOT_CLUSTER = 2
-    disk = bytearray(TOTAL_SECTORS * SECTOR_SIZE)
-    disk[510:512] = b"\x55\xAA"
-    disk[446:462] = struct.pack("<BBBBBBBBII", 0x80, 0x00, 0x02, 0x00, 0xEF, 0xFF, 0xFF, 0xFF, PART_START_SECTOR, PART_SECTORS)
 
-    vbr_offset = PART_START_SECTOR * SECTOR_SIZE
+    disk = bytearray(TOTAL_SECTORS * SECTOR_SIZE)
+
+    # VBR (Volume Boot Record) مباشرة في القطاع 0 بدون MBR
     vbr = bytearray(SECTOR_SIZE)
     vbr[0:3] = b"\xEB\x58\x90"
     vbr[3:11] = b"MSWIN4.1"
@@ -123,10 +95,10 @@ def make_uefi_fat32_disk(img_path, files):
     struct.pack_into("<H", vbr, 19, 0)
     vbr[21] = 0xF8
     struct.pack_into("<H", vbr, 22, 0)
-    struct.pack_into("<H", vbr, 24, 63)
-    struct.pack_into("<H", vbr, 26, 255)
-    struct.pack_into("<I", vbr, 28, PART_START_SECTOR)
-    struct.pack_into("<I", vbr, 32, PART_SECTORS)
+    struct.pack_into("<H", vbr, 24, 32)
+    struct.pack_into("<H", vbr, 26, 64)
+    struct.pack_into("<I", vbr, 28, 0)
+    struct.pack_into("<I", vbr, 32, TOTAL_SECTORS)
     struct.pack_into("<I", vbr, 36, FAT_SIZE_SECTORS)
     struct.pack_into("<H", vbr, 40, 0)
     struct.pack_into("<H", vbr, 42, 0)
@@ -139,8 +111,8 @@ def make_uefi_fat32_disk(img_path, files):
     vbr[71:82] = b"EOS_BOOT   "
     vbr[82:90] = b"FAT32   "
     vbr[510:512] = b"\x55\xAA"
-    disk[vbr_offset : vbr_offset + SECTOR_SIZE] = vbr
-    disk[vbr_offset + (6 * SECTOR_SIZE) : vbr_offset + (7 * SECTOR_SIZE)] = vbr
+    disk[0:SECTOR_SIZE] = vbr
+    disk[6 * SECTOR_SIZE : 7 * SECTOR_SIZE] = vbr
 
     fsinfo = bytearray(SECTOR_SIZE)
     struct.pack_into("<I", fsinfo, 0, 0x41615252)
@@ -148,9 +120,10 @@ def make_uefi_fat32_disk(img_path, files):
     struct.pack_into("<I", fsinfo, 488, 0xFFFFFFFF)
     struct.pack_into("<I", fsinfo, 492, 0x00000003)
     struct.pack_into("<I", fsinfo, 508, 0xAA550000)
-    disk[vbr_offset + SECTOR_SIZE : vbr_offset + (2 * SECTOR_SIZE)] = fsinfo
-    disk[vbr_offset + (7 * SECTOR_SIZE) : vbr_offset + (8 * SECTOR_SIZE)] = fsinfo
+    disk[SECTOR_SIZE : 2 * SECTOR_SIZE] = fsinfo
+    disk[7 * SECTOR_SIZE : 8 * SECTOR_SIZE] = fsinfo
 
+    vbr_offset = 0
     fat1_offset = vbr_offset + (RESERVED_SECTORS * SECTOR_SIZE)
     data_start = fat1_offset + (NUM_FATS * FAT_SIZE_SECTORS * SECTOR_SIZE)
 
@@ -205,7 +178,7 @@ def make_uefi_fat32_disk(img_path, files):
     boot_dir = bytearray(CLUSTER_SIZE)
     for i, ent in enumerate([
         make_entry(".          ", 0x10, boot_dir_cluster, 0),
-        make_entry("..         ", 0x10, efi_dir_cluster, 0),
+        make_entry("..         ", 0x10, ROOT_CLUSTER, 0),
         make_entry("BOOTX64 EFI", 0x20, bootx64_cluster, len(files["BOOTX64.EFI"])),
         lfn_conf,
         short_conf_entry
@@ -216,7 +189,7 @@ def make_uefi_fat32_disk(img_path, files):
     efi_dir = bytearray(CLUSTER_SIZE)
     for i, ent in enumerate([
         make_entry(".          ", 0x10, efi_dir_cluster, 0),
-        make_entry("..         ", 0x10, 0, 0),
+        make_entry("..         ", 0x10, ROOT_CLUSTER, 0),
         make_entry("BOOT       ", 0x10, boot_dir_cluster, 0)
     ]):
         efi_dir[i * 32 : (i + 1) * 32] = ent
@@ -240,7 +213,7 @@ def make_uefi_fat32_disk(img_path, files):
         f.write(disk)
 
 def make_ext2_disk(img_path):
-    TARGET_SIZE_MB = 2048 # 2 GB
+    TARGET_SIZE_MB = 2048
     BLOCK_SIZE = 1024
     TOTAL_BLOCKS = TARGET_SIZE_MB * 1024
 
@@ -257,7 +230,6 @@ def make_ext2_disk(img_path):
     HEADER_BLOCKS = 64
     header_disk = bytearray(HEADER_BLOCKS * BLOCK_SIZE)
 
-    # 1. Superblock
     sb_off = 1024
     struct.pack_into("<I", header_disk, sb_off + 0, INODES_COUNT)
     struct.pack_into("<I", header_disk, sb_off + 4, TOTAL_BLOCKS)
@@ -276,7 +248,6 @@ def make_ext2_disk(img_path):
     struct.pack_into("<H", header_disk, sb_off + 84, 11)
     struct.pack_into("<H", header_disk, sb_off + 88, INODE_SIZE)
 
-    # 2. Block Group Descriptor
     bgd_off = 2048
     struct.pack_into("<I", header_disk, bgd_off + 0, 3)
     struct.pack_into("<I", header_disk, bgd_off + 4, 4)
@@ -285,7 +256,6 @@ def make_ext2_disk(img_path):
     struct.pack_into("<H", header_disk, bgd_off + 14, INODES_PER_GROUP - 30)
     struct.pack_into("<H", header_disk, bgd_off + 16, 8)
 
-    # 3. Bitmaps
     for b in range(64):
         header_disk[(3 * BLOCK_SIZE) + (b // 8)] |= (1 << (b % 8))
 
@@ -327,21 +297,16 @@ def make_ext2_disk(img_path):
     write_inode(15, 0o040755, BLOCK_SIZE, 42)
     write_inode(16, 0o040700, BLOCK_SIZE, 43)
     write_inode(17, 0o040700, BLOCK_SIZE, 44)
-
-    # Inode 18: /home/march/.bash_history
     write_inode(18, 0o100600, 0, 45)
 
-    # Inode 19: /home/march/.config/settings.ini
     init_settings = b"dark_mode=false\nui_scale=2\nwallpaper=\n"
     write_inode(19, 0o100644, len(init_settings), 46)
     header_disk[46 * BLOCK_SIZE : 46 * BLOCK_SIZE + len(init_settings)] = init_settings
 
-    # Inode 20: /etc/os-release
     os_rel = b'NAME="EOS Linux"\nVERSION="0.1.0"\nID=eos\nPRETTY_NAME="EOS x86_64 Monolithic"\n'
     write_inode(20, 0o100644, len(os_rel), 47)
     header_disk[47 * BLOCK_SIZE : 47 * BLOCK_SIZE + len(os_rel)] = os_rel
 
-    # Inode 21: /etc/heroers
     heroers = b"root ALL=(ALL:ALL) ALL\nmarch ALL=(ALL:ALL) NOPASSWD: ALL\n"
     write_inode(21, 0o100440, len(heroers), 48)
     header_disk[48 * BLOCK_SIZE : 48 * BLOCK_SIZE + len(heroers)] = heroers
@@ -361,27 +326,45 @@ def make_ext2_disk(img_path):
         f.write(header_disk)
         f.truncate(expected_file_size)
 
-def prepare_and_run():
-    share_dir = r"C:\EOS_SHARE"
-    os.makedirs(share_dir, exist_ok=True); os.makedirs(os.path.join(share_dir, "fonts"), exist_ok=True)
+def prepare_and_run(cli_args=None):
+    parser = argparse.ArgumentParser(description="EOS Builder & QEMU Runner")
+    parser.add_argument("--build-only", action="store_true", help="Build kernel and disk images without launching QEMU")
+    parser.add_argument("--skip-build", action="store_true", help="Launch QEMU using existing disk images without rebuilding")
+    parser.add_argument("--mem", type=str, default="1536M", help="Guest RAM allocation for QEMU (default: 1536M)")
+    parser.add_argument("--qmp", type=str, default=None, help="QMP socket path or tcp spec (e.g. tcp:127.0.0.1:4445,server,nowait)")
+    parser.add_argument("--serial-file", type=str, default=None, help="Redirect serial output to file instead of stdio")
+    parser.add_argument("--headless", action="store_true", help="Run QEMU with -display none")
+    args = parser.parse_args(cli_args)
 
-    print("[*] Building Userspace App...")
+    share_dir = r"C:\EOS_SHARE"
+    target_dir = "target"
+    os.makedirs(share_dir, exist_ok=True); os.makedirs(os.path.join(share_dir, "fonts"), exist_ok=True)
+    os.makedirs(target_dir, exist_ok=True)
+
+    img_path = os.path.join(target_dir, "uefi_hdd.img")
+    ext2_img_path = os.path.join(target_dir, "rootfs.ext2")
+    settings_img_path = os.path.join(target_dir, "settings.img")
+
+    if not args.skip_build:
+        print("[*] Building Userspace App...")
     user_elf = build_userspace_app()
     if not user_elf:
-        print("\n[!] ❌ ABORTING: user_app.elf could not be built successfully.")
-        return
+        print("\n[!] ABORTING: user_app.elf could not be built successfully.")
+        sys.exit(1)
 
     print("[*] Building EOS Kernel (Release, LTO)...")
     env = os.environ.copy(); env.pop("RUSTFLAGS", None)
     res = subprocess.run([CARGO_BIN, "build", "--release", "-Z", "build-std=core,alloc"], shell=True, env=env)
-    if res.returncode != 0: return
+    if res.returncode != 0:
+        print("\n[!] ABORTING: kernel build failed.")
+        sys.exit(1)
 
     target_dir = "target"; os.makedirs(target_dir, exist_ok=True)
     kernel_src = os.path.join(target_dir, "x86_64-unknown-none", "release", "EOS")
-    bootx64_path = os.path.join(target_dir, "BOOTX64.EFI")
+    bootx64_path = os.path.join(target_dir, "BOOTX64_v10.EFI")
 
     if not os.path.exists(bootx64_path):
-        print("[*] Downloading Limine BOOTX64.EFI v5...")
+        print("[*] Downloading Limine BOOTX64.EFI v10...")
         urllib.request.urlretrieve(LIMINE_BOOTX64_URL, bootx64_path)
 
     with open(kernel_src, "rb") as f: kernel_data = f.read()
@@ -391,6 +374,15 @@ def prepare_and_run():
     tar_data = create_demo_tar(user_elf)
     img_path = os.path.join(target_dir, "uefi_hdd.img")
     make_uefi_fat32_disk(img_path, { "EOS": kernel_data, "limine.conf": conf_data, "BOOTX64.EFI": bootx64_data, "initrd.tar": tar_data })
+
+    efi_boot_share = os.path.join(share_dir, "EFI", "BOOT")
+    os.makedirs(efi_boot_share, exist_ok=True)
+    with open(os.path.join(efi_boot_share, "BOOTX64.EFI"), "wb") as f: f.write(bootx64_data)
+    with open(os.path.join(share_dir, "limine.conf"), "wb") as f: f.write(conf_data)
+    with open(os.path.join(share_dir, "EOS"), "wb") as f: f.write(kernel_data)
+    with open(os.path.join(share_dir, "INITRD.TAR"), "wb") as f: f.write(tar_data)
+    with open(os.path.join(share_dir, "startup.nsh"), "wb") as f:
+        f.write(b"\\EFI\\BOOT\\BOOTX64.EFI\r\n")
 
     ext2_img_path = os.path.join(target_dir, "rootfs.ext2"); make_ext2_disk(ext2_img_path)
 
@@ -415,6 +407,10 @@ def prepare_and_run():
             f.write(sec0)
             f.write(bytearray((1024 * 1024) - 512))
 
+        if args.build_only:
+            print("[+] Build and disk image packaging completed (--build-only).")
+            return
+
     qemu_share = os.path.join(os.path.dirname(QEMU_EXE), "share")
     if not os.path.exists(qemu_share): qemu_share = r"C:\Program Files\qemu\share"
     code_fd = os.path.join(qemu_share, "edk2-x86_64-code.fd")
@@ -433,8 +429,15 @@ def prepare_and_run():
     print("[*] Starting Gamepad Bridge Server...")
     bridge_proc = subprocess.Popen([sys.executable, "gamepad_bridge.py"]); time.sleep(0.3)
 
+    serial_arg = f"file:{args.serial_file}" if args.serial_file else "stdio"
+    extra_qemu_args = []
+    if args.qmp:
+        extra_qemu_args += ["-qmp", args.qmp]
+    if args.headless:
+        extra_qemu_args += ["-display", "none"]
+
     qemu_cmd = [
-        QEMU_EXE, "-M", "q35", "-m", "8192M", "-smp", "5",
+        QEMU_EXE, "-M", "q35", "-m", args.mem, "-smp", "5",
         "-accel", "tcg,thread=multi",
         "-drive", f"if=pflash,format=raw,readonly=on,file={code_fd}",
     ] + pflash_vars_args + [
@@ -444,8 +447,8 @@ def prepare_and_run():
         "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",
         "-drive", f"id=disk3,file={settings_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=1,drive=disk3",
         "-netdev", "user,id=n0,hostfwd=udp::68-:68", "-device", "e1000,netdev=n0",
-        "-serial", "stdio", "-d", "guest_errors", "-no-reboot", "-no-shutdown"
-    ]
+        "-serial", serial_arg, "-d", "guest_errors", "-no-reboot", "-no-shutdown"
+    ] + extra_qemu_args
     try: subprocess.run(qemu_cmd)
     finally: bridge_proc.terminate()
 

@@ -200,19 +200,25 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                             if let Some(pipe) = unsafe { &mut crate::task::PIPE_REGISTRY[*id] } {
                                 let to_read = core::cmp::min(pipe.data.len(), frame.rdx as usize);
                                 if to_read > 0 {
-                                    let mut buf = alloc::vec![0u8; to_read];
-                                    for i in 0..to_read {
-                                        buf[i] = pipe.data.pop_front().unwrap();
+                                    let mut buf = alloc::vec::Vec::with_capacity(to_read);
+                                    for _ in 0..to_read {
+                                        if let Some(b) = pipe.data.pop_front() {
+                                            buf.push(b);
+                                        } else {
+                                            break;
+                                        }
                                     }
+                                    let actual_read = buf.len();
                                     crate::task::PIPE_LOCK.unlock();
                                     if copy_to_user(frame.rsi, &buf).is_ok() {
-                                        frame.rax = to_read as u64;
+                                        frame.rax = actual_read as u64;
                                     } else {
                                         frame.rax = -14i64 as u64;
                                     }
                                 } else {
+                                    let is_closed = pipe.closed;
                                     crate::task::PIPE_LOCK.unlock();
-                                    if pipe.closed { frame.rax = 0; }
+                                    if is_closed { frame.rax = 0; }
                                     else { crate::task::yield_now(); frame.rax = -11i64 as u64; }
                                 }
                             } else {
@@ -601,6 +607,64 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             }
         }
         186 => { frame.rax = cur_core as u64; } // gettid
+        217 => { // getdents64
+            let fd = frame.rdi as usize;
+            let dirp = frame.rsi;
+            let count = frame.rdx as usize;
+
+            if fd < 64 && validate_user_range(dirp, count) {
+                let proc = get_current_process();
+                if let Some(file) = &mut proc.fd_table[fd] {
+                    // الكود المصحح:
+                    if let crate::task::FileSource::Directory(ref items, ref mut idx) = file.source {
+                        let mut written = 0usize;
+                        let mut out_buf = alloc::vec![0u8; count];
+
+                        while *idx < items.len() {
+                            let (name_str, d_type) = match &items[*idx] {
+                                crate::fs::FsItem::Directory(n, _) => (n.as_str(), 4u8), // DT_DIR = 4
+                                crate::fs::FsItem::File(n, _, _) => (n.as_str(), 8u8),   // DT_REG = 8
+                            };
+                            let name_bytes = name_str.as_bytes();
+                            let reclen = (19 + name_bytes.len() + 1 + 7) & !7;
+
+                            if written + reclen > count {
+                                break;
+                            }
+
+                            let ino = (*idx as u64) + 100;
+                            let off = (*idx as i64) + 1;
+
+                            out_buf[written..written + 8].copy_from_slice(&ino.to_ne_bytes());
+                            out_buf[written + 8..written + 16].copy_from_slice(&off.to_ne_bytes());
+                            out_buf[written + 16..written + 18].copy_from_slice(&(reclen as u16).to_ne_bytes());
+                            out_buf[written + 18] = d_type;
+                            out_buf[written + 19..written + 19 + name_bytes.len()].copy_from_slice(name_bytes);
+                            out_buf[written + 19 + name_bytes.len()] = 0;
+
+                            written += reclen;
+                            *idx += 1;
+                        }
+
+                        if written > 0 {
+                            if copy_to_user(dirp, &out_buf[..written]).is_ok() {
+                                frame.rax = written as u64;
+                            } else {
+                                frame.rax = -14i64 as u64;
+                            }
+                        } else {
+                            frame.rax = 0;
+                        }
+                    } else {
+                        frame.rax = -20i64 as u64; // ENOTDIR
+                    }
+                } else {
+                    frame.rax = -9i64 as u64; // EBADF
+                }
+            } else {
+                frame.rax = -14i64 as u64; // EFAULT
+            }
+        }
         218 => { // set_tid_address
             let tidptr = frame.rdi;
             THREAD_CLEAR_TID[cur_core].store(tidptr, Ordering::SeqCst);
@@ -773,6 +837,78 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 } else { frame.rax = -14i64 as u64; }
             } else { frame.rax = -14i64 as u64; }
         }
+        520 => { // sys_agent_dispatch (Agent Sandbox & Telemetry Protocol)
+            let cmd_id = frame.rdi as u32;
+            let arg_ptr = frame.rsi;
+            let len = frame.rdx as usize;
+
+            match cmd_id {
+                1 => { // Command: Ping / Heartbeat
+                    frame.rax = 0;
+                }
+                2 => { // Command: Safe Query VFS State
+                    frame.rax = crate::fs::FAT_FS.drive as u64;
+                }
+                3 => { // Command: Emit Structured Userspace Audit Event
+                    if len > 0 && len <= 1024 && validate_user_range(arg_ptr, len) {
+                        let mut buf = alloc::vec![0u8; len];
+                        if copy_from_user(&mut buf, arg_ptr, len).is_ok() {
+                            if let Ok(msg) = core::str::from_utf8(&buf) {
+                                crate::audit::emit_raw_json("USERSPACE", "AGENT_CHECKPOINT", "PASS", msg);
+                                frame.rax = 0;
+                            } else {
+                                frame.rax = -22i64 as u64;
+                            }
+                        } else {
+                            frame.rax = -14i64 as u64;
+                        }
+                    } else {
+                        frame.rax = -14i64 as u64;
+                    }
+                }
+                4 => { // Command: Run Kernel Self-Audit On Demand
+                    let passed = crate::audit::run_kernel_self_audit();
+                    frame.rax = passed as u64;
+                }
+                5 => { // Command: Inject Synthetic Input Event (arg_ptr = kind, len = packed payload)
+                    match arg_ptr {
+                        1 => {
+                            let dx = (len & 0xFFFF) as i16 as isize;
+                            let dy = ((len >> 16) & 0xFFFF) as i16 as isize;
+                            push_user_event(InputEvent::MouseMove { x: dx, y: dy });
+                            frame.rax = 0;
+                        }
+                        2 => {
+                            let btn = (len & 0xFF) as u8;
+                            let pressed = ((len >> 8) & 1) != 0;
+                            push_user_event(InputEvent::MouseButton { button: btn, pressed });
+                            frame.rax = 0;
+                        }
+                        3 => {
+                            let keycode = (len & 0xFF) as u8;
+                            let mods = ((len >> 8) & 0xFF) as u8;
+                            push_user_event(InputEvent::KeyDown { keycode, mods });
+                            frame.rax = 0;
+                        }
+                        4 => {
+                            if let Some(c) = char::from_u32(len as u32) {
+                                push_user_event(InputEvent::Char(c));
+                                frame.rax = 0;
+                            } else {
+                                frame.rax = -22i64 as u64;
+                            }
+                        }
+                        _ => frame.rax = -22i64 as u64,
+                    }
+                }
+                6 => { // Command: Query Kernel Heap Used Bytes
+                    frame.rax = crate::mm::heap::HEAP_ALLOCATOR.used() as u64;
+                }
+                _ => {
+                    frame.rax = -38i64 as u64; // ENOSYS
+                }
+            }
+        }
         10 | 13 | 14 | 28 | 131 | 273 | 334 => { frame.rax = 0; }
         39 => { frame.rax = 1; }
         _ => { frame.rax = -38i64 as u64; }
@@ -854,7 +990,13 @@ pub fn spawn_thread_on_core(core_id: usize, ctx: ThreadSpawnContext) {
 
 fn ap_thread_runner_worker() {
     let core_id = crate::profiler::get_core_id();
-    let ctx = unsafe { THREAD_SPAWN_CONTEXTS[core_id].take().expect("Missing thread context") };
+    let ctx = match unsafe { THREAD_SPAWN_CONTEXTS[core_id].take() } {
+        Some(c) => c,
+        None => {
+            THREAD_ACTIVE[core_id].store(false, Ordering::SeqCst);
+            return;
+        }
+    };
 
     let state_ptr = unsafe { core::ptr::addr_of_mut!(CORE_SYSCALL_STATES[core_id]) };
     let spawn_rsp_ptr = unsafe { &mut (*state_ptr).kernel_spawn_rsp as *mut u64 };

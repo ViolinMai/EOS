@@ -98,7 +98,10 @@ pub fn map_user_pages(pml4_phys: u64, virt_addr: u64, pages: usize) -> Result<()
 }
 
 pub unsafe fn free_user_pages(pml4_phys: u64) {
-    let vmm = unsafe { (*addr_of!(VMM)).unwrap() };
+    let vmm = match unsafe { (*addr_of!(VMM)).as_ref() } {
+        Some(v) => v,
+        None => return,
+    };
     let pml4 = unsafe { &mut *((pml4_phys + vmm.hhdm_offset) as *mut PageTable) };
     
     for p4 in 0..256 {

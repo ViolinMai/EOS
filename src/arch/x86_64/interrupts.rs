@@ -111,8 +111,9 @@ pub fn execute_command(cmd: &str) {
         "ipconfig" | "net" => crate::net::cmd_ipconfig(),
         "ping" => log_info!("NET", "Pinging QEMU Gateway (10.0.2.2)... [OK]"),
         "clear" => log_info!("SHELL", "Screen clear requested."),
+        "audit" => { crate::audit::run_kernel_self_audit(); }
         "reboot" => crate::arch::x86_64::power::reboot(),
-        "help" => log_info!("SHELL", "Available commands: gui, ipconfig, net, ping, reboot, clear, help"),
+        "help" => log_info!("SHELL", "Available commands: gui, audit, ipconfig, net, ping, reboot, clear, help"),
         _ => log_error!("SHELL", "Unknown command: '{}'. Type 'help'.", trimmed),
     }
 }

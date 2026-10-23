@@ -241,7 +241,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                         return;
                     }
                     match &mut file.source {
-                        crate::task::FileSource::Memory(ref mut bytes) => {
+                        crate::task::FileSource::Memory(bytes) => {
                             let mut buf = alloc::vec![0u8; frame.rdx as usize];
                             if copy_from_user(&mut buf, frame.rsi, frame.rdx as usize).is_ok() {
                                 if file.offset + buf.len() > bytes.len() { bytes.resize(file.offset + buf.len(), 0); }
@@ -772,6 +772,27 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     frame.rax = 0;
                 } else { frame.rax = -14i64 as u64; }
             } else { frame.rax = -14i64 as u64; }
+        }
+        520 => { // sys_agent_dispatch (Agent Sandbox Constraint Guard)
+            let cmd_id = frame.rdi as u32;
+            let arg_ptr = frame.rsi;
+            let len = frame.rdx as usize;
+
+            if len > 4096 || !validate_user_range(arg_ptr, len) {
+                frame.rax = -14i64 as u64; // EFAULT
+            } else {
+                match cmd_id {
+                    1 => { // Command: Ping / Heartbeat
+                        frame.rax = 0;
+                    }
+                    2 => { // Command: Safe Query VFS State
+                        frame.rax = crate::fs::FAT_FS.drive as u64;
+                    }
+                    _ => {
+                        frame.rax = -38i64 as u64; // ENOSYS
+                    }
+                }
+            }
         }
         10 | 13 | 14 | 28 | 131 | 273 | 334 => { frame.rax = 0; }
         39 => { frame.rax = 1; }
