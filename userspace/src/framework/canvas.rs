@@ -103,19 +103,31 @@ impl<'a> Canvas<'a> {
             }
 
             let dy = if is_top { (y + radius as i32 - 1) - cy } else { cy - (y + h - radius as i32) };
+            let r_f = radius as f32;
 
             for cx in rect.x..(rect.x + rect.w) {
                 let is_left = cx < x + radius as i32;
                 let is_right = cx >= x + w - radius as i32;
+                let mut p_alpha = alpha;
 
                 if is_left || is_right {
                     let dx = if is_left { (x + radius as i32 - 1) - cx } else { cx - (x + w - radius as i32) };
-                    if dx * dx + dy * dy >= r_sq { continue; }
+                    let dist_sq = dx * dx + dy * dy;
+                    if dist_sq >= r_sq { continue; }
+                    // تنعيم الحواف الدائرية (يتبع إعدادات الـ Framework المركزية)
+                    if crate::framework::features::get_features().aa_corners
+                        && dist_sq > (radius.saturating_sub(2) * radius.saturating_sub(2)) as i32
+                    {
+                        let dist = (dist_sq as f32).sqrt();
+                        let cov = (r_f - dist).clamp(0.0, 1.0);
+                        p_alpha = ((alpha as f32) * cov) as u32;
+                        if p_alpha == 0 { continue; }
+                    }
                 }
 
                 let idx = row + (cx as usize);
-                if alpha < 255 {
-                    self.buffer[idx] = blend(self.buffer[idx], color, alpha);
+                if p_alpha < 255 {
+                    self.buffer[idx] = blend(self.buffer[idx], color, p_alpha);
                 } else {
                     self.buffer[idx] = color;
                 }
@@ -124,16 +136,69 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn draw_rect_outline(&mut self, x: i32, y: i32, w: i32, h: i32, color: u32, radius: usize) {
-        if radius == 0 {
+        if radius == 0 || w <= 2 || h <= 2 {
             self.draw_line_h(x, y, w, color);
             self.draw_line_h(x, y + h - 1, w, color);
             self.draw_line_v(x, y, h, color);
             self.draw_line_v(x + w - 1, y, h, color);
-        } else {
-            self.draw_rect(x, y, w, 1, color, 0);
-            self.draw_rect(x, y + h - 1, w, 1, color, 0);
-            self.draw_rect(x, y, 1, h, color, 0);
-            self.draw_rect(x + w - 1, y, 1, h, color, 0);
+            return;
+        }
+        let clip = self.current_clip();
+        let rect = Rect::new(x, y, w, h).intersect(&clip);
+        if rect.w <= 0 || rect.h <= 0 { return; }
+
+        let alpha = (color >> 24) & 0xFF;
+        if alpha == 0 { return; }
+
+        let r = radius.min((w as usize) / 2).min((h as usize) / 2) as f32;
+        let r_outer2 = r * r;
+        let r_inner = (r - 1.35).max(0.0);
+        let r_inner2 = r_inner * r_inner;
+        let aa = crate::framework::features::get_features().aa_corners;
+
+        for cy in rect.y..(rect.y + rect.h) {
+            let row = (cy as usize) * self.width;
+            let ly = cy - y;
+            let in_top = (ly as f32) < r;
+            let in_bot = (ly as f32) >= (h as f32) - r;
+
+            if !in_top && !in_bot {
+                for &edge_x in &[x, x + w - 1] {
+                    if edge_x >= rect.x && edge_x < rect.x + rect.w {
+                        let idx = row + (edge_x as usize);
+                        self.buffer[idx] = if alpha < 255 { blend(self.buffer[idx], color, alpha) } else { color };
+                    }
+                }
+                continue;
+            }
+
+            let dy = if in_top { r - (ly as f32) - 0.5 } else { (ly as f32) - ((h as f32) - r) + 0.5 };
+            for cx in rect.x..(rect.x + rect.w) {
+                let lx = cx - x;
+                let in_left = (lx as f32) < r;
+                let in_right = (lx as f32) >= (w as f32) - r;
+
+                let p_alpha = if !in_left && !in_right {
+                    if ly == 0 || ly == h - 1 { alpha } else { 0 }
+                } else {
+                    let dx = if in_left { r - (lx as f32) - 0.5 } else { (lx as f32) - ((w as f32) - r) + 0.5 };
+                    let d2 = dx * dx + dy * dy;
+                    if d2 > r_outer2 || d2 < r_inner2 {
+                        0
+                    } else if aa {
+                        let d = d2.sqrt();
+                        let cov = (1.0 - (d - (r - 0.7)).abs()).clamp(0.25, 1.0);
+                        ((alpha as f32) * cov) as u32
+                    } else {
+                        alpha
+                    }
+                };
+
+                if p_alpha > 0 {
+                    let idx = row + (cx as usize);
+                    self.buffer[idx] = if p_alpha < 255 { blend(self.buffer[idx], color, p_alpha) } else { color };
+                }
+            }
         }
     }
 
@@ -146,7 +211,111 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn draw_frosted_glass_rect(&mut self, x: i32, y: i32, w: i32, h: i32, tint: u32, radius: usize) {
+        if !crate::framework::features::get_features().aero_blur {
+            self.draw_rect(x, y, w, h, tint, radius);
+            return;
+        }
+        let clip = self.current_clip();
+        let rect = Rect::new(x, y, w, h).intersect(&clip);
+        if rect.w <= 4 || rect.h <= 4 {
+            self.draw_rect(x, y, w, h, tint, radius);
+            return;
+        }
+
+        let x1 = rect.x as usize;
+        let y1 = rect.y as usize;
+        let rw = rect.w as usize;
+        let rh = rect.h as usize;
+
+        // 2x Downsampled Separable Blur باستخدام ذاكرة ثابتة (Zero Per-Frame Allocation)
+        static mut BLUR_SMALL: Vec<u32> = Vec::new();
+        static mut BLUR_TEMP: Vec<u32> = Vec::new();
+        let dw = (rw + 1) / 2;
+        let dh = (rh + 1) / 2;
+        let needed = dw * dh;
+        let (small, temp) = unsafe {
+            if BLUR_SMALL.len() < needed { BLUR_SMALL.resize(needed, 0); }
+            if BLUR_TEMP.len() < needed { BLUR_TEMP.resize(needed, 0); }
+            (&mut BLUR_SMALL[..needed], &mut BLUR_TEMP[..needed])
+        };
+
+        for dy in 0..dh {
+            let sy = (y1 + dy * 2).min(self.height - 1) * self.width;
+            for dx in 0..dw {
+                let sx = (x1 + dx * 2).min(self.width - 1);
+                small[dy * dw + dx] = self.buffer[sy + sx];
+            }
+        }
+
+        let br: isize = 2;
+        for dy in 0..dh {
+            let row = dy * dw;
+            for dx in 0..dw {
+                let mut ra = 0u32; let mut ga = 0u32; let mut ba = 0u32; let mut cnt = 0u32;
+                for ox in -br..=br {
+                    let sx = (dx as isize + ox).clamp(0, (dw - 1) as isize) as usize;
+                    let p = small[row + sx];
+                    ra += (p >> 16) & 0xFF; ga += (p >> 8) & 0xFF; ba += p & 0xFF; cnt += 1;
+                }
+                temp[row + dx] = 0xFF000000 | ((ra / cnt) << 16) | ((ga / cnt) << 8) | (ba / cnt);
+            }
+        }
+
+        for dy in 0..dh {
+            let row = dy * dw;
+            for dx in 0..dw {
+                let mut ra = 0u32; let mut ga = 0u32; let mut ba = 0u32; let mut cnt = 0u32;
+                for oy in -br..=br {
+                    let sy = (dy as isize + oy).clamp(0, (dh - 1) as isize) as usize;
+                    let p = temp[sy * dw + dx];
+                    ra += (p >> 16) & 0xFF; ga += (p >> 8) & 0xFF; ba += p & 0xFF; cnt += 1;
+                }
+                small[row + dx] = 0xFF000000 | ((ra / cnt) << 16) | ((ga / cnt) << 8) | (ba / cnt);
+            }
+        }
+
+        for ly in 0..rh {
+            let dst_row = (y1 + ly) * self.width + x1;
+            let src_row = (ly / 2).min(dh - 1) * dw;
+            for lx in 0..rw {
+                self.buffer[dst_row + lx] = small[src_row + (lx / 2).min(dw - 1)];
+            }
+        }
+
         self.draw_rect(x, y, w, h, tint, radius);
+    }
+
+    /// رسم تدرج لوني أفقي مع خيار 10-bit Ordered Dithering لإزالة الـ Banding على شاشات 2K
+    pub fn draw_gradient_h(&mut self, x: i32, y: i32, w: i32, h: i32, c1: u32, c2: u32, dither_10bit: bool) {
+        let clip = self.current_clip();
+        let rect = Rect::new(x, y, w, h).intersect(&clip);
+        if rect.w <= 0 || rect.h <= 0 || w <= 1 { return; }
+
+        let r1 = ((c1 >> 16) & 0xFF) as f32;
+        let g1 = ((c1 >> 8) & 0xFF) as f32;
+        let b1 = (c1 & 0xFF) as f32;
+        let r2 = ((c2 >> 16) & 0xFF) as f32;
+        let g2 = ((c2 >> 8) & 0xFF) as f32;
+        let b2 = (c2 & 0xFF) as f32;
+        let bayer4: [[f32; 4]; 4] = [
+            [0.0/16.0, 8.0/16.0, 2.0/16.0, 10.0/16.0],
+            [12.0/16.0, 4.0/16.0, 14.0/16.0, 6.0/16.0],
+            [3.0/16.0, 11.0/16.0, 1.0/16.0, 9.0/16.0],
+            [15.0/16.0, 7.0/16.0, 13.0/16.0, 5.0/16.0],
+        ];
+
+        for cy in rect.y..(rect.y + rect.h) {
+            let row = (cy as usize) * self.width;
+            let by = (cy as usize) & 3;
+            for cx in rect.x..(rect.x + rect.w) {
+                let t = ((cx - x) as f32 / (w - 1) as f32).clamp(0.0, 1.0);
+                let d = if dither_10bit { bayer4[by][(cx as usize) & 3] - 0.5 } else { 0.0 };
+                let r = (r1 + (r2 - r1) * t + d).clamp(0.0, 255.0) as u32;
+                let g = (g1 + (g2 - g1) * t + d).clamp(0.0, 255.0) as u32;
+                let b = (b1 + (b2 - b1) * t + d).clamp(0.0, 255.0) as u32;
+                self.buffer[row + cx as usize] = 0xFF000000 | (r << 16) | (g << 8) | b;
+            }
+        }
     }
 
     pub fn measure_text(&mut self, text: &str, size: usize) -> (usize, usize) {
@@ -272,6 +441,43 @@ impl<'a> Canvas<'a> {
         self.push_clip(Rect::new(x, y - 4, max_w, size as i32 + 10));
         self.draw_text(x, y, text, color, size);
         self.pop_clip();
+    }
+
+    /// رسم نص متكيف رياضياً مع سطوع الخلفية (Adaptive Contrast Text)
+    /// يتحول تدريجياً من الأبيض إلى الأسود كلما زاد سطوع الخلفية لضمان القراءة
+    pub fn draw_text_adaptive(&mut self, x: i32, y: i32, max_w: i32, text: &str, fallback_color: u32, size: usize) {
+        let final_color = if crate::framework::features::get_features().adaptive_text {
+            let x1 = x.clamp(0, self.width as i32 - 1) as usize;
+            let y1 = y.clamp(0, self.height as i32 - 1) as usize;
+            let x2 = (x + max_w.max(16)).clamp(0, self.width as i32 - 1) as usize;
+            let y2 = (y + size as i32).clamp(0, self.height as i32 - 1) as usize;
+            let mut lum_sum = 0.0f32;
+            let mut samples = 0u32;
+            let step_x = ((x2.saturating_sub(x1)) / 6).max(1);
+            let step_y = ((y2.saturating_sub(y1)) / 4).max(1);
+            let mut sy = y1;
+            while sy <= y2 {
+                let mut sx = x1;
+                while sx <= x2 {
+                    let px = self.buffer[sy * self.width + sx];
+                    let r = ((px >> 16) & 0xFF) as f32;
+                    let g = ((px >> 8) & 0xFF) as f32;
+                    let b = (px & 0xFF) as f32;
+                    lum_sum += 0.299 * r + 0.587 * g + 0.114 * b;
+                    samples += 1;
+                    sx += step_x;
+                }
+                sy += step_y;
+            }
+            let avg_lum = if samples > 0 { lum_sum / samples as f32 } else { 0.0 };
+            // تدرج سلس: تحت 115 أبيض ناصع، فوق 180 أسود داكن، وبينهما انتقال تدريجي محسوب
+            let t = ((avg_lum - 115.0) / 65.0).clamp(0.0, 1.0);
+            let c = (255.0 * (1.0 - t) + 15.0 * t).round() as u32;
+            0xFF000000 | (c << 16) | (c << 8) | c
+        } else {
+            fallback_color
+        };
+        self.draw_text_clipped(x, y, max_w, text, final_color, size);
     }
 
     pub fn draw_text_with_icons(&mut self, x: i32, y: i32, text: &str, color: u32, size: usize) {

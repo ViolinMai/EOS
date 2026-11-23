@@ -25,18 +25,6 @@ pub fn push_user_event(ev: InputEvent) {
     let head = USER_EVENT_HEAD.load(Ordering::Relaxed);
     let tail = USER_EVENT_TAIL.load(Ordering::Acquire);
 
-    // Merge consecutive MouseMove events in the queue to save space and reduce latency
-    if let InputEvent::MouseMove { x: new_dx, y: new_dy } = ev {
-        if head != tail {
-            let prev_idx = if head == 0 { 127 } else { head - 1 };
-            if let Some(InputEvent::MouseMove { x, y }) = unsafe { USERSPACE_EVENTS[prev_idx].as_mut() } {
-                *x += new_dx;
-                *y += new_dy;
-                return;
-            }
-        }
-    }
-
     let next = (head + 1) % 128;
     if next != tail {
         unsafe { USERSPACE_EVENTS[head] = Some(ev); }
@@ -138,9 +126,27 @@ extern "C" fn syscall_entry() {
         "swapgs", "mov gs:[0], rsp", "mov rsp, gs:[8]",
         "push rcx", "push r11", "push r9", "push r8", "push r10", "push rdx", "push rsi", "push rdi", "push rax",
         "push rbp", "push rbx", "push r12", "push r13", "push r14", "push r15",
-        "sub rsp, 8", "lea rdi, [rsp + 56]",
+        // حفظ سجلات XMM0..XMM15 (256 بايت + 8 بايت لمحاذاة 16-byte) لمنع تخريب قيم Userspace
+        "sub rsp, 264",
+        "movdqa [rsp + 0],   xmm0",  "movdqa [rsp + 16],  xmm1",
+        "movdqa [rsp + 32],  xmm2",  "movdqa [rsp + 48],  xmm3",
+        "movdqa [rsp + 64],  xmm4",  "movdqa [rsp + 80],  xmm5",
+        "movdqa [rsp + 96],  xmm6",  "movdqa [rsp + 112], xmm7",
+        "movdqa [rsp + 128], xmm8",  "movdqa [rsp + 144], xmm9",
+        "movdqa [rsp + 160], xmm10", "movdqa [rsp + 176], xmm11",
+        "movdqa [rsp + 192], xmm12", "movdqa [rsp + 208], xmm13",
+        "movdqa [rsp + 224], xmm14", "movdqa [rsp + 240], xmm15",
+        "lea rdi, [rsp + 312]",
         "call {handler}",
-        "add rsp, 8",
+        "movdqa xmm0,  [rsp + 0]",   "movdqa xmm1,  [rsp + 16]",
+        "movdqa xmm2,  [rsp + 32]",  "movdqa xmm3,  [rsp + 48]",
+        "movdqa xmm4,  [rsp + 64]",  "movdqa xmm5,  [rsp + 80]",
+        "movdqa xmm6,  [rsp + 96]",  "movdqa xmm7,  [rsp + 112]",
+        "movdqa xmm8,  [rsp + 128]", "movdqa xmm9,  [rsp + 144]",
+        "movdqa xmm10, [rsp + 160]", "movdqa xmm11, [rsp + 176]",
+        "movdqa xmm12, [rsp + 192]", "movdqa xmm13, [rsp + 208]",
+        "movdqa xmm14, [rsp + 224]", "movdqa xmm15, [rsp + 240]",
+        "add rsp, 264",
         "cmp byte ptr [{exit_flag}], 1", "je 1f",
         "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx", "pop rbp",
         "pop rax", "pop rdi", "pop rsi", "pop rdx", "pop r10", "pop r8", "pop r9", "pop r11", "pop rcx",
@@ -175,6 +181,7 @@ fn fill_stat_buffer(statbuf: u64, size: u64, mode: u32) -> Result<(), ()> {
 
 #[unsafe(no_mangle)]
 pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
+    let t_start = pit::read_tsc();
     let frame = unsafe { &mut *frame_ptr };
     let cur_core = crate::profiler::get_core_id();
 
@@ -453,7 +460,12 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 let vaddr = proc.mmap_bump;
                 proc.mmap_bump += (pages * 4096) as u64;
                 let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
-                if crate::mm::paging::map_user_pages(cur_pml4, vaddr, pages).is_err() { frame.rax = -12i64 as u64; } else { frame.rax = vaddr; }
+                if crate::mm::paging::map_user_pages(cur_pml4, vaddr, pages).is_err() {
+                    frame.rax = -12i64 as u64;
+                } else {
+                    crate::task::record_proc_mem(cur_core, (pages * 4096) as u64);
+                    frame.rax = vaddr;
+                }
             } else { frame.rax = -38i64 as u64; }
         }
         11 => { frame.rax = 0; }
@@ -469,6 +481,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                         frame.rax = current; return;
                     }
                     proc.mmap_bump = (addr + 0xFFF) & !0xFFF;
+                    crate::task::record_proc_mem(cur_core, (pages * 4096) as u64);
                 }
                 frame.rax = addr;
             }
@@ -607,6 +620,22 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             }
         }
         186 => { frame.rax = cur_core as u64; } // gettid
+        204 => { // sched_getaffinity(pid, cpusetsize, mask_ptr)
+            let size = frame.rsi as usize;
+            let mask_ptr = frame.rdx;
+            if size > 0 && validate_user_range(mask_ptr, size) {
+                let mut mask = alloc::vec![0u8; size];
+                let cores = (crate::CORES_ONLINE.load(Ordering::Relaxed) as usize).clamp(1, 8);
+                mask[0] = ((1u16 << cores) - 1) as u8;
+                if copy_to_user(mask_ptr, &mask).is_ok() {
+                    frame.rax = 8.min(size) as u64;
+                } else {
+                    frame.rax = -14i64 as u64;
+                }
+            } else {
+                frame.rax = -22i64 as u64;
+            }
+        }
         217 => { // getdents64
             let fd = frame.rdi as usize;
             let dirp = frame.rsi;
@@ -678,7 +707,11 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             } else { frame.rax = -14i64 as u64; }
         }
         231 => { // exit_group
-            ELF_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+            if cur_core == 2 {
+                ELF_EXIT_REQUESTED.store(true, Ordering::SeqCst);
+            } else {
+                crate::task::force_exit_user_process();
+            }
             frame.rax = 0;
         }
         318 => { // getrandom
@@ -712,17 +745,21 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             }
         }
         502 => { // sys_present
-            let target_w = core::cmp::min(frame.r10 as usize, 1920);
-            let target_h = core::cmp::min(frame.r8 as usize, 1080);
+            let target_w = core::cmp::min(frame.r10 as usize, 2560);
+            let target_h = core::cmp::min(frame.r8 as usize, 1440);
             let total_bytes = target_w * target_h * 4;
             if target_w > 0 && target_h > 0 && validate_user_range(frame.rdi, total_bytes) {
-                unsafe {
-                    if let Some(writer) = &mut *core::ptr::addr_of_mut!(crate::writer::WRITER) {
-                        let src = frame.rdi as *const u8;
-                        let dst = writer.buffer;
-                        let line_bytes = target_w.min(writer.width) * 4;
-                        for y in 0..target_h.min(writer.height) {
-                            core::ptr::copy_nonoverlapping(src.add(y * target_w * 4), dst.add(y * writer.pitch), line_bytes);
+                if crate::drivers::virtio_gpu::is_active() {
+                    crate::drivers::virtio_gpu::present_full(frame.rdi as *const u32, target_w, target_h);
+                } else {
+                    unsafe {
+                        if let Some(writer) = &mut *core::ptr::addr_of_mut!(crate::writer::WRITER) {
+                            let src = frame.rdi as *const u8;
+                            let dst = writer.buffer;
+                            let line_bytes = target_w.min(writer.width) * 4;
+                            for y in 0..target_h.min(writer.height) {
+                                core::ptr::copy_nonoverlapping(src.add(y * target_w * 4), dst.add(y * writer.pitch), line_bytes);
+                            }
                         }
                     }
                 }
@@ -743,8 +780,8 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             } else { frame.rax = 0; frame.rdi = 0; frame.rsi = 0; }
         }
         504 => { // sys_present_rects
-            let target_w = core::cmp::min(frame.r10 as usize, 1920);
-            let target_h = core::cmp::min(frame.r8 as usize, 1080);
+            let target_w = core::cmp::min(frame.r10 as usize, 2560);
+            let target_h = core::cmp::min(frame.r8 as usize, 1440);
             let total_bytes = target_w * target_h * 4;
             let rects_len = (frame.rdx as usize).min(256);
             let rects_bytes = rects_len * 16;
@@ -753,28 +790,34 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 let mut rects = alloc::vec![[0u32; 4]; rects_len];
                 unsafe {
                     core::ptr::copy_nonoverlapping(frame.rsi as *const [u32; 4], rects.as_mut_ptr(), rects_len);
-                    if let Some(writer) = &mut *core::ptr::addr_of_mut!(crate::writer::WRITER) {
-                        let src = frame.rdi as *const u32;
-                        let dst = writer.buffer as *mut u32;
-                        let pitch = writer.pitch / 4;
-                        let max_w = target_w.min(writer.width);
-                        let max_h = target_h.min(writer.height);
+                }
+                if crate::drivers::virtio_gpu::is_active() {
+                    crate::drivers::virtio_gpu::present_rects(frame.rdi as *const u32, target_w, target_h, &rects);
+                } else {
+                    unsafe {
+                        if let Some(writer) = &mut *core::ptr::addr_of_mut!(crate::writer::WRITER) {
+                            let src = frame.rdi as *const u32;
+                            let dst = writer.buffer as *mut u32;
+                            let pitch = writer.pitch / 4;
+                            let max_w = target_w.min(writer.width);
+                            let max_h = target_h.min(writer.height);
 
-                        for rect in &rects {
-                            let rx = rect[0] as usize;
-                            let ry = rect[1] as usize;
-                            let rw = rect[2] as usize;
-                            let rh = rect[3] as usize;
+                            for rect in &rects {
+                                let rx = rect[0] as usize;
+                                let ry = rect[1] as usize;
+                                let rw = rect[2] as usize;
+                                let rh = rect[3] as usize;
 
-                            let ex = rx.saturating_add(rw).min(max_w);
-                            let ey = ry.saturating_add(rh).min(max_h);
-                            if rx >= ex || ry >= ey { continue; }
-                            let line_len = ex - rx;
+                                let ex = rx.saturating_add(rw).min(max_w);
+                                let ey = ry.saturating_add(rh).min(max_h);
+                                if rx >= ex || ry >= ey { continue; }
+                                let line_len = ex - rx;
 
-                            for y in ry..ey {
-                                let src_idx = y * target_w + rx;
-                                let dst_idx = y * pitch + rx;
-                                core::ptr::copy_nonoverlapping(src.add(src_idx), dst.add(dst_idx), line_len);
+                                for y in ry..ey {
+                                    let src_idx = y * target_w + rx;
+                                    let dst_idx = y * pitch + rx;
+                                    core::ptr::copy_nonoverlapping(src.add(src_idx), dst.add(dst_idx), line_len);
+                                }
                             }
                         }
                     }
@@ -804,6 +847,111 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 crate::task::yield_now();
             }
             if !got_event { frame.rax = 0; frame.rdi = 0; frame.rsi = 0; }
+        }
+        506 => { // sys_gpu_move_cursor
+            let x = frame.rdi as u32;
+            let y = frame.rsi as u32;
+            frame.rax = if crate::drivers::virtio_gpu::move_cursor(x, y) { 1 } else { 0 };
+        }
+        507 => { // sys_gpu_submit_3d
+            let ptr = frame.rdi;
+            let word_len = (frame.rsi as usize).min(500);
+            let byte_len = word_len * 4;
+            if word_len > 0 && validate_user_range(ptr, byte_len) {
+                let mut words = alloc::vec![0u32; word_len];
+                unsafe {
+                    core::ptr::copy_nonoverlapping(ptr as *const u32, words.as_mut_ptr(), word_len);
+                }
+                frame.rax = if crate::drivers::virtio_gpu::submit_3d(&words) { 1 } else { 0 };
+            } else {
+                frame.rax = 0;
+            }
+        }
+        509 => { // sys_proc_list(out_ptr, max_entries) -> count
+            let out_ptr = frame.rdi;
+            let max_entries = (frame.rsi as usize).min(crate::task::MAX_PROCS);
+            let entry_sz = core::mem::size_of::<crate::task::ProcTelemetry>();
+            if max_entries > 0 && validate_user_range(out_ptr, max_entries * entry_sz) {
+                let mut snap = [crate::task::ProcTelemetry::empty(); crate::task::MAX_PROCS];
+                let count = crate::task::snapshot_procs(&mut snap).min(max_entries);
+                let bytes = unsafe { core::slice::from_raw_parts(snap.as_ptr() as *const u8, count * entry_sz) };
+                if copy_to_user(out_ptr, bytes).is_ok() {
+                    frame.rax = count as u64;
+                } else {
+                    frame.rax = -14i64 as u64;
+                }
+            } else {
+                frame.rax = -14i64 as u64;
+            }
+        }
+        508 => { // sys_gpu_info
+            let out_ptr = frame.rdi;
+            if validate_user_range(out_ptr, 24) {
+                let info = crate::drivers::virtio_gpu::get_gpu_info();
+                let bytes = unsafe { core::slice::from_raw_parts(info.as_ptr() as *const u8, 24) };
+                if copy_to_user(out_ptr, bytes).is_ok() {
+                    frame.rax = 0;
+                } else {
+                    frame.rax = -14i64 as u64;
+                }
+            } else {
+                frame.rax = -14i64 as u64;
+            }
+        }
+        510 => { // sys_media_decode_image(src_ptr, src_len, out_pixels_ptr, out_cap_pixels, out_meta_ptr)
+            static mut STAGED_IMG: Option<(usize, usize, alloc::vec::Vec<u32>)> = None;
+            let src_ptr = frame.rdi;
+            let src_len = (frame.rsi as usize).min(16 * 1024 * 1024);
+            let out_pixels_ptr = frame.rdx;
+            let out_cap = frame.r10 as usize;
+            let out_meta_ptr = frame.r8;
+
+            if out_pixels_ptr == 0 {
+                if src_len > 0 && validate_user_range(src_ptr, src_len) && validate_user_range(out_meta_ptr, 8) {
+                    let mut raw = alloc::vec![0u8; src_len];
+                    if copy_from_user(&mut raw, src_ptr, src_len).is_ok() {
+                        match crate::fs::image::decode_image_to_raw(&raw) {
+                            Ok((px, w, h)) => {
+                                let meta = [w as u32, h as u32];
+                                let meta_bytes = unsafe { core::slice::from_raw_parts(meta.as_ptr() as *const u8, 8) };
+                                if copy_to_user(out_meta_ptr, meta_bytes).is_ok() {
+                                    unsafe { *core::ptr::addr_of_mut!(STAGED_IMG) = Some((w, h, px)); }
+                                    frame.rax = 0;
+                                } else {
+                                    frame.rax = -14i64 as u64;
+                                }
+                            }
+                            Err(_) => { frame.rax = -22i64 as u64; }
+                        }
+                    } else {
+                        frame.rax = -14i64 as u64;
+                    }
+                } else {
+                    frame.rax = -14i64 as u64;
+                }
+            } else {
+                let staged = unsafe { (*core::ptr::addr_of_mut!(STAGED_IMG)).take() };
+                if let Some((w, h, px)) = staged {
+                    let needed = px.len();
+                    if out_cap >= needed && validate_user_range(out_pixels_ptr, needed * 4) {
+                        let px_bytes = unsafe { core::slice::from_raw_parts(px.as_ptr() as *const u8, needed * 4) };
+                        if copy_to_user(out_pixels_ptr, px_bytes).is_ok() {
+                            if out_meta_ptr != 0 && validate_user_range(out_meta_ptr, 8) {
+                                let meta = [w as u32, h as u32];
+                                let meta_bytes = unsafe { core::slice::from_raw_parts(meta.as_ptr() as *const u8, 8) };
+                                let _ = copy_to_user(out_meta_ptr, meta_bytes);
+                            }
+                            frame.rax = 0;
+                        } else {
+                            frame.rax = -14i64 as u64;
+                        }
+                    } else {
+                        frame.rax = -12i64 as u64;
+                    }
+                } else {
+                    frame.rax = -2i64 as u64;
+                }
+            }
         }
         512 => { // sys_net_tx
             let data_ptr = frame.rdi;
@@ -838,6 +986,90 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     frame.rax = 0;
                 } else { frame.rax = -14i64 as u64; }
             } else { frame.rax = -14i64 as u64; }
+        }
+        530 => { // sys_win_create(title_ptr, len, w, h)
+            let len = (frame.rsi as usize).min(39);
+            let mut tbuf = [0u8; 40];
+            if len > 0 && copy_from_user(&mut tbuf[..len], frame.rdi, len).is_ok() {
+                let title = core::str::from_utf8(&tbuf[..len]).unwrap_or("App");
+                frame.rax = crate::task::create_ext_window(cur_core as u32, title, frame.rdx as u32, frame.r10 as u32).unwrap_or(0) as u64;
+            } else { frame.rax = 0; }
+        }
+        531 => { // sys_win_commit(win_id, px_ptr, w, h)
+            let cnt = (frame.rdx as usize).saturating_mul(frame.r10 as usize);
+            let bytes = cnt.saturating_mul(4);
+            if cnt > 0 && bytes <= 2560 * 1440 * 4 && validate_user_range(frame.rsi, bytes) {
+                let sl = unsafe { core::slice::from_raw_parts(frame.rsi as *const u32, cnt) };
+                frame.rax = if crate::task::commit_ext_window(frame.rdi as u32, frame.rdx as u32, frame.r10 as u32, sl) { 0 } else { -1i64 as u64 };
+            } else { frame.rax = -14i64 as u64; }
+        }
+        532 => { // sys_win_poll_event(win_id, out_ptr)
+            let sz = core::mem::size_of::<crate::task::ExtWindowEvent>();
+            if validate_user_range(frame.rsi, sz) {
+                if let Some(ev) = crate::task::poll_ext_event(frame.rdi as u32) {
+                    let b = unsafe { core::slice::from_raw_parts(&ev as *const _ as *const u8, sz) };
+                    let _ = copy_to_user(frame.rsi, b);
+                    frame.rax = 1;
+                } else { frame.rax = 0; }
+            } else { frame.rax = 0; }
+        }
+        533 => { crate::task::destroy_ext_window(frame.rdi as u32); frame.rax = 0; }
+        534 => { // sys_comp_list_windows(out_ptr, max)
+            let max_e = (frame.rsi as usize).min(crate::task::MAX_EXT_WINDOWS);
+            let sz = core::mem::size_of::<crate::task::ExtWindowDesc>();
+            if max_e > 0 && validate_user_range(frame.rdi, max_e * sz) {
+                let mut list = [crate::task::ExtWindowDesc::default(); crate::task::MAX_EXT_WINDOWS];
+                let cnt = crate::task::list_ext_windows(&mut list).min(max_e);
+                let b = unsafe { core::slice::from_raw_parts(list.as_ptr() as *const u8, cnt * sz) };
+                frame.rax = if copy_to_user(frame.rdi, b).is_ok() { cnt as u64 } else { 0 };
+            } else { frame.rax = 0; }
+        }
+        535 => { // sys_comp_read_surface(win_id, dst_ptr, cap_pixels)
+            let cap = (frame.rdx as usize).min(2560 * 1440);
+            if cap > 0 && validate_user_range(frame.rsi, cap * 4) {
+                let dst = unsafe { core::slice::from_raw_parts_mut(frame.rsi as *mut u32, cap) };
+                frame.rax = crate::task::read_ext_surface(frame.rdi as u32, dst) as u64;
+            } else { frame.rax = 0; }
+        }
+        536 => { // sys_comp_send_event(win_id, kind, a, b, c)
+            let ev = crate::task::ExtWindowEvent { kind: frame.rsi as u32, a: frame.rdx as i32, b: frame.r10 as i32, c: frame.r8 as i32 };
+            frame.rax = if crate::task::push_ext_event(frame.rdi as u32, ev) { 0 } else { -1i64 as u64 };
+        }
+        537 => { // sys_win_file_portal(cmd, win_id, buf_ptr, buf_len)
+            let cmd = frame.rdi as u32;
+            let wid = frame.rsi as u32;
+            let len = (frame.r10 as usize).min(127);
+            let mut kbuf = [0u8; 128];
+            if cmd == 3 || cmd == 5 {
+                frame.rax = crate::task::ext_file_portal(cmd, wid, &mut []) as u64;
+            } else if (cmd == 0 || cmd == 1) && (len == 0 || copy_from_user(&mut kbuf[..len], frame.rdx, len).is_ok()) {
+                frame.rax = crate::task::ext_file_portal(cmd, wid, &mut kbuf[..len]) as u64;
+            } else if (cmd == 2 || cmd == 4) && len > 0 && validate_user_range(frame.rdx, len) {
+                let n = crate::task::ext_file_portal(cmd, wid, &mut kbuf[..len]);
+                if n > 0 { let _ = copy_to_user(frame.rdx, &kbuf[..n]); }
+                frame.rax = n as u64;
+            } else { frame.rax = 0; }
+        }
+        540 => { // sys_audio_write(pcm_ptr, byte_len) -> bytes_written
+            let ptr = frame.rdi;
+            let len = (frame.rsi as usize).min(65536);
+            if len > 0 && validate_user_range(ptr, len) {
+                let mut tmp = alloc::vec![0u8; len];
+                if copy_from_user(&mut tmp, ptr, len).is_ok() {
+                    frame.rax = crate::drivers::ac97::write_pcm(&tmp) as u64;
+                } else {
+                    frame.rax = 0;
+                }
+            } else {
+                frame.rax = 0;
+            }
+        }
+        541 => { // sys_audio_set_volume(vol_0_100)
+            crate::drivers::ac97::set_volume(frame.rdi as u8);
+            frame.rax = 0;
+        }
+        542 => { // sys_audio_info() -> 1 if active
+            frame.rax = if crate::drivers::ac97::is_active() { 1 } else { 0 };
         }
         520 => { // sys_agent_dispatch (Agent Sandbox & Telemetry Protocol)
             let cmd_id = frame.rdi as u32;
@@ -911,10 +1143,53 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 }
             }
         }
-        10 | 13 | 14 | 28 | 131 | 273 | 334 => { frame.rax = 0; }
+        35 => { // nanosleep(req_ptr, rem_ptr)
+            let mut req = [0u64; 2];
+            if validate_user_range(frame.rdi, 16) {
+                let bytes = unsafe { core::slice::from_raw_parts_mut(req.as_mut_ptr() as *mut u8, 16) };
+                if copy_from_user(bytes, frame.rdi, 16).is_ok() {
+                    let ms = req[0].saturating_mul(1000).saturating_add(req[1] / 1_000_000);
+                    if ms > 0 {
+                        let wait_ticks = (ms / 10).max(1);
+                        let target = pit::TICKS.load(Ordering::Relaxed).saturating_add(wait_ticks);
+                        while pit::TICKS.load(Ordering::Relaxed) < target {
+                            if cur_core == 0 {
+                                unsafe { core::arch::asm!("sti; hlt"); }
+                            } else {
+                                core::hint::spin_loop();
+                            }
+                        }
+                    }
+                }
+            }
+            frame.rax = 0;
+        }
+        230 => { // clock_nanosleep(clock_id, flags, req_ptr, rem_ptr)
+            let mut req = [0u64; 2];
+            if validate_user_range(frame.rdx, 16) {
+                let bytes = unsafe { core::slice::from_raw_parts_mut(req.as_mut_ptr() as *mut u8, 16) };
+                if copy_from_user(bytes, frame.rdx, 16).is_ok() {
+                    let ms = req[0].saturating_mul(1000).saturating_add(req[1] / 1_000_000);
+                    if ms > 0 {
+                        let wait_ticks = (ms / 10).max(1);
+                        let target = pit::TICKS.load(Ordering::Relaxed).saturating_add(wait_ticks);
+                        while pit::TICKS.load(Ordering::Relaxed) < target {
+                            if cur_core == 0 {
+                                unsafe { core::arch::asm!("sti; hlt"); }
+                            } else {
+                                core::hint::spin_loop();
+                            }
+                        }
+                    }
+                }
+            }
+            frame.rax = 0;
+        }
+        10 | 13 | 14 | 28 | 72 | 131 | 273 | 334 => { frame.rax = 0; }
         39 => { frame.rax = 1; }
         _ => { frame.rax = -38i64 as u64; }
     }
+    crate::task::record_proc_syscall(cur_core, pit::read_tsc().saturating_sub(t_start));
 }
 
 pub struct ProcessTableLock {

@@ -1,158 +1,135 @@
-use crate::framework::*;
 use std::fs;
+use crate::framework::*;
+use crate::sdk;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum SettingsTab {
-    General,
     Appearance,
-    ThemeColor,
-    Display,
-    About,
-    Detective,
+    Wallpapers,
+    SystemHw,
+}
+
+struct WallpaperItem {
+    name: String,
+    thumb: ImageWidget,
+    src_w: usize,
+    src_h: usize,
 }
 
 pub struct SettingsApp {
     bounds: Rect,
-    current_tab: SettingsTab,
-    available_wallpapers: Vec<String>,
-    selected_wp: Option<usize>,
-    status: String,
-    color_picker: crate::framework::tools::ColorPickerTool,
+    tab: SettingsTab,
+    style: ThemeStyle,
+    dark_mode: bool,
+    accent: u32,
+    scale: f32,
+    active_wallpaper: String,
+    wallpapers: Vec<WallpaperItem>,
+    wallpapers_loaded: bool,
+    wp_scroll: i32,
+    status_msg: String,
 }
 
 impl SettingsApp {
     pub fn new() -> Self {
-        let mut app = Self {
+        let mut dark_mode = true;
+        let mut style = ThemeStyle::AeroGlass;
+        let mut accent = 0xFF0284C7u32;
+        let mut scale = 2.0f32;
+        let mut active_wallpaper = "none".to_string();
+
+        if let Ok(c) = fs::read_to_string("RootFS/settings.ini").or_else(|_| fs::read_to_string("settings.ini")) {
+            for line in c.lines() {
+                let l = line.trim();
+                if let Some(v) = l.strip_prefix("dark_mode=") {
+                    dark_mode = v.trim() == "1" || v.trim().eq_ignore_ascii_case("true");
+                } else if let Some(v) = l.strip_prefix("style=") {
+                    if v.trim().eq_ignore_ascii_case("modern") { style = ThemeStyle::CleanModern; }
+                } else if let Some(v) = l.strip_prefix("accent=") {
+                    let hex = v.trim().trim_start_matches("0x").trim_start_matches('#');
+                    if let Ok(col) = u32::from_str_radix(hex, 16) {
+                        accent = if col <= 0xFFFFFF { 0xFF000000 | col } else { col };
+                    }
+                } else if let Some(v) = l.strip_prefix("scale=") {
+                    if let Ok(s) = v.trim().parse::<f32>() { scale = s; }
+                } else if let Some(v) = l.strip_prefix("wallpaper=") {
+                    active_wallpaper = v.trim().to_string();
+                }
+            }
+        }
+
+        Self {
             bounds: Rect::default(),
-            current_tab: SettingsTab::General,
-            available_wallpapers: Vec::new(),
-            selected_wp: None,
-            status: String::new(),
-            color_picker: crate::framework::tools::ColorPickerTool::new(0, 0, 320, 200, 0xFF2563EB),
-        };
-        app.scan_wallpapers();
-        app
+            tab: SettingsTab::Appearance,
+            style,
+            dark_mode,
+            accent,
+            scale,
+            active_wallpaper,
+            wallpapers: Vec::new(),
+            wallpapers_loaded: false,
+            wp_scroll: 0,
+            status_msg: "Instant launch — Wallpapers load lazily when opened.".into(),
+        }
     }
 
     fn scan_wallpapers(&mut self) {
-        self.available_wallpapers.clear();
-        let dirs = ["/EOS SHARE", "EOS SHARE", "."];
+        self.wallpapers.clear();
+        let dirs = ["EOS SHARE", "/EOS SHARE"];
         for d in &dirs {
-            if let Ok(entries) = fs::read_dir(d) {
-                for e in entries.flatten() {
-                    let name = e.file_name().to_string_lossy().to_string();
-                    let lower = name.to_lowercase();
-                    if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-                        if !self.available_wallpapers.contains(&name) {
-                            self.available_wallpapers.push(name);
-                        }
+            if let Ok(rd) = fs::read_dir(d) {
+                for entry in rd.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    let lower = name.to_ascii_lowercase();
+                    if !(lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg")) {
+                        continue;
                     }
-                }
-                if !self.available_wallpapers.is_empty() { break; }
-            }
-        }
-    }
-
-    pub fn save_setting_key_value(key: &str, val: &str) {
-        let mut lines = Vec::new();
-        let paths = ["RootFS/settings.ini", "settings.ini"];
-
-        let mut existing_content = String::new();
-        for p in &paths {
-            if let Ok(c) = fs::read_to_string(p) {
-                if !c.is_empty() {
-                    existing_content = c;
-                    break;
-                }
-            }
-        }
-
-        let prefix = format!("{}=", key);
-        for line in existing_content.lines() {
-            let tr = line.trim();
-            if !tr.starts_with(&prefix) && !tr.is_empty() {
-                lines.push(tr.to_string());
-            }
-        }
-        lines.push(format!("{}={}", key, val));
-        let payload = lines.join("\n") + "\n";
-
-        for p in &paths {
-            let _ = fs::write(p, payload.as_bytes());
-        }
-    }
-
-    fn apply_wallpaper(&mut self, idx: usize) {
-        if idx >= self.available_wallpapers.len() { return; }
-        let fname = self.available_wallpapers[idx].clone();
-
-        let candidates = [
-            format!("EOS SHARE/{}", fname),
-            format!("/EOS SHARE/{}", fname),
-            fname.clone(),
-        ];
-
-        let mut read_bytes = Vec::new();
-        for p in &candidates {
-            if let Ok(b) = fs::read(p) {
-                if !b.is_empty() {
-                    read_bytes = b;
-                    break;
-                }
-            }
-        }
-
-        if !read_bytes.is_empty() {
-            let mut decoded: Option<(Vec<u32>, usize, usize)> = None;
-
-            if read_bytes.len() >= 8 && &read_bytes[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
-                if let Ok((px, w, h)) = crate::png::decode_png(&read_bytes) {
-                    decoded = Some((px, w, h));
-                }
-            } else if read_bytes.len() >= 3 && read_bytes[0] == 0xFF && read_bytes[1] == 0xD8 && read_bytes[2] == 0xFF {
-                let mut dec = zune_jpeg::JpegDecoder::new(&read_bytes);
-                if let Ok(raw) = dec.decode() {
-                    if let Some(info) = dec.info() {
-                        let orig_w = info.width as usize;
-                        let orig_h = info.height as usize;
-                        let step = ((orig_w + 1919) / 1920).max((orig_h + 1079) / 1080).max(1);
-                        let out_w = orig_w / step;
-                        let out_h = orig_h / step;
-                        let mut px = vec![0u32; out_w * out_h];
-
-                        for dy in 0..out_h {
-                            let sy = dy * step;
-                            let src_row = sy * orig_w * 3;
-                            let dst_row = dy * out_w;
-                            for dx in 0..out_w {
-                                let sx = dx * step;
-                                let o = src_row + (sx * 3);
-                                if o + 2 < raw.len() {
-                                    px[dst_row + dx] = (0xFF << 24)
-                                        | ((raw[o] as u32) << 16)
-                                        | ((raw[o+1] as u32) << 8)
-                                        | (raw[o+2] as u32);
+                    let full = format!("{}/{}", d, name);
+                    if let Ok(bytes) = fs::read(&full) {
+                        if let Ok((px, w, h, _)) = sdk::media::decode_image(&bytes) {
+                            // Aspect-preserving pre-scale (max 200px) so ImageWidget renders crisp thumbnails
+                            let scale = (200.0 / (w.max(h) as f32)).min(1.0);
+                            let tw = ((w as f32 * scale).round() as usize).max(16);
+                            let th = ((h as f32 * scale).round() as usize).max(16);
+                            let mut thumb_px = vec![0xFF0F172A; tw * th];
+                            for ty in 0..th {
+                                let sy = (ty * h) / th.max(1);
+                                for tx in 0..tw {
+                                    let sx = (tx * w) / tw.max(1);
+                                    thumb_px[ty * tw + tx] = px[sy.min(h - 1) * w + sx.min(w - 1)];
                                 }
                             }
+                            self.wallpapers.push(WallpaperItem {
+                                name,
+                                thumb: ImageWidget::new_cover(thumb_px, tw, th),
+                                src_w: w,
+                                src_h: h,
+                            });
                         }
-                        decoded = Some((px, out_w, out_h));
                     }
                 }
-            }
-
-            if let Some((px, w, h)) = decoded {
-                unsafe { crate::framework::theme::DESKTOP_WALLPAPER = Some((px, w, h)); }
-                crate::framework::theme::notify_wallpaper_changed();
-                crate::framework::theme::redraw_fullscreen();
-
-                Self::save_setting_key_value("wallpaper", &fname);
-
-                self.status = format!("Active: {}", fname);
-                self.selected_wp = Some(idx);
-                return;
+                if !self.wallpapers.is_empty() { break; }
             }
         }
-        self.status = format!("Failed to read {}", fname);
+    }
+
+    fn persist_and_apply(&mut self) {
+        set_theme_style(self.style, self.dark_mode);
+        set_theme_accent(self.accent);
+        set_theme_scale(self.scale);
+
+        let style_str = if self.style == ThemeStyle::CleanModern { "modern" } else { "aero" };
+        let ini = format!(
+            "style={}\ndark_mode={}\naccent={:#010x}\nscale={:.1}\nwallpaper={}\n",
+            style_str,
+            if self.dark_mode { 1 } else { 0 },
+            self.accent,
+            self.scale,
+            self.active_wallpaper
+        );
+        let _ = fs::write("RootFS/settings.ini", &ini);
+        let _ = fs::write("settings.ini", &ini);
+        redraw_fullscreen();
     }
 }
 
@@ -162,278 +139,315 @@ impl Widget for SettingsApp {
 
     fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
         self.bounds = Rect::new(x, y, w, h);
-        let theme = get_theme();
-        let sidebar_w = theme.pt(160.0);
-        let picker_x = self.bounds.x + sidebar_w + theme.pt(24.0);
-        let picker_y = self.bounds.y + theme.pt(80.0);
-        let picker_w = (self.bounds.w - sidebar_w - theme.pt(48.0)).min(360);
-        let picker_h = theme.pt(180.0);
-        self.color_picker.bounds = Rect::new(picker_x, picker_y, picker_w, picker_h);
         self.bounds
     }
 
     fn paint(&self, canvas: &mut Canvas) {
         let theme = get_theme();
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, 0);
+        let x = self.bounds.x;
+        let y = self.bounds.y;
+        let w = self.bounds.w;
+        let h = self.bounds.h;
+        let pad = theme.pt(12.0);
 
-        let sidebar_w = theme.pt(160.0);
-        canvas.draw_rect(self.bounds.x, self.bounds.y, sidebar_w, self.bounds.h, theme.bg_titlebar, 0);
-        canvas.draw_line_v(self.bounds.x + sidebar_w, self.bounds.y, self.bounds.h, theme.border_window);
+        canvas.draw_rect(x, y, w, h, theme.bg_app, 0);
+
+        // Clean 3-Tab Header
+        let tb_h = theme.pt(36.0);
+        canvas.draw_rect(x, y, w, tb_h, theme.bg_sidebar, 0);
+        canvas.draw_line_h(x, y + tb_h, w, theme.border_window);
 
         let tabs = [
-            (SettingsTab::General, "General"),
-            (SettingsTab::Appearance, "Wallpaper"),
-            (SettingsTab::ThemeColor, "Accent Color"),
-            (SettingsTab::Display, "Display & Scale"),
-            (SettingsTab::About, "About EOS"),
-            (SettingsTab::Detective, "Detective (Log)"),
+            (SettingsTab::Appearance, "Appearance & Theme", "settings"),
+            (SettingsTab::Wallpapers, "Wallpapers", "image"),
+            (SettingsTab::SystemHw, "System & Hardware", "lighthouse"),
         ];
-
-        let tab_h = theme.pt(32.0);
-        for (i, (tab, name)) in tabs.iter().enumerate() {
-            let ty = self.bounds.y + theme.pt(16.0) + (i as i32 * (tab_h + theme.pt(4.0)));
-            let is_sel = self.current_tab == *tab;
-
-            if is_sel {
-                canvas.draw_rect(self.bounds.x + theme.pt(8.0), ty, sidebar_w - theme.pt(16.0), tab_h, theme.accent, theme.pt(6.0) as usize);
-                canvas.draw_text(self.bounds.x + theme.pt(20.0), ty + theme.pt(7.0), name, 0xFFFFFFFF, theme.font_body());
-            } else {
-                canvas.draw_text(self.bounds.x + theme.pt(20.0), ty + theme.pt(7.0), name, theme.text_primary, theme.font_body());
-            }
+        let tab_w = theme.pt(160.0);
+        for (i, (t, lbl, ic)) in tabs.iter().enumerate() {
+            let tx = x + pad + (i as i32 * (tab_w + theme.pt(6.0)));
+            let ty = y + theme.pt(4.0);
+            let th = tb_h - theme.pt(8.0);
+            let bg = if self.tab == *t { theme.accent } else { theme.bg_panel };
+            canvas.draw_rect(tx, ty, tab_w, th, bg, 5);
+            let ic_sz = theme.pt(16.0);
+            crate::framework::icons::draw_svg_icon(canvas, ic, tx + theme.pt(8.0), ty + (th - ic_sz) / 2, ic_sz, ic_sz);
+            canvas.draw_text(tx + theme.pt(30.0), ty + theme.pt(5.0), lbl, 0xFFFFFFFF, theme.font_caption());
         }
 
-        let content_x = self.bounds.x + sidebar_w + theme.pt(24.0);
-        let content_y = self.bounds.y + theme.pt(24.0);
+        let cy = y + tb_h + pad;
+        let cw = w - pad * 2;
+        let ch = (h - tb_h - pad * 2 - theme.pt(26.0)).max(80);
 
-        match self.current_tab {
-            SettingsTab::General => {
-                canvas.draw_text(content_x, content_y, "System Preferences", theme.text_primary, theme.font_large());
-                canvas.draw_text(content_x, content_y + theme.pt(36.0), "EOS 64-bit Musl Desktop on Symmetrical Cores", theme.text_secondary, theme.font_body());
-
-                let btn_w = theme.pt(200.0);
-                let btn_h = theme.pt(34.0);
-                let btn_y = content_y + theme.pt(80.0);
-                canvas.draw_rect(content_x, btn_y, btn_w, btn_h, theme.accent, theme.pt(6.0) as usize);
-                canvas.draw_text(content_x + theme.pt(16.0), btn_y + theme.pt(8.0), "Redraw Full Screen", 0xFFFFFFFF, theme.font_body());
-                canvas.draw_text(content_x, btn_y + theme.pt(44.0), "Forces a complete framebuffer damage refresh for the UI.", theme.text_muted, theme.font_caption());
-            }
+        match self.tab {
             SettingsTab::Appearance => {
-                canvas.draw_text(content_x, content_y, "Desktop Wallpaper", theme.text_primary, theme.font_large());
-                canvas.draw_text(content_x, content_y + theme.pt(32.0), "Choose an image from /EOS SHARE:", theme.text_secondary, theme.font_body());
+                canvas.draw_rect(x + pad, cy, cw, ch, theme.bg_panel, 8);
+                canvas.draw_rect_outline(x + pad, cy, cw, ch, theme.border_window, 8);
 
-                let mut item_y = content_y + theme.pt(60.0);
-                for (idx, wp) in self.available_wallpapers.iter().enumerate() {
-                    let is_sel = self.selected_wp == Some(idx);
-                    let row_w = self.bounds.w - sidebar_w - theme.pt(48.0);
-                    let bg = if is_sel { theme.accent } else { 0xFF141E2E };
-                    canvas.draw_rect(content_x, item_y, row_w, theme.pt(32.0), bg, theme.pt(5.0) as usize);
-                    let txt_c = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
-                    canvas.draw_text_clipped(content_x + theme.pt(12.0), item_y + theme.pt(7.0), row_w - theme.pt(24.0), &format!(":img: {}", wp), txt_c, theme.font_body());
-                    item_y += theme.pt(36.0);
-                }
+                // 1. Theme Mode (Dark / Light)
+                canvas.draw_text(x + pad + theme.pt(14.0), cy + theme.pt(12.0), "System Theme Mode (Global):", theme.text_primary, theme.font_body());
+                let m_y = cy + theme.pt(38.0);
+                let btn_w = theme.pt(130.0);
+                let btn_h = theme.pt(30.0);
+                canvas.draw_rect(x + pad + theme.pt(14.0), m_y, btn_w, btn_h, if self.dark_mode { theme.accent } else { 0xFF334155 }, 6);
+                canvas.draw_text(x + pad + theme.pt(36.0), m_y + theme.pt(7.0), "Dark Mode", 0xFFFFFFFF, theme.font_caption());
 
-                if !self.status.is_empty() {
-                    canvas.draw_text(content_x, item_y + theme.pt(10.0), &self.status, theme.accent, theme.font_body());
-                }
-            }
-            SettingsTab::ThemeColor => {
-                canvas.draw_text(content_x, content_y, "System Accent Color", theme.text_primary, theme.font_large());
-                canvas.draw_text(content_x, content_y + theme.pt(32.0), "Pick any custom color across the UI & Controls:", theme.text_secondary, theme.font_body());
+                canvas.draw_rect(x + pad + theme.pt(154.0), m_y, btn_w, btn_h, if !self.dark_mode { theme.accent } else { 0xFF334155 }, 6);
+                canvas.draw_text(x + pad + theme.pt(176.0), m_y + theme.pt(7.0), "Light Mode", 0xFFFFFFFF, theme.font_caption());
 
-                self.color_picker.draw(canvas);
+                // Theme Style Switcher: Aero Glass vs Clean Modern
+                canvas.draw_rect(x + pad + theme.pt(310.0), m_y, btn_w, btn_h, if self.style == ThemeStyle::AeroGlass { theme.accent } else { 0xFF334155 }, 6);
+                canvas.draw_text(x + pad + theme.pt(332.0), m_y + theme.pt(7.0), "Aero Glass", 0xFFFFFFFF, theme.font_caption());
 
-                let btn_w = theme.pt(120.0);
-                let btn_h = theme.pt(32.0);
-                let btn_x = content_x;
-                let btn_y = self.color_picker.bounds.y + self.color_picker.bounds.h + theme.pt(16.0);
+                canvas.draw_rect(x + pad + theme.pt(450.0), m_y, btn_w, btn_h, if self.style == ThemeStyle::CleanModern { theme.accent } else { 0xFF334155 }, 6);
+                canvas.draw_text(x + pad + theme.pt(468.0), m_y + theme.pt(7.0), "Clean Modern", 0xFFFFFFFF, theme.font_caption());
 
-                canvas.draw_rect(btn_x, btn_y, btn_w, btn_h, self.color_picker.selected_color, theme.pt(6.0) as usize);
-                canvas.draw_text(btn_x + theme.pt(18.0), btn_y + theme.pt(8.0), "Apply Theme", 0xFFFFFFFF, theme.font_body());
-
-                let presets = [0xFF2563EB, 0xFF8B5CF6, 0xFFEC4899, 0xFF10B981, 0xFFF59E0B, 0xFFEF4444, 0xFF06B6D4];
-                let p_y = btn_y;
-                let mut p_x = btn_x + btn_w + theme.pt(20.0);
-                for &preset in &presets {
-                    canvas.draw_rect(p_x, p_y + theme.pt(4.0), theme.pt(24.0), theme.pt(24.0), preset, theme.pt(12.0) as usize);
-                    p_x += theme.pt(32.0);
-                }
-            }
-            SettingsTab::Display => {
-                canvas.draw_text(content_x, content_y, "Interface Scale", theme.text_primary, theme.font_large());
-                canvas.draw_text(content_x, content_y + theme.pt(36.0), "Select typography & UI scaling factor (Persistent across reboots):", theme.text_secondary, theme.font_body());
-
-                let scales = [(2.0, "1x (Normal)"), (2.5, "2x (Medium)"), (3.0, "3x (Large)")];
-                for (i, (s_val, label)) in scales.iter().enumerate() {
-                    let bx = content_x + (i as i32 * theme.pt(110.0));
-                    let by = content_y + theme.pt(70.0);
-                    let cur_scale = get_theme().scale;
-                    let is_active = (cur_scale - *s_val).abs() < 0.1;
-                    let (bg, fg) = if is_active {
-                        (theme.accent, 0xFFFFFFFF)
-                    } else {
-                        (theme.bg_titlebar, theme.text_primary)
-                    };
-                    canvas.draw_rect(bx, by, theme.pt(100.0), theme.pt(34.0), bg, theme.pt(6.0) as usize);
-                    canvas.draw_rect_outline(bx, by, theme.pt(100.0), theme.pt(34.0), theme.border_window, theme.pt(6.0) as usize);
-                    canvas.draw_text(bx + theme.pt(12.0), by + theme.pt(8.0), label, fg, theme.font_caption());
-                }
-            }
-            SettingsTab::About => {
-                canvas.draw_text(content_x, content_y, "About EOS", theme.text_primary, theme.font_large());
-                canvas.draw_text(content_x, content_y + theme.pt(36.0), "Kernel: x86_64 SMP Monolithic + Ring 3 UI", theme.text_secondary, theme.font_body());
-                canvas.draw_text(content_x, content_y + theme.pt(66.0), "Hardware: 8 Cores Online & Active", theme.text_secondary, theme.font_body());
-            }
-            SettingsTab::Detective => {
-                canvas.draw_text(content_x, content_y, "Detective: Framework Bottleneck Logger", theme.text_primary, theme.font_large());
-
-                let btn_w = theme.pt(140.0);
-                let btn_h = theme.pt(28.0);
-                let btn_x = self.bounds.x + self.bounds.w - btn_w - theme.pt(24.0);
-                canvas.draw_rect(btn_x, content_y, btn_w, btn_h, theme.accent, theme.pt(4.0) as usize);
-                canvas.draw_text(btn_x + theme.pt(12.0), content_y + theme.pt(6.0), "Print to Terminal", 0xFFFFFFFF, theme.font_caption());
-
-                let log_box_y = content_y + theme.pt(40.0);
-                let log_box_w = self.bounds.w - sidebar_w - theme.pt(48.0);
-                let log_box_h = self.bounds.h - theme.pt(80.0);
-                canvas.draw_rect(content_x, log_box_y, log_box_w, log_box_h, 0xFF0B1120, theme.pt(6.0) as usize);
-                canvas.draw_rect_outline(content_x, log_box_y, log_box_w, log_box_h, theme.border_window, theme.pt(6.0) as usize);
-
-                let entries = crate::framework::perf_log::SmartLogger::get_recent_entries();
-                let mut line_y = log_box_y + theme.pt(10.0);
-                let row_h = theme.pt(18.0);
-
-                if entries.is_empty() {
-                    canvas.draw_text(content_x + theme.pt(16.0), line_y, "No performance bottlenecks detected. UI operations nominal.", 0xFF10B981, theme.font_caption());
-                } else {
-                    for entry in entries.iter().rev() {
-                        if line_y + row_h >= log_box_y + log_box_h - theme.pt(10.0) { break; }
-                        canvas.draw_text_clipped(content_x + theme.pt(12.0), line_y, log_box_w - theme.pt(24.0), entry, 0xFFF59E0B, theme.font_caption());
-                        line_y += row_h;
+                // 2. Global Accent Color Swatches
+                let ac_y = cy + theme.pt(86.0);
+                canvas.draw_text(x + pad + theme.pt(14.0), ac_y, "System Accent Color (Applies to All Windows & Controls):", theme.text_primary, theme.font_body());
+                let palette = [
+                    ("Aero Blue", 0xFF0284C7u32),
+                    ("Royal Violet", 0xFF7C3AED),
+                    ("Crimson Rose", 0xFFE11D48),
+                    ("Emerald", 0xFF059669),
+                    ("Amber Gold", 0xFFD97706),
+                    ("Cyan Sky", 0xFF0891B2),
+                    ("Indigo", 0xFF4F46E5),
+                    ("Slate", 0xFF475569),
+                ];
+                let sw_sz = theme.pt(34.0);
+                for (i, (_, col)) in palette.iter().enumerate() {
+                    let sx = x + pad + theme.pt(14.0) + (i as i32 * (sw_sz + theme.pt(10.0)));
+                    let sy = ac_y + theme.pt(28.0);
+                    canvas.draw_rect(sx, sy, sw_sz, sw_sz, *col, (sw_sz / 2) as usize);
+                    if self.accent == *col {
+                        canvas.draw_rect_outline(sx - 3, sy - 3, sw_sz + 6, sw_sz + 6, 0xFFFFFFFF, ((sw_sz + 6) / 2) as usize);
                     }
                 }
+
+                // 3. UI Scaling (2K Display)
+                let sc_y = ac_y + theme.pt(82.0);
+                canvas.draw_text(x + pad + theme.pt(14.0), sc_y, &format!("Display UI Scale: {:.1}x (2560x1440 Native)", self.scale), theme.text_primary, theme.font_body());
+                let scales = [1.5f32, 2.0, 2.5];
+                for (i, &sc) in scales.iter().enumerate() {
+                    let bx = x + pad + theme.pt(14.0) + (i as i32 * theme.pt(96.0));
+                    let by = sc_y + theme.pt(26.0);
+                    let active = (self.scale - sc).abs() < 0.05;
+                    canvas.draw_rect(bx, by, theme.pt(86.0), theme.pt(28.0), if active { theme.accent } else { 0xFF334155 }, 5);
+                    canvas.draw_text(bx + theme.pt(26.0), by + theme.pt(6.0), &format!("{:.1}x", sc), 0xFFFFFFFF, theme.font_caption());
+                }
+            }
+            SettingsTab::Wallpapers => {
+                canvas.draw_rect(x + pad, cy, cw, ch, theme.bg_panel, 8);
+                canvas.draw_rect_outline(x + pad, cy, cw, ch, theme.border_window, 8);
+
+                // Default Gradient Option
+                let def_y = cy + theme.pt(10.0);
+                let def_active = self.active_wallpaper == "none";
+                canvas.draw_rect(x + pad + theme.pt(12.0), def_y, cw - theme.pt(24.0), theme.pt(32.0), if def_active { theme.accent } else { 0xFF1E293B }, 6);
+                canvas.draw_text(x + pad + theme.pt(24.0), def_y + theme.pt(8.0), "Default EOS Harmony Blue Wallpaper", 0xFFFFFFFF, theme.font_caption());
+
+                // Visual Image Cards (Rendered via Framework ImageWidget)
+                let card_h = theme.pt(76.0);
+                let thumb_w = theme.pt(120.0);
+                let thumb_h = theme.pt(64.0);
+                let list_top = def_y + theme.pt(40.0);
+                canvas.push_clip(Rect::new(x + pad + 4, list_top, cw - 8, (cy + ch - list_top - 4).max(20)));
+
+                if self.wallpapers.is_empty() {
+                    canvas.draw_text(x + pad + theme.pt(16.0), list_top + theme.pt(12.0), "No PNG/JPG wallpapers found in /EOS SHARE.", theme.text_secondary, theme.font_caption());
+                } else {
+                    for (i, item) in self.wallpapers.iter().enumerate() {
+                        let ry = list_top + (i as i32 * (card_h + theme.pt(8.0))) - self.wp_scroll;
+                        if ry + card_h < list_top || ry > cy + ch { continue; }
+                        let is_sel = self.active_wallpaper == item.name;
+                        let card_bg = if is_sel { 0xFF1D4ED8 } else { 0xFF0F172A };
+                        canvas.draw_rect(x + pad + theme.pt(12.0), ry, cw - theme.pt(24.0), card_h, card_bg, 6);
+                        canvas.draw_rect_outline(x + pad + theme.pt(12.0), ry, cw - theme.pt(24.0), card_h, if is_sel { 0xFFFFFFFF } else { theme.border_window }, 6);
+
+                        // Blit live aspect-preserved thumbnail directly without cloning pixel buffers
+                        let tx = x + pad + theme.pt(18.0);
+                        let ty = ry + (card_h - thumb_h) / 2;
+                        let iw = item.thumb.img_w as f32;
+                        let ih = item.thumb.img_h as f32;
+                        let scale = (thumb_w as f32 / iw).max(thumb_h as f32 / ih);
+                        let crop_w = (thumb_w as f32 / scale).min(iw);
+                        let crop_h = (thumb_h as f32 / scale).min(ih);
+                        let sx0 = (iw - crop_w) * 0.5;
+                        let sy0 = (ih - crop_h) * 0.5;
+                        for py in 0..thumb_h {
+                            let sy = (sy0 + (py as f32 / thumb_h as f32) * crop_h) as usize;
+                            let srow = sy.min(item.thumb.img_h - 1) * item.thumb.img_w;
+                            let drow = ((ty + py) as usize) * canvas.width;
+                            if ty + py < 0 || ty + py >= canvas.height as i32 { continue; }
+                            for px in 0..thumb_w {
+                                if tx + px < 0 || tx + px >= canvas.width as i32 { continue; }
+                                let sx = (sx0 + (px as f32 / thumb_w as f32) * crop_w) as usize;
+                                canvas.buffer[drow + (tx + px) as usize] = item.thumb.pixels[srow + sx.min(item.thumb.img_w - 1)];
+                            }
+                        }
+                        canvas.draw_rect_outline(tx, ty, thumb_w, thumb_h, 0x88FFFFFF, 2);
+
+                        // Filename & Resolution
+                        let info_x = tx + thumb_w + theme.pt(14.0);
+                        canvas.draw_text_clipped(info_x, ry + theme.pt(14.0), cw - thumb_w - theme.pt(60.0), &item.name, 0xFFFFFFFF, theme.font_body());
+                        canvas.draw_text(info_x, ry + theme.pt(38.0), &format!("Resolution: {}x{} px  |  Click to Apply", item.src_w, item.src_h), 0xFFCBD5E1, theme.font_caption());
+                    }
+                }
+                canvas.pop_clip();
+            }
+            SettingsTab::SystemHw => {
+                canvas.draw_rect(x + pad, cy, cw, ch, theme.bg_panel, 8);
+                canvas.draw_rect_outline(x + pad, cy, cw, ch, theme.border_window, 8);
+                let gpu = sdk::gpu::query_info();
+                let aud = if sdk::audio::is_available() { "Intel AC'97 Hardware Audio (48kHz Stereo ACTIVE)" } else { "OFF" };
+                let heap_mb = sdk::agent::query_kernel_heap_used() as f32 / (1024.0 * 1024.0);
+
+                canvas.draw_text(x + pad + theme.pt(14.0), cy + theme.pt(14.0), "EOS Hardware & Kernel Configuration", 0xFF38BDF8, theme.font_title());
+                canvas.draw_text(x + pad + theme.pt(14.0), cy + theme.pt(44.0), &format!("Graphics Adapter : {} ({}x{})", gpu.backend_name(), gpu.width, gpu.height), theme.text_primary, theme.font_body());
+                canvas.draw_text(x + pad + theme.pt(14.0), cy + theme.pt(68.0), &format!("Audio Subsystem  : {}", aud), theme.text_primary, theme.font_body());
+                canvas.draw_text(x + pad + theme.pt(14.0), cy + theme.pt(92.0), &format!("Kernel Heap Used : {:.1} MB  |  Architecture: Multi-Process Isolated ELF", heap_mb), theme.text_secondary, theme.font_caption());
             }
         }
+
+        // Bottom Status Bar
+        canvas.draw_text(x + pad, y + h - theme.pt(22.0), &self.status_msg, theme.text_secondary, theme.font_caption());
     }
 
     fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
         if !self.bounds.contains(mx, my) { return false; }
-        let theme = get_theme();
-        let sidebar_w = theme.pt(160.0);
+        if !pressed { return true; }
 
-        if pressed && mx <= self.bounds.x + sidebar_w {
-            let tab_h = theme.pt(32.0);
-            let rel_y = (my - (self.bounds.y + theme.pt(16.0))).max(0);
-            let idx = rel_y / (tab_h + theme.pt(4.0));
-            match idx {
-                0 => self.current_tab = SettingsTab::General,
-                1 => { self.current_tab = SettingsTab::Appearance; self.scan_wallpapers(); }
-                2 => self.current_tab = SettingsTab::ThemeColor,
-                3 => self.current_tab = SettingsTab::Display,
-                4 => self.current_tab = SettingsTab::About,
-                5 => self.current_tab = SettingsTab::Detective,
-                _ => {}
+        let theme = get_theme();
+        let pad = theme.pt(12.0);
+        let tb_h = theme.pt(36.0);
+        let tab_w = theme.pt(160.0);
+
+        if my >= self.bounds.y && my <= self.bounds.y + tb_h {
+            for i in 0..3 {
+                let tx = self.bounds.x + pad + (i as i32 * (tab_w + theme.pt(6.0)));
+                if mx >= tx && mx <= tx + tab_w {
+                    self.tab = match i {
+                        0 => SettingsTab::Appearance,
+                        1 => {
+                            if !self.wallpapers_loaded {
+                                self.wallpapers_loaded = true;
+                                self.scan_wallpapers();
+                            }
+                            SettingsTab::Wallpapers
+                        }
+                        _ => SettingsTab::SystemHw,
+                    };
+                    return true;
+                }
             }
             return true;
         }
 
-        if pressed && self.current_tab == SettingsTab::General {
-            let content_x = self.bounds.x + sidebar_w + theme.pt(24.0);
-            let content_y = self.bounds.y + theme.pt(24.0);
-            let btn_w = theme.pt(200.0);
-            let btn_h = theme.pt(34.0);
-            let btn_y = content_y + theme.pt(80.0);
-            if mx >= content_x && mx <= content_x + btn_w && my >= btn_y && my <= btn_y + btn_h {
-                crate::framework::theme::redraw_fullscreen();
-                return true;
-            }
-        }
+        let cy = self.bounds.y + tb_h + pad;
+        let cw = self.bounds.w - pad * 2;
 
-        if self.current_tab == SettingsTab::ThemeColor {
-            if self.color_picker.handle_mouse(mx, my, pressed) {
-                return true;
-            }
-
-            let content_x = self.bounds.x + sidebar_w + theme.pt(24.0);
-            let btn_w = theme.pt(120.0);
-            let btn_h = theme.pt(32.0);
-            let btn_x = content_x;
-            let btn_y = self.color_picker.bounds.y + self.color_picker.bounds.h + theme.pt(16.0);
-
-            if pressed && mx >= btn_x && mx <= btn_x + btn_w && my >= btn_y && my <= btn_y + btn_h {
-                crate::framework::theme::set_theme_accent(self.color_picker.selected_color);
-                Self::save_setting_key_value("accent", &format!("0x{:08X}", self.color_picker.selected_color));
-                crate::framework::theme::redraw_fullscreen();
-                return true;
-            }
-
-            let presets = [0xFF2563EB, 0xFF8B5CF6, 0xFFEC4899, 0xFF10B981, 0xFFF59E0B, 0xFFEF4444, 0xFF06B6D4];
-            let mut p_x = btn_x + btn_w + theme.pt(20.0);
-            for &preset in &presets {
-                if pressed && mx >= p_x && mx <= p_x + theme.pt(24.0) && my >= btn_y + theme.pt(4.0) && my <= btn_y + theme.pt(28.0) {
-                    self.color_picker.selected_color = preset;
-                    crate::framework::theme::set_theme_accent(preset);
-                    Self::save_setting_key_value("accent", &format!("0x{:08X}", preset));
-                    crate::framework::theme::redraw_fullscreen();
-                    return true;
-                }
-                p_x += theme.pt(32.0);
-            }
-        }
-
-        if pressed && self.current_tab == SettingsTab::Detective {
-            let content_y = self.bounds.y + theme.pt(24.0);
-            let btn_w = theme.pt(140.0);
-            let btn_h = theme.pt(28.0);
-            let btn_x = self.bounds.x + self.bounds.w - btn_w - theme.pt(24.0);
-
-            if mx >= btn_x && mx <= btn_x + btn_w && my >= content_y && my <= content_y + btn_h {
-                let logs = crate::framework::perf_log::SmartLogger::get_recent_entries();
-                println!("\n=== [DETECTIVE LOGS - LIVE TRACE] ===");
-                if logs.is_empty() {
-                    println!("No bottleneck logs recorded yet.");
-                } else {
-                    for l in logs {
-                        println!("{}", l);
+        match self.tab {
+            SettingsTab::Appearance => {
+                let m_y = cy + theme.pt(38.0);
+                let btn_w = theme.pt(130.0);
+                let btn_h = theme.pt(30.0);
+                if my >= m_y && my <= m_y + btn_h {
+                    if mx >= self.bounds.x + pad + theme.pt(14.0) && mx <= self.bounds.x + pad + theme.pt(14.0) + btn_w {
+                        self.dark_mode = true;
+                        self.persist_and_apply();
+                        self.status_msg = "Applied Dark Mode across all windows.".into();
+                        return true;
                     }
-                }
-                println!("=== [END DETECTIVE LOGS] ===\n");
-                return true;
-            }
-        }
-
-        if pressed && self.current_tab == SettingsTab::Appearance {
-            let content_x = self.bounds.x + sidebar_w + theme.pt(24.0);
-            let content_y = self.bounds.y + theme.pt(24.0);
-            let item_start_y = content_y + theme.pt(60.0);
-            let row_w = self.bounds.w - sidebar_w - theme.pt(48.0);
-
-            if mx >= content_x && mx <= content_x + row_w && my >= item_start_y {
-                let idx = ((my - item_start_y) / theme.pt(36.0)) as usize;
-                if idx < self.available_wallpapers.len() {
-                    self.apply_wallpaper(idx);
-                    return true;
-                }
-            }
-        }
-
-        if pressed && self.current_tab == SettingsTab::Display {
-            let content_x = self.bounds.x + sidebar_w + theme.pt(24.0);
-            let content_y = self.bounds.y + theme.pt(24.0);
-            let by = content_y + theme.pt(70.0);
-            if my >= by && my <= by + theme.pt(34.0) {
-                let scales = [2.0, 2.5, 3.0];
-                for (i, &s) in scales.iter().enumerate() {
-                    let bx = content_x + (i as i32 * theme.pt(110.0));
-                    if mx >= bx && mx <= bx + theme.pt(100.0) {
-                        set_theme_scale(s);
-                        Self::save_setting_key_value("ui_scale", &format!("{:.1}", s));
-                        crate::framework::theme::redraw_fullscreen();
+                    if mx >= self.bounds.x + pad + theme.pt(154.0) && mx <= self.bounds.x + pad + theme.pt(154.0) + btn_w {
+                        self.dark_mode = false;
+                        self.persist_and_apply();
+                        self.status_msg = "Applied Light Mode across all windows.".into();
+                        return true;
+                    }
+                    if mx >= self.bounds.x + pad + theme.pt(310.0) && mx <= self.bounds.x + pad + theme.pt(310.0) + btn_w {
+                        self.style = ThemeStyle::AeroGlass;
+                        self.persist_and_apply();
+                        self.status_msg = "Switched to Aero Glass Theme.".into();
+                        return true;
+                    }
+                    if mx >= self.bounds.x + pad + theme.pt(450.0) && mx <= self.bounds.x + pad + theme.pt(450.0) + btn_w {
+                        self.style = ThemeStyle::CleanModern;
+                        self.persist_and_apply();
+                        self.status_msg = "Switched to Clean Modern Theme.".into();
                         return true;
                     }
                 }
-            }
-        }
 
+                let ac_y = cy + theme.pt(86.0);
+                let palette = [0xFF0284C7u32, 0xFF7C3AED, 0xFFE11D48, 0xFF059669, 0xFFD97706, 0xFF0891B2, 0xFF4F46E5, 0xFF475569];
+                let sw_sz = theme.pt(34.0);
+                let sy = ac_y + theme.pt(28.0);
+                if my >= sy && my <= sy + sw_sz {
+                    for (i, &col) in palette.iter().enumerate() {
+                        let sx = self.bounds.x + pad + theme.pt(14.0) + (i as i32 * (sw_sz + theme.pt(10.0)));
+                        if mx >= sx && mx <= sx + sw_sz {
+                            self.accent = col;
+                            self.persist_and_apply();
+                            self.status_msg = format!("Applied system accent color {:#010x}.", col);
+                            return true;
+                        }
+                    }
+                }
+
+                let sc_y = ac_y + theme.pt(82.0);
+                let by = sc_y + theme.pt(26.0);
+                let scales = [1.5f32, 2.0, 2.5];
+                if my >= by && my <= by + theme.pt(28.0) {
+                    for (i, &sc) in scales.iter().enumerate() {
+                        let bx = self.bounds.x + pad + theme.pt(14.0) + (i as i32 * theme.pt(96.0));
+                        if mx >= bx && mx <= bx + theme.pt(86.0) {
+                            self.scale = sc;
+                            self.persist_and_apply();
+                            self.status_msg = format!("Updated UI Scale to {:.1}x.", sc);
+                            return true;
+                        }
+                    }
+                }
+            }
+            SettingsTab::Wallpapers => {
+                let def_y = cy + theme.pt(10.0);
+                if my >= def_y && my <= def_y + theme.pt(32.0) {
+                    self.active_wallpaper = "none".into();
+                    self.persist_and_apply();
+                    self.status_msg = "Applied Default EOS Harmony Wallpaper.".into();
+                    return true;
+                }
+
+                let card_h = theme.pt(76.0);
+                let list_top = def_y + theme.pt(40.0);
+                if my >= list_top && mx >= self.bounds.x + pad + theme.pt(12.0) && mx <= self.bounds.x + pad + cw - theme.pt(12.0) {
+                    let rel = my - list_top + self.wp_scroll;
+                    if rel >= 0 {
+                        let idx = (rel / (card_h + theme.pt(8.0))) as usize;
+                        if idx < self.wallpapers.len() {
+                            self.active_wallpaper = self.wallpapers[idx].name.clone();
+                            self.persist_and_apply();
+                            self.status_msg = format!("Applied Wallpaper: {}", self.active_wallpaper);
+                            return true;
+                        }
+                    }
+                }
+            }
+            SettingsTab::SystemHw => {}
+        }
+        true
+    }
+
+    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
+        if !self.bounds.contains(mx, my) || self.tab != SettingsTab::Wallpapers { return false; }
+        let theme = get_theme();
+        let card_h = theme.pt(76.0) + theme.pt(8.0);
+        let max_s = ((self.wallpapers.len() as i32) * card_h - theme.pt(240.0)).max(0);
+        if dy > 0 {
+            self.wp_scroll = (self.wp_scroll + card_h).min(max_s);
+        } else if dy < 0 {
+            self.wp_scroll = (self.wp_scroll - card_h).max(0);
+        }
         true
     }
 }

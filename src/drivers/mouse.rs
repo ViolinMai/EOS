@@ -68,22 +68,40 @@ unsafe fn mouse_read_data() -> u8 {
     }
 }
 
+unsafe fn flush_ps2_output() {
+    let mut limit = 128;
+    while (unsafe { inb(MOUSE_STATUS_PORT) } & 0x01) != 0 && limit > 0 {
+        let _ = unsafe { inb(MOUSE_DATA_PORT) };
+        limit -= 1;
+    }
+}
+
 pub fn init() {
     unsafe {
-        mouse_write_cmd(0xA8);
+        // 1. تعطيل الكيبورد والماوس مؤقتاً لمنع تداخل البايتات أثناء التهيئة
+        mouse_write_cmd(0xAD); // Disable Port 1 (Keyboard)
+        mouse_write_cmd(0xA7); // Disable Port 2 (Mouse)
+        flush_ps2_output();
+
+        // 2. ضبط إعدادات متحكم PS/2
         mouse_write_cmd(0x20);
         let mut config = mouse_read_data();
-        config |= 0x02;
-        config |= 0x01;
-        config &= !0x20;
+        config |= 0x03;  // Enable IRQ1 + IRQ12
+        config &= !0x30; // Enable Keyboard + Mouse Clocks
         mouse_write_cmd(0x60);
         mouse_wait_write();
         outb(MOUSE_DATA_PORT, config);
 
+        // 3. إعادة تفعيل المنفذين
+        mouse_write_cmd(0xAE); // Enable Port 1
+        mouse_write_cmd(0xA8); // Enable Port 2
+        flush_ps2_output();
+
+        // 4. إعادة ضبط افتراضية للماوس
         mouse_write_device(0xF6);
         let _ = mouse_read_data();
 
-        // IntelliMouse sequence
+        // 5. تفعيل عجلة التمرير (IntelliMouse) والتحقق من الرد الفعلي
         mouse_write_device(0xF3); let _ = mouse_read_data();
         mouse_write_device(200);  let _ = mouse_read_data();
         mouse_write_device(0xF3); let _ = mouse_read_data();
@@ -95,19 +113,19 @@ pub fn init() {
         let dev_id = mouse_read_data();
         HAS_WHEEL = dev_id == 3 || dev_id == 4;
 
-        // Boost sample rate to 200 Hz & resolution to 8 counts/mm
+        // 6. معدل استجابة مستقر 100Hz لمنع طوفان المقاطعات في QEMU
         mouse_write_device(0xF3); let _ = mouse_read_data();
-        mouse_write_device(200);  let _ = mouse_read_data();
-        mouse_write_device(0xE8); let _ = mouse_read_data();
-        mouse_write_device(0x03); let _ = mouse_read_data();
+        mouse_write_device(100);  let _ = mouse_read_data();
 
+        // 7. تفعيل بث الحزم وتفريغ أي بقايا
         mouse_write_device(0xF4);
         let _ = mouse_read_data();
+        flush_ps2_output();
 
         CYCLE = 0;
         LAST_LEFT = false;
         LAST_RIGHT = false;
-        crate::log_info!("MOUSE", "PS/2 Mouse Ready (200Hz, High-Res).");
+        crate::log_info!("MOUSE", "PS/2 Mouse Ready (100Hz, Wheel: {}).", HAS_WHEEL);
     }
 }
 
@@ -121,7 +139,8 @@ pub unsafe fn on_mouse_interrupt() {
             let raw = inb(MOUSE_DATA_PORT);
             match CYCLE {
                 0 => {
-                    if (raw & 0x08) != 0 {
+                    // بايت البداية الصالح يجب أن يكون فيه Bit 3 = 1 وبدون Overflow (Bits 6,7 = 0)
+                    if (raw & 0x08) != 0 && (raw & 0xC0) == 0 {
                         BYTES[0] = raw;
                         CYCLE = 1;
                     }
@@ -160,9 +179,12 @@ unsafe fn process_packet() {
         if (flags & 0x10) != 0 { dx |= !0xFF; }
         if (flags & 0x20) != 0 { dy |= !0xFF; }
 
-        // Clamp overflows instead of dropping packet completely
-        if (flags & 0x40) != 0 { dx = if (flags & 0x10) != 0 { -255 } else { 255 }; }
-        if (flags & 0x80) != 0 { dy = if (flags & 0x20) != 0 { -255 } else { 255 }; }
+        // تجاهل حزم الـ Overflow التالفة لمنع قفز المؤشر العشوائي عبر الشاشة
+        if (flags & 0xC0) != 0 {
+            return;
+        }
+        dx = dx.clamp(-64, 64);
+        dy = dy.clamp(-64, 64);
 
         let left = (flags & 0x01) != 0;
         let right = (flags & 0x02) != 0;
@@ -183,7 +205,7 @@ unsafe fn process_packet() {
         if HAS_WHEEL {
             let dz = (BYTES[3] as i8) as isize;
             if dz != 0 {
-                push_event(InputEvent::Scroll { dy: dz });
+                push_event(InputEvent::Scroll { dy: -dz });
             }
         }
     }

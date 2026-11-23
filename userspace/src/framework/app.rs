@@ -12,9 +12,97 @@ use crate::apps::activity_monitor::ActivityMonitorApp;
 use crate::apps::browser::BrowserApp;
 use crate::apps::preview::PreviewApp;
 use crate::apps::textedit::TextEditApp;
-use crate::syscall::{sys_present_rects, sys_poll_event, sys_wait_event};
+use crate::apps::test_app::TestApp;
+use crate::apps::video_player::VideoPlayerApp;
+use std::sync::Mutex;
+
+pub static ACTIVE_WINDOW_TITLES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+pub struct ExternalWindowWidget {
+    pub win_id: u32,
+    pub bounds: Rect,
+    pub buf_w: usize,
+    pub buf_h: usize,
+    pub last_gen: u32,
+    pub pixels: Vec<u32>,
+}
+
+impl ExternalWindowWidget {
+    pub fn new(win_id: u32, w: usize, h: usize) -> Self {
+        Self { win_id, bounds: Rect::default(), buf_w: w, buf_h: h, last_gen: 0, pixels: vec![0xFF0F172A; w * h] }
+    }
+}
+
+impl Widget for ExternalWindowWidget {
+    fn as_any(&self) -> &dyn std::any::Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any { self }
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        if self.bounds.w != w || self.bounds.h != h {
+            crate::syscall::sys_comp_send_event(self.win_id, 5, w, h, 0);
+        }
+        self.bounds = Rect::new(x, y, w, h);
+        self.bounds
+    }
+    fn paint(&self, canvas: &mut Canvas) {
+        if self.buf_w == 0 || self.buf_h == 0 || self.pixels.is_empty() { return; }
+        let clip = canvas.current_clip();
+        let x1 = self.bounds.x.max(clip.x).max(0);
+        let y1 = self.bounds.y.max(clip.y).max(0);
+        let x2 = (self.bounds.x + self.buf_w as i32).min(self.bounds.x + self.bounds.w).min(clip.x + clip.w).min(canvas.width as i32);
+        let y2 = (self.bounds.y + self.buf_h as i32).min(self.bounds.y + self.bounds.h).min(clip.y + clip.h).min(canvas.height as i32);
+        if x2 <= x1 || y2 <= y1 { return; }
+        let r = get_theme().r_win() as i32;
+        let cw = (x2 - x1) as usize;
+        let sx0 = (x1 - self.bounds.x) as usize;
+        for py in y1..y2 {
+            let sy = (py - self.bounds.y) as usize;
+            if sy >= self.buf_h { break; }
+            let ly_bot = (self.bounds.y + self.bounds.h - 1) - py;
+            if r > 0 && ly_bot < r {
+                let dy = (r - ly_bot) as f32;
+                let cut = (r as f32 - ((r * r) as f32 - dy * dy).max(0.0).sqrt()).ceil() as i32;
+                let row_x1 = x1.max(self.bounds.x + cut);
+                let row_x2 = x2.min(self.bounds.x + self.bounds.w - cut);
+                if row_x2 > row_x1 {
+                    let rcw = (row_x2 - row_x1) as usize;
+                    let rsx0 = (row_x1 - self.bounds.x) as usize;
+                    let src = sy * self.buf_w + rsx0;
+                    let dst = (py as usize) * canvas.width + (row_x1 as usize);
+                    if src + rcw <= self.pixels.len() && dst + rcw <= canvas.buffer.len() {
+                        canvas.buffer[dst..dst + rcw].copy_from_slice(&self.pixels[src..src + rcw]);
+                    }
+                }
+            } else {
+                let src = sy * self.buf_w + sx0;
+                let dst = (py as usize) * canvas.width + (x1 as usize);
+                if src + cw <= self.pixels.len() && dst + cw <= canvas.buffer.len() {
+                    canvas.buffer[dst..dst + cw].copy_from_slice(&self.pixels[src..src + cw]);
+                }
+            }
+        }
+    }
+    fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        crate::syscall::sys_comp_send_event(self.win_id, 1, mx - self.bounds.x, my - self.bounds.y, if pressed { 1 } else { 0 });
+        true
+    }
+    fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
+        if !self.bounds.contains(mx, my) { return false; }
+        crate::syscall::sys_comp_send_event(self.win_id, 2, mx - self.bounds.x, my - self.bounds.y, dy);
+        true
+    }
+    fn handle_key(&mut self, keycode: u8, mods: u8) -> bool {
+        crate::syscall::sys_comp_send_event(self.win_id, 3, keycode as i32, mods as i32, 0);
+        true
+    }
+    fn handle_char(&mut self, c: char) -> bool {
+        crate::syscall::sys_comp_send_event(self.win_id, 4, c as u32 as i32, 0, 0);
+        true
+    }
+}
+use crate::syscall::{sys_present_rects, sys_poll_event, sys_wait_event, sys_gpu_move_cursor};
 use crate::framework::widget::{Rect, ResizeEdge, Widget, WindowFrame};
-use crate::framework::tools::ContextMenu;
+use crate::framework::menu::ContextMenu;
 use crate::framework::vector::draw_vector_icon;
 
 pub struct FocusManager {
@@ -70,6 +158,8 @@ pub struct FrameworkApp<'a> {
     pub damage: crate::framework::damage::DamageRegion,
     pub wallpaper_cache: Vec<u32>,
     pub wallpaper_dirty: bool,
+    pub dock_auto_hide: bool,
+    pub taskbar_revealed: bool,
     pub hovered_dock_idx: Option<usize>,
     pub start_orb_hovered: bool,
     pub aero_peek_hovered: bool,
@@ -78,6 +168,7 @@ pub struct FrameworkApp<'a> {
     pub prev_pointer_x: i32,
     pub prev_pointer_y: i32,
     pub context_menu: ContextMenu,
+    pub file_dialog: Option<(String, crate::framework::tools::FileDialog)>,
     pub desktop_icons: Vec<DesktopIcon>,
     pub rubber_band_start: Option<(i32, i32)>,
     pub rubber_band_rect: Option<Rect>,
@@ -88,6 +179,10 @@ pub struct FrameworkApp<'a> {
     pub rendered_frames: usize,
     pub compositor_bench_logged: bool,
     pub win7_shell_audits_logged: bool,
+    pub hw_cursor_enabled: bool,
+    pub last_hw_cursor_x: i32,
+    pub last_hw_cursor_y: i32,
+    pub animator: crate::framework::animator::Animator,
 }
 
 impl<'a> FrameworkApp<'a> {
@@ -118,7 +213,7 @@ impl<'a> FrameworkApp<'a> {
                 label: "Computer".into(),
                 target_app: "Finder".into(),
                 target_arg: None,
-                icon_name: "computer".into(),
+                icon_name: "virtual".into(),
                 bounds: Rect::new(start_x, start_y, icon_w, icon_h),
                 selected: false,
             },
@@ -126,7 +221,7 @@ impl<'a> FrameworkApp<'a> {
                 label: "Recycle Bin".into(),
                 target_app: "Finder".into(),
                 target_arg: None,
-                icon_name: "recycle_bin".into(),
+                icon_name: "disc".into(),
                 bounds: Rect::new(start_x, start_y + step_y, icon_w, icon_h),
                 selected: false,
             },
@@ -134,7 +229,7 @@ impl<'a> FrameworkApp<'a> {
                 label: "TEST_SUBJECT".into(),
                 target_app: "Finder".into(),
                 target_arg: Some("EOS SHARE/TEST_SUBJECT".into()),
-                icon_name: "folder".into(),
+                icon_name: "lib".into(),
                 bounds: Rect::new(start_x, start_y + step_y * 2, icon_w, icon_h),
                 selected: false,
             },
@@ -142,7 +237,7 @@ impl<'a> FrameworkApp<'a> {
                 label: "Command Prompt".into(),
                 target_app: "Terminal".into(),
                 target_arg: None,
-                icon_name: "terminal".into(),
+                icon_name: "console".into(),
                 bounds: Rect::new(start_x, start_y + step_y * 3, icon_w, icon_h),
                 selected: false,
             },
@@ -160,19 +255,14 @@ impl<'a> FrameworkApp<'a> {
             window_surfaces: Vec::new(),
             menubar_widget: menubar,
             start_menu,
-            dock_items: vec![
-                "Finder".into(),
-                "TextEdit".into(),
-                "Terminal".into(),
-                "Activity Monitor".into(),
-                "Browser".into(),
-                "Settings".into(),
-            ],
+            dock_items: Self::load_saved_dock_items(),
             dock_handler: None,
             current_cursor: CursorType::Default,
             damage: crate::framework::damage::DamageRegion::new(),
             wallpaper_cache: vec![theme.bg_desktop; width * height],
             wallpaper_dirty: true,
+            dock_auto_hide: false,
+            taskbar_revealed: true,
             hovered_dock_idx: None,
             start_orb_hovered: false,
             aero_peek_hovered: false,
@@ -181,6 +271,7 @@ impl<'a> FrameworkApp<'a> {
             prev_pointer_x: (width / 2) as i32,
             prev_pointer_y: (height / 2) as i32,
             context_menu: ContextMenu::new(),
+            file_dialog: None,
             desktop_icons,
             rubber_band_start: None,
             rubber_band_rect: None,
@@ -191,8 +282,13 @@ impl<'a> FrameworkApp<'a> {
             rendered_frames: 0,
             compositor_bench_logged: false,
             win7_shell_audits_logged: false,
+            hw_cursor_enabled: sys_gpu_move_cursor((width / 2) as u32, (height / 2) as u32),
+            last_hw_cursor_x: (width / 2) as i32,
+            last_hw_cursor_y: (height / 2) as i32,
+            animator: crate::framework::animator::Animator::new(),
         };
 
+        crate::framework::portal::init_default_portals();
         app.input_mgr.pointer.x = (width / 2) as i32;
         app.input_mgr.pointer.y = (height / 2) as i32;
         app.load_startup_wallpaper();
@@ -213,12 +309,56 @@ impl<'a> FrameworkApp<'a> {
         crate::sdk::agent::audit_log("WIN7_TASKBAR_PREVIEW:PASS:HoverCard_Ready");
     }
 
+    fn load_saved_dock_items() -> Vec<String> {
+        if let Ok(txt) = fs::read_to_string("RootFS/dock.ini").or_else(|_| fs::read_to_string("dock.ini")) {
+            let items: Vec<String> = txt.lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect();
+            if !items.is_empty() {
+                return items;
+            }
+        }
+        vec![
+            "Finder".into(),
+            "TextEdit".into(),
+            "Terminal".into(),
+            "Activity Monitor".into(),
+            "Browser".into(),
+            "Settings".into(),
+            "Video".into(),
+            "Test".into(),
+        ]
+    }
+
+    fn save_dock_items(&self) {
+        let data = self.dock_items.join("\n");
+        let _ = fs::write("RootFS/dock.ini", &data);
+        let _ = fs::write("dock.ini", &data);
+    }
+
+    pub fn pin_to_dock(&mut self, app: &str) {
+        if !self.dock_items.iter().any(|x| x == app) {
+            self.dock_items.push(app.to_string());
+            self.save_dock_items();
+            self.request_full_redraw();
+        }
+    }
+
+    pub fn unpin_from_dock(&mut self, app: &str) {
+        self.dock_items.retain(|x| x != app);
+        self.save_dock_items();
+        self.request_full_redraw();
+    }
+
     pub fn taskbar_height(&self) -> i32 {
         get_theme().pt(40.0)
     }
 
+    pub fn is_taskbar_shown(&self) -> bool {
+        !self.dock_auto_hide || self.taskbar_revealed || self.start_menu.is_open
+    }
+
     pub fn work_area(&self) -> Rect {
-        Rect::new(0, 0, self.width as i32, (self.height as i32) - self.taskbar_height())
+        let reserved = if self.dock_auto_hide { 0 } else { self.taskbar_height() };
+        Rect::new(0, 0, self.width as i32, (self.height as i32) - reserved)
     }
 
     fn load_startup_wallpaper(&mut self) {
@@ -272,34 +412,13 @@ impl<'a> FrameworkApp<'a> {
             }
         }
 
-        let initial_w = theme.pt(680.0);
-        let initial_h = theme.pt(460.0);
-        let pos_offset = (self.root_widgets.len() as i32 * 28) % 200;
-        let x = theme.pt(120.0) + pos_offset;
-        let y = theme.pt(40.0) + pos_offset;
-
-        let content_widget: Box<dyn Widget> = match name {
-            "Finder" => Box::new(FinderApp::new()),
-            "TextEdit" => Box::new(TextEditApp::new()),
-            "Terminal" => Box::new(TerminalApp::new()),
-            "Activity Monitor" => Box::new(ActivityMonitorApp::new()),
-            "Browser" => Box::new(BrowserApp::new()),
-            "Settings" => Box::new(SettingsApp::new()),
-            _ => Box::new(FinderApp::new()),
-        };
-
-        let frame = WindowFrame::new(name, x, y, initial_w, initial_h, content_widget);
-        let mut surface = crate::framework::surface::WindowSurface::new(frame.bounds.w as usize, frame.bounds.h as usize);
-        surface.is_dirty = true;
-
-        self.root_widgets.push(Box::new(frame));
-        self.window_surfaces.push(surface);
-
-        let new_idx = self.root_widgets.len() - 1;
-        self.focus_mgr.active_window_idx = Some(new_idx);
-        self.menubar_widget.set_active_app(name);
-        crate::sdk::agent::audit_log(&format!("APP_SPAWN:PASS:{}", name));
-        self.request_full_redraw();
+        // إطلاق التطبيق كعملية ELF مستقلة ومعزولة على نواة SMP خاصة بها
+        let slug = name.to_ascii_lowercase().replace(' ', "_");
+        let args = format!("eos_{}.elf --app {}", slug, name.replace(' ', "_"));
+        let res = crate::syscall::sys_spawn_elf("user_app.elf", &args);
+        if res >= 0 {
+            crate::sdk::agent::audit_log(&format!("APP_SPAWN:PASS:{}", name));
+        }
     }
 
     pub fn spawn_text_editor(&mut self, file_path: &str) {
@@ -386,27 +505,50 @@ impl<'a> FrameworkApp<'a> {
 
         match ev {
             PointerEvent::Move { x, y, .. } => {
-                let cur_cursor_rect = Rect::new(x - 4, y - 4, 32, 32);
-                let prev_cursor_rect = Rect::new(self.prev_pointer_x - 4, self.prev_pointer_y - 4, 32, 32);
-                self.damage.add(cur_cursor_rect);
-                self.damage.add(prev_cursor_rect);
+                if !self.hw_cursor_enabled {
+                    let cur_cursor_rect = Rect::new(x - 4, y - 4, 32, 32);
+                    let prev_cursor_rect = Rect::new(self.prev_pointer_x - 4, self.prev_pointer_y - 4, 32, 32);
+                    self.damage.add(cur_cursor_rect);
+                    self.damage.add(prev_cursor_rect);
+                }
                 self.prev_pointer_x = x;
                 self.prev_pointer_y = y;
+
+                if self.context_menu.is_visible {
+                    let old_h = self.context_menu.hover_idx;
+                    self.context_menu.handle_mouse(x, y, false);
+                    if old_h != self.context_menu.hover_idx {
+                        self.damage.add(self.context_menu.bounds);
+                    }
+                }
 
                 if self.start_menu.is_open {
                     self.start_menu.handle_mouse(x, y, false);
                     self.damage.add(self.start_menu.bounds);
                 }
 
-                // Taskbar / Superbar Hover Detection
+                // Taskbar Auto-Hide Reveal & Hover Detection
+                if self.dock_auto_hide {
+                    let should_reveal = if self.taskbar_revealed {
+                        y >= tb_y - theme.pt(8.0)
+                    } else {
+                        y >= (self.height as i32) - 8
+                    };
+                    if should_reveal != self.taskbar_revealed {
+                        self.taskbar_revealed = should_reveal;
+                        self.request_full_redraw();
+                    }
+                }
+
+                let tb_shown = self.is_taskbar_shown();
                 let old_orb = self.start_orb_hovered;
                 let old_peek = self.aero_peek_hovered;
                 let old_dock = self.hovered_dock_idx;
 
-                self.start_orb_hovered = y >= tb_y && x < orb_w;
-                self.aero_peek_hovered = y >= tb_y && x >= (self.width as i32) - peek_w;
+                self.start_orb_hovered = tb_shown && y >= tb_y && x < orb_w;
+                self.aero_peek_hovered = tb_shown && y >= tb_y && x >= (self.width as i32) - peek_w;
 
-                if y >= tb_y && x >= orb_w + theme.pt(8.0) && x < orb_w + theme.pt(8.0) + (self.dock_items.len() as i32 * btn_w) {
+                if tb_shown && y >= tb_y && x >= orb_w + theme.pt(8.0) && x < orb_w + theme.pt(8.0) + (self.dock_items.len() as i32 * btn_w) {
                     let idx = ((x - orb_w - theme.pt(8.0)) / btn_w) as usize;
                     self.hovered_dock_idx = if idx < self.dock_items.len() { Some(idx) } else { None };
                 } else {
@@ -492,22 +634,66 @@ impl<'a> FrameworkApp<'a> {
                 }
             }
             PointerEvent::Down { x, y, button } => {
+                // Wayland Implicit Pointer Grab: منع فتح قوائم أو سرقة التركيز أثناء سحب نافذة
+                if self.captured_window_idx.is_some() {
+                    return;
+                }
                 if button == PointerButton::Secondary {
                     self.start_menu.is_open = false;
-                    self.context_menu.show(
-                        x,
-                        y,
-                        vec![
-                            "View".into(),
-                            "Sort by".into(),
-                            "Refresh".into(),
-                            "New Folder".into(),
-                            "New Python Script".into(),
-                            "Command Prompt Here".into(),
-                            "Personalize".into(),
-                        ],
-                        None,
-                    );
+                    if let Some((_, ref mut dlg)) = self.file_dialog {
+                        if dlg.handle_right_click(x, y) {
+                            self.request_full_redraw();
+                            return;
+                        }
+                    }
+                    // Taskbar Context Menu (Pin / Unpin / Auto-Hide)
+                    if self.is_taskbar_shown() && y >= tb_y {
+                        let hide_lbl = if self.dock_auto_hide { "Disable Auto-Hide Taskbar" } else { "Enable Auto-Hide Taskbar" };
+                        let mut items = Vec::new();
+                        if x >= orb_w + theme.pt(8.0) && x < orb_w + theme.pt(8.0) + (self.dock_items.len() as i32 * btn_w) {
+                            let idx = ((x - orb_w - theme.pt(8.0)) / btn_w) as usize;
+                            if idx < self.dock_items.len() {
+                                let target = &self.dock_items[idx];
+                                items.push(crate::framework::menu::ContextMenuItem::action(&format!("launch:{}", target), &format!("Open {}", target), Some(crate::framework::icons::icon_for_app(target))));
+                                items.push(crate::framework::menu::ContextMenuItem::action(&format!("unpin:{}", target), &format!("Unpin {} from Taskbar", target), Some("disc")).with_sep());
+                            }
+                        }
+                        items.push(crate::framework::menu::ContextMenuItem::action("toggle_autohide", hide_lbl, Some("tune")));
+                        self.context_menu.open_custom(x, y, self.width as i32, self.height as i32, Some("Taskbar".into()), items);
+                        self.request_full_redraw();
+                        return;
+                    }
+                    for icon in &self.desktop_icons {
+                        if icon.bounds.contains(x, y) {
+                            let items = vec![
+                                crate::framework::menu::ContextMenuItem::action(&format!("launch:{}", icon.target_app), &format!("Open {}", icon.label), Some(crate::framework::icons::icon_for_app(&icon.target_app))).with_sep(),
+                                crate::framework::menu::ContextMenuItem::action("refresh", "Refresh Desktop", Some("tune")),
+                            ];
+                            self.context_menu.open_custom(x, y, self.width as i32, self.height as i32, Some(icon.label.clone()), items);
+                            self.request_full_redraw();
+                            return;
+                        }
+                    }
+                    for w in self.root_widgets.iter().rev() {
+                        if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
+                            if !f.is_closed && !f.is_minimized && f.bounds.contains(x, y) {
+                                let pin_lbl = if f.always_on_top { "Unpin Always-on-Top" } else { "Pin Always-on-Top" };
+                                let mut items = vec![
+                                    crate::framework::menu::ContextMenuItem::action("win_pin", pin_lbl, Some("tune")),
+                                    crate::framework::menu::ContextMenuItem::action("win_full", "Toggle Fullscreen", Some("video")),
+                                ];
+                                let base_app = f.title.split('-').next().unwrap_or(&f.title).trim();
+                                if !self.dock_items.iter().any(|d| d == base_app) {
+                                    items.push(crate::framework::menu::ContextMenuItem::action(&format!("dock_pin:{}", base_app), &format!("Pin {} to Taskbar", base_app), Some("settings")));
+                                }
+                                items.push(crate::framework::menu::ContextMenuItem::action("win_close", "Close Window", Some("disc")));
+                                self.context_menu.open_custom(x, y, self.width as i32, self.height as i32, Some(f.title.clone()), items);
+                                self.request_full_redraw();
+                                return;
+                            }
+                        }
+                    }
+                    self.context_menu.open_at(x, y, self.width as i32, self.height as i32);
                     self.request_full_redraw();
                     return;
                 }
@@ -515,20 +701,56 @@ impl<'a> FrameworkApp<'a> {
                 if self.context_menu.is_visible {
                     let action = self.context_menu.handle_mouse(x, y, true);
                     if let Some(act) = action {
-                        match act.as_str() {
-                            "Refresh" => self.request_full_redraw(),
-                            "Sort by" => {
-                                self.desktop_icons.sort_by(|a, b| a.label.cmp(&b.label));
-                                self.request_full_redraw();
+                        if let Some(app_target) = act.strip_prefix("launch:") {
+                            self.spawn_app(app_target);
+                        } else if let Some(unpin_target) = act.strip_prefix("unpin:") {
+                            self.unpin_from_dock(unpin_target);
+                        } else if let Some(pin_target) = act.strip_prefix("dock_pin:") {
+                            self.pin_to_dock(pin_target);
+                        } else {
+                            match act.as_str() {
+                                "toggle_autohide" => {
+                                    self.dock_auto_hide = !self.dock_auto_hide;
+                                    self.taskbar_revealed = !self.dock_auto_hide;
+                                    self.request_full_redraw();
+                                }
+                                "refresh" => self.request_full_redraw(),
+                                "new_folder" => {
+                                    let _ = fs::create_dir_all("EOS SHARE/New_Folder");
+                                    self.spawn_app("Finder");
+                                }
+                                "open_terminal" => self.spawn_app("Terminal"),
+                                "personalize" => self.spawn_app("Settings"),
+                                "win_pin" => {
+                                    if let Some(idx) = self.focus_mgr.active_window_idx {
+                                        if let Some(w) = self.root_widgets.get_mut(idx) {
+                                            if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                                                f.always_on_top = !f.always_on_top;
+                                            }
+                                        }
+                                    }
+                                }
+                                "win_full" => {
+                                    let screen = Rect::new(0, 0, self.width as i32, self.height as i32);
+                                    if let Some(idx) = self.focus_mgr.active_window_idx {
+                                        if let Some(w) = self.root_widgets.get_mut(idx) {
+                                            if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                                                f.toggle_fullscreen(&screen);
+                                            }
+                                        }
+                                    }
+                                }
+                                "win_close" => {
+                                    if let Some(idx) = self.focus_mgr.active_window_idx {
+                                        if let Some(w) = self.root_widgets.get_mut(idx) {
+                                            if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                                                f.is_closed = true;
+                                            }
+                                        }
+                                    }
+                                }
+                                _ => {}
                             }
-                            "New Folder" => {
-                                let _ = fs::create_dir_all("EOS SHARE/New_Folder");
-                                self.spawn_app("Finder");
-                            }
-                            "New Python Script" => self.spawn_app("TextEdit"),
-                            "Command Prompt Here" => self.spawn_app("Terminal"),
-                            "Personalize" => self.spawn_app("Settings"),
-                            _ => {}
                         }
                         self.request_full_redraw();
                         return;
@@ -537,9 +759,33 @@ impl<'a> FrameworkApp<'a> {
                 }
 
                 if button == PointerButton::Primary {
+                    // 0. Active Portal FilePicker Dialog
+                    if let Some((caller, mut dlg)) = self.file_dialog.take() {
+                        let picked = dlg.handle_mouse(x, y, true);
+                        if let Some(path) = picked {
+                            if let Some(id_str) = caller.strip_prefix("EXT:") {
+                                if let Ok(wid) = id_str.parse::<u32>() {
+                                    let mut pb = path.into_bytes();
+                                    crate::syscall::sys_win_file_portal(1, wid, &mut pb);
+                                }
+                            } else {
+                                crate::framework::portal::complete_file_picker(caller, path);
+                            }
+                        } else if dlg.is_open {
+                            self.file_dialog = Some((caller, dlg));
+                        }
+                        self.request_full_redraw();
+                        return;
+                    }
+
                     // 1. Start Menu Click
                     if self.start_menu.is_open {
-                        if let Some(target_app) = self.start_menu.handle_mouse(x, y, true) {
+                        if let Some((target_app, target_arg)) = self.start_menu.handle_mouse(x, y, true) {
+                            if !target_arg.is_empty() && target_app == "Finder" {
+                                let mut pb = target_arg.into_bytes();
+                                pb.truncate(127);
+                                let _ = fs::write("RootFS/finder_nav.ini", &pb);
+                            }
                             self.spawn_app(&target_app);
                             self.request_full_redraw();
                             return;
@@ -551,7 +797,7 @@ impl<'a> FrameworkApp<'a> {
                     }
 
                     // 2. Bottom Superbar Click
-                    if y >= tb_y {
+                    if self.is_taskbar_shown() && y >= tb_y {
                         // Start Orb
                         if x < orb_w {
                             self.start_menu.layout_above_taskbar(self.height as i32, tb_h);
@@ -708,6 +954,12 @@ impl<'a> FrameworkApp<'a> {
                 self.update_cursor_state(self.prev_pointer_x, self.prev_pointer_y);
             }
             PointerEvent::Scroll { x, y, dy } => {
+                if let Some((_, ref mut dlg)) = self.file_dialog {
+                    if dlg.handle_scroll(x, y, dy) {
+                        self.request_full_redraw();
+                    }
+                    return;
+                }
                 for (idx, w) in self.root_widgets.iter_mut().enumerate().rev() {
                     if w.handle_scroll(x, y, dy) {
                         if let Some(surf) = self.window_surfaces.get_mut(idx) {
@@ -879,14 +1131,117 @@ impl<'a> FrameworkApp<'a> {
         }
 
         loop {
+            if self.context_menu.tick_anim() {
+                self.damage.add(self.context_menu.bounds);
+            }
+            if let Some((caller, exts)) = crate::framework::portal::take_pending_file_picker() {
+                let theme = get_theme();
+                let dw = theme.pt(440.0).min(self.width as i32 - 80);
+                let dh = theme.pt(300.0).min(self.height as i32 - 120);
+                let mut dlg = crate::framework::tools::FileDialog::new_with_filter(false, &exts);
+                dlg.bounds = Rect::new(
+                    (self.width as i32 - dw) / 2,
+                    (self.height as i32 - dh) / 2,
+                    dw,
+                    dh,
+                );
+                self.file_dialog = Some((caller, dlg));
+                self.request_full_redraw();
+            }
+            if crate::framework::theme::sync_theme_from_disk_if_changed()
+                || crate::framework::theme::take_full_redraw_requested()
+            {
+                self.request_full_redraw();
+            }
             if take_wallpaper_changed() || self.wallpaper_dirty {
                 self.rebuild_wallpaper_cache();
                 self.request_full_redraw();
             }
 
+            // مزامنة نوافذ التطبيقات المعزولة من الكيرنل (Wayland-Style Surface Sync)
+            let mut descs = [crate::syscall::RawExtWindowDesc::default(); 8];
+            let ext_cnt = crate::syscall::sys_comp_list_windows(&mut descs);
+            let live = &descs[..ext_cnt];
+
+            for d in live {
+                if (d.file_req & 1) != 0 && self.file_dialog.is_none() {
+                    let mut fbuf = [0u8; 128];
+                    let flen = crate::syscall::sys_win_file_portal(4, d.id, &mut fbuf);
+                    let exts = String::from_utf8_lossy(&fbuf[..flen]).to_string();
+                    let theme = get_theme();
+                    let dw = theme.pt(440.0).min(self.width as i32 - 80);
+                    let dh = theme.pt(300.0).min(self.height as i32 - 120);
+                    let mut dlg = crate::framework::tools::FileDialog::new_with_filter(false, &exts);
+                    dlg.bounds = Rect::new((self.width as i32 - dw) / 2, (self.height as i32 - dh) / 2, dw, dh);
+                    self.file_dialog = Some((format!("EXT:{}", d.id), dlg));
+                    self.request_full_redraw();
+                }
+
+                let mut found = false;
+                let mut need_full_redraw = false;
+                let want_fullscreen = (d.file_req & 4) != 0;
+                let want_pin = (d.file_req & 8) != 0;
+                for w in self.root_widgets.iter_mut() {
+                    if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                        let mut matched = false;
+                        if let Some(ext) = f.content.as_any_mut().downcast_mut::<ExternalWindowWidget>() {
+                            if ext.win_id == d.id {
+                                matched = true;
+                                if ext.last_gen != d.generation {
+                                    let nw = d.width as usize; let nh = d.height as usize;
+                                    if ext.pixels.len() != nw * nh { ext.pixels.resize(nw * nh, 0xFF0F172A); }
+                                    ext.buf_w = nw; ext.buf_h = nh;
+                                    crate::syscall::sys_comp_read_surface(d.id, &mut ext.pixels);
+                                    ext.last_gen = d.generation;
+                                    self.damage.add(f.bounds);
+                                }
+                            }
+                        }
+                        if matched {
+                            found = true;
+                            if want_fullscreen {
+                                let screen = Rect::new(0, 0, self.width as i32, self.height as i32);
+                                f.toggle_fullscreen(&screen);
+                                need_full_redraw = true;
+                            }
+                            if want_pin {
+                                f.always_on_top = !f.always_on_top;
+                                need_full_redraw = true;
+                            }
+                            break;
+                        }
+                    }
+                }
+                if need_full_redraw {
+                    self.request_full_redraw();
+                }
+                if !found {
+                    let tlen = d.title.iter().position(|&b| b == 0).unwrap_or(40);
+                    let title = String::from_utf8_lossy(&d.title[..tlen]).to_string();
+                    let theme = get_theme();
+                    let off = (self.root_widgets.len() as i32 * 36) % 240;
+                    let tbh = theme.pt(36.0);
+                    let mut ext = ExternalWindowWidget::new(d.id, d.width as usize, d.height as usize);
+                    crate::syscall::sys_comp_read_surface(d.id, &mut ext.pixels);
+                    ext.last_gen = d.generation;
+                    let frame = WindowFrame::new(title, theme.pt(120.0) + off, theme.pt(40.0) + off, d.width as i32 + 2, d.height as i32 + tbh + 1, Box::new(ext));
+                    self.root_widgets.push(Box::new(frame));
+                    self.window_surfaces.push(crate::framework::surface::WindowSurface::new(1, 1));
+                    self.focus_mgr.active_window_idx = Some(self.root_widgets.len() - 1);
+                    self.request_full_redraw();
+                }
+            }
+
             let mut removed = Vec::new();
-            for (idx, w) in self.root_widgets.iter().enumerate() {
-                if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
+            for (idx, w) in self.root_widgets.iter_mut().enumerate() {
+                if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                    if let Some(ext) = f.content.as_any().downcast_ref::<ExternalWindowWidget>() {
+                        if f.is_closed {
+                            crate::syscall::sys_comp_send_event(ext.win_id, 9, 0, 0, 0);
+                        } else if !live.iter().any(|d| d.id == ext.win_id) {
+                            f.is_closed = true; // العملية المعزولة أُغلقت أو انهارت — أزل النافذة بنظافة
+                        }
+                    }
                     if f.is_closed {
                         removed.push(idx);
                         self.damage.add(f.bounds);
@@ -983,6 +1338,52 @@ impl<'a> FrameworkApp<'a> {
                 self.route_pointer_event(PointerEvent::Move { x: new_x, y: new_y, dx: pending_dx, dy: pending_dy });
             }
 
+            if self.animator.is_active() {
+                let now_ms = crate::framework::perf_log::SmartLogger::cycles_to_us(
+                    crate::framework::perf_log::SmartLogger::read_tsc()
+                ) / 1000;
+                self.animator.tick(now_ms, &mut self.damage);
+            }
+
+            // تحديث موقع مؤشر الماوس العتادي مرة واحدة فقط في كل دورة لمنع الاهتزاز والتدبّل
+            if self.hw_cursor_enabled
+                && (self.prev_pointer_x != self.last_hw_cursor_x || self.prev_pointer_y != self.last_hw_cursor_y)
+            {
+                sys_gpu_move_cursor(self.prev_pointer_x as u32, self.prev_pointer_y as u32);
+                self.last_hw_cursor_x = self.prev_pointer_x;
+                self.last_hw_cursor_y = self.prev_pointer_y;
+            }
+
+            // مزامنة قائمة النوافذ النشطة ليعرضها TestApp لحظياً
+            if let Ok(mut titles) = ACTIVE_WINDOW_TITLES.lock() {
+                titles.clear();
+                for w in &self.root_widgets {
+                    if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
+                        if !f.is_closed {
+                            let st = if f.is_minimized { "Minimized" } else { "Active" };
+                            titles.push(format!("{} [{}]", f.title, st));
+                        }
+                    }
+                }
+            }
+
+            for w in self.root_widgets.iter_mut() {
+                if let Some(frame) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                    if !frame.is_closed && !frame.is_minimized {
+                        if let Some(test_app) = frame.content.as_any_mut().downcast_mut::<TestApp>() {
+                            if test_app.anim_running {
+                                test_app.tick_animation();
+                                self.damage.add(frame.bounds);
+                            }
+                        } else if let Some(vid) = frame.content.as_any_mut().downcast_mut::<VideoPlayerApp>() {
+                            if vid.tick_frame() {
+                                self.damage.add(frame.bounds);
+                            }
+                        }
+                    }
+                }
+            }
+
             self.render();
         }
     }
@@ -997,6 +1398,7 @@ impl<'a> FrameworkApp<'a> {
         let peek_w = theme.pt(12.0);
         let tray_w = theme.pt(120.0);
 
+        self.damage.clamp_to_screen(self.width, self.height);
         if self.damage.is_empty() { return; }
         let dirty_rects = self.damage.rects.clone();
 
@@ -1024,14 +1426,16 @@ impl<'a> FrameworkApp<'a> {
                             canvas.draw_rect(icon.bounds.x, icon.bounds.y, icon.bounds.w, icon.bounds.h, 0x5538BDF8, 4);
                             canvas.draw_rect_outline(icon.bounds.x, icon.bounds.y, icon.bounds.w, icon.bounds.h, 0xAA7DD3FC, 4);
                         }
-                        let ic_sz = theme.pt(34.0);
+                        let ic_sz = theme.pt(36.0);
                         let ic_x = icon.bounds.x + (icon.bounds.w - ic_sz) / 2;
                         let ic_y = icon.bounds.y + theme.pt(6.0);
-                        draw_vector_icon(&mut canvas, &icon.icon_name, ic_x, ic_y, ic_sz, ic_sz, None);
+                        if !crate::framework::icons::draw_svg_icon(&mut canvas, &icon.icon_name, ic_x, ic_y, ic_sz, ic_sz) {
+                            draw_vector_icon(&mut canvas, &icon.icon_name, ic_x, ic_y, ic_sz, ic_sz, None);
+                        }
                         let (tw, _) = canvas.measure_text(&icon.label, theme.font_caption());
                         let tx = icon.bounds.x + (icon.bounds.w - tw as i32) / 2;
                         let ty = ic_y + ic_sz + theme.pt(4.0);
-                        canvas.draw_text_clipped(tx.max(icon.bounds.x + 2), ty, icon.bounds.w - 4, &icon.label, 0xFFFFFFFF, theme.font_caption());
+                        canvas.draw_text_adaptive(tx.max(icon.bounds.x + 2), ty, icon.bounds.w - 4, &icon.label, 0xFFFFFFFF, theme.font_caption());
                     }
                 }
 
@@ -1059,16 +1463,21 @@ impl<'a> FrameworkApp<'a> {
                 canvas.pop_clip();
             }
 
-            // 3. Windows (Unless Aero Peek Hover is active)
+            // 3. Windows (Regular first, then Always-on-Top, then Fullscreen on top of Superbar)
             if !self.aero_peek_hovered {
-                for (_idx, w) in self.root_widgets.iter().enumerate() {
-                    if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
-                        if !f.is_closed && !f.is_minimized {
-                            if let Some(intersect) = f.bounds.intersect(&r).non_empty() {
-                                let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-                                canvas.push_clip(intersect);
-                                w.paint(&mut canvas);
-                                canvas.pop_clip();
+                for pass in 0..2 {
+                    for w in self.root_widgets.iter() {
+                        if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
+                            if !f.is_closed && !f.is_minimized && !f.is_fullscreen {
+                                let is_top = f.always_on_top;
+                                if (pass == 0 && !is_top) || (pass == 1 && is_top) {
+                                    if let Some(intersect) = f.bounds.intersect(&r).non_empty() {
+                                        let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                                        canvas.push_clip(intersect);
+                                        w.paint(&mut canvas);
+                                        canvas.pop_clip();
+                                    }
+                                }
                             }
                         }
                     }
@@ -1087,7 +1496,8 @@ impl<'a> FrameworkApp<'a> {
                 canvas.pop_clip();
             }
 
-            // 4. Windows 7 Bottom Aero Superbar, Start Orb, System Tray & Show Desktop Peek Strip
+            // 4. Bottom Aero Superbar, Custom EOS Logo Orb, System Tray & Show Desktop Peek Strip
+            if self.is_taskbar_shown() {
             if let Some(intersect) = superbar_rect.intersect(&r).non_empty() {
                 let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
                 canvas.push_clip(intersect);
@@ -1096,24 +1506,21 @@ impl<'a> FrameworkApp<'a> {
                 canvas.draw_line_h(0, tb_y, self.width as i32, theme.border_frost_highlight);
                 canvas.draw_line_h(0, tb_y + 1, self.width as i32, 0x4438BDF8);
 
-                // Iconic Circular Windows 7 Start Orb on the Left
+                // Custom EOS Logo Start Orb on the Left (userspace/assets/icon.png)
                 let orb_sz = theme.pt(36.0);
                 let orb_x = theme.pt(6.0);
                 let orb_y = tb_y + (tb_h - orb_sz) / 2;
                 let orb_col = if self.start_orb_hovered || self.start_menu.is_open {
-                    0xFF38BDF8
+                    theme.accent_hover
                 } else {
-                    0xFF0284C7
+                    0x550F172A
                 };
                 canvas.draw_rect(orb_x, orb_y, orb_sz, orb_sz, orb_col, (orb_sz / 2) as usize);
-                canvas.draw_rect_outline(orb_x, orb_y, orb_sz, orb_sz, 0xFFE0F2FE, (orb_sz / 2) as usize);
-                // 4-Pane Windows Flag inside Start Orb
-                let cx = orb_x + orb_sz / 2;
-                let cy = orb_y + orb_sz / 2;
-                canvas.draw_rect(cx - 7, cy - 7, 6, 6, 0xFFF97316, 1);
-                canvas.draw_rect(cx + 1, cy - 7, 6, 6, 0xFF22C55E, 1);
-                canvas.draw_rect(cx - 7, cy + 1, 6, 6, 0xFF38BDF8, 1);
-                canvas.draw_rect(cx + 1, cy + 1, 6, 6, 0xFFFACC15, 1);
+                canvas.draw_rect_outline(orb_x, orb_y, orb_sz, orb_sz, 0x99E0F2FE, (orb_sz / 2) as usize);
+                let logo_pad = theme.pt(4.0);
+                if !crate::framework::icons::draw_eos_logo(&mut canvas, orb_x + logo_pad, orb_y + logo_pad, orb_sz - logo_pad * 2, orb_sz - logo_pad * 2) {
+                    canvas.draw_rect(orb_x + 8, orb_y + 8, orb_sz - 16, orb_sz - 16, theme.accent, 6);
+                }
 
                 // Pinned / Running Application Glass Buttons
                 for (i, item) in self.dock_items.iter().enumerate() {
@@ -1135,24 +1542,10 @@ impl<'a> FrameworkApp<'a> {
                         canvas.draw_rect_outline(bx, by, btn_w - 4, bh, theme.border_frost_highlight, 4);
                     }
 
-                    let icon_key = match item.as_str() {
-                        "Finder" => "folder",
-                        "TextEdit" => "doc",
-                        "Terminal" => "terminal",
-                        "Activity Monitor" => "monitor",
-                        "Browser" => "browser",
-                        _ => "gear",
-                    };
-                    let ic_sz = theme.pt(22.0);
-                    draw_vector_icon(
-                        &mut canvas,
-                        icon_key,
-                        bx + (btn_w - 4 - ic_sz) / 2,
-                        by + (bh - ic_sz) / 2,
-                        ic_sz,
-                        ic_sz,
-                        None,
-                    );
+                    let ic_sz = theme.pt(24.0);
+                    let ix = bx + (btn_w - 4 - ic_sz) / 2;
+                    let iy = by + (bh - ic_sz) / 2;
+                    crate::framework::icons::draw_app_icon(&mut canvas, item, ix, iy, ic_sz, ic_sz);
 
                     if is_running {
                         canvas.draw_rect(bx + 10, tb_y + tb_h - 4, btn_w - 24, 3, 0xFF38BDF8, 1);
@@ -1183,23 +1576,41 @@ impl<'a> FrameworkApp<'a> {
 
                 canvas.pop_clip();
             }
+            }
 
-            // 5. Taskbar Live Thumbnail Hover Preview Card
+            // 4b. True Fullscreen Windows (Covers entire 2560x1440 screen above Superbar)
+            for w in self.root_widgets.iter() {
+                if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
+                    if !f.is_closed && !f.is_minimized && f.is_fullscreen {
+                        let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                        canvas.push_clip(*r);
+                        w.paint(&mut canvas);
+                        canvas.pop_clip();
+                    }
+                }
+            }
+
+            // 5. Taskbar Live Hover Tooltip (Only shows preview card if the app is actually running)
+            if self.is_taskbar_shown() {
             if let Some(dock_idx) = self.hovered_dock_idx {
                 if dock_idx < self.dock_items.len() {
                     let app_title = &self.dock_items[dock_idx];
-                    let card_w = theme.pt(160.0);
-                    let card_h = theme.pt(96.0);
-                    let card_x = (orb_w + (dock_idx as i32 * btn_w) - card_w / 4).clamp(8, self.width as i32 - card_w - 8);
-                    let card_y = tb_y - card_h - theme.pt(6.0);
+                    let is_running = self.root_widgets.iter().any(|w| {
+                        w.as_any().downcast_ref::<WindowFrame>().map(|f| !f.is_closed && f.title.contains(app_title)).unwrap_or(false)
+                    });
+                    if is_running {
+                        let card_w = theme.pt(160.0);
+                        let card_h = theme.pt(44.0);
+                        let card_x = (orb_w + (dock_idx as i32 * btn_w) - card_w / 4).clamp(8, self.width as i32 - card_w - 8);
+                        let card_y = tb_y - card_h - theme.pt(6.0);
 
-                    let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-                    canvas.draw_frosted_glass_rect(card_x, card_y, card_w, card_h, theme.aero_glass_tint, 6);
-                    canvas.draw_rect_outline(card_x, card_y, card_w, card_h, theme.border_frost_highlight, 6);
-                    canvas.draw_text_clipped(card_x + 10, card_y + 8, card_w - 20, app_title, 0xFFFFFFFF, theme.font_caption());
-                    canvas.draw_rect(card_x + 10, card_y + 28, card_w - 20, card_h - 38, 0xFF0F172A, 4);
-                    canvas.draw_text(card_x + 20, card_y + 48, "Aero Live Preview", 0xFF38BDF8, theme.font_caption());
+                        let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                        canvas.draw_frosted_glass_rect(card_x, card_y, card_w, card_h, theme.aero_glass_tint, theme.r_ctrl());
+                        canvas.draw_rect_outline(card_x, card_y, card_w, card_h, theme.border_frost_highlight, theme.r_ctrl());
+                        canvas.draw_text_clipped(card_x + 12, card_y + 12, card_w - 24, app_title, 0xFFFFFFFF, theme.font_caption());
+                    }
                 }
+            }
             }
 
             // 6. Calendar / Clock Flyout
@@ -1247,25 +1658,38 @@ impl<'a> FrameworkApp<'a> {
                 }
             }
 
-            // 9. Right-Click Context Menu
+            // 9. Right-Click Context Menu & Portal FilePicker Dialog
             if self.context_menu.is_visible {
                 let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
                 self.context_menu.draw(&mut canvas);
             }
-
-            // 10. Software Cursor
-            let cur_cursor_rect = Rect::new(self.prev_pointer_x - 4, self.prev_pointer_y - 4, 32, 32);
-            if cur_cursor_rect.intersect(&r).non_empty().is_some() {
+            if let Some((_, ref dlg)) = self.file_dialog {
                 let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
-                match self.current_cursor {
-                    CursorType::Default => canvas.draw_linux_cursor(self.prev_pointer_x, self.prev_pointer_y),
-                    CursorType::Pointer => canvas.draw_pointer_hand_cursor(self.prev_pointer_x, self.prev_pointer_y),
-                    CursorType::ResizeCorner => canvas.draw_resize_corner_cursor(self.prev_pointer_x, self.prev_pointer_y),
+                dlg.draw(&mut canvas);
+            }
+
+            // 10. Software Cursor (يُستخدم فقط عند تعطيل Hardware Cursor)
+            if !self.hw_cursor_enabled {
+                let cur_cursor_rect = Rect::new(self.prev_pointer_x - 4, self.prev_pointer_y - 4, 32, 32);
+                if cur_cursor_rect.intersect(&r).non_empty().is_some() {
+                    let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+                    match self.current_cursor {
+                        CursorType::Default => canvas.draw_linux_cursor(self.prev_pointer_x, self.prev_pointer_y),
+                        CursorType::Pointer => canvas.draw_pointer_hand_cursor(self.prev_pointer_x, self.prev_pointer_y),
+                        CursorType::ResizeCorner => canvas.draw_resize_corner_cursor(self.prev_pointer_x, self.prev_pointer_y),
+                    }
                 }
             }
         }
 
-        let rect_data: Vec<[u32; 4]> = dirty_rects.iter().map(|r| [r.x as u32, r.y as u32, r.w as u32, r.h as u32]).collect();
+        if crate::framework::features::get_features().debug_damage_overlay {
+            let mut canvas = Canvas::new(&mut self.buffer, self.width, self.height, self.font.as_ref(), &mut self.font_cache);
+            for r in &dirty_rects {
+                canvas.draw_rect_outline(r.x, r.y, r.w, r.h, 0xFFEF4444, 0);
+            }
+        }
+
+        let rect_data = self.damage.to_syscall_rects();
         sys_present_rects(self.buffer.as_ptr(), self.width, self.height, &rect_data);
         self.damage.clear();
 
@@ -1275,7 +1699,7 @@ impl<'a> FrameworkApp<'a> {
 
         if !self.first_frame_presented {
             self.first_frame_presented = true;
-            crate::sdk::agent::audit_log("FIRST_FRAME:PASS:1920x1080 desktop frame composited");
+            crate::sdk::agent::audit_log("FIRST_FRAME:PASS:2560x1440 desktop frame composited");
         }
         if self.rendered_frames >= 5 && !self.compositor_bench_logged {
             self.compositor_bench_logged = true;

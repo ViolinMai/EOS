@@ -5,6 +5,8 @@ pub mod textedit;
 pub mod settings;
 pub mod activity_monitor;
 pub mod browser;
+pub mod test_app;
+pub mod video_player;
 
 pub use finder::FinderApp;
 pub use preview::PreviewApp;
@@ -13,3 +15,5 @@ pub use textedit::TextEditApp;
 pub use settings::SettingsApp;
 pub use activity_monitor::ActivityMonitorApp;
 pub use browser::BrowserApp;
+pub use test_app::TestApp;
+pub use video_player::VideoPlayerApp;

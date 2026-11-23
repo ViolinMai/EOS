@@ -1,0 +1,14 @@
+prefix=/mnt/storage/LINUX-WIN/Codes/RUST/EOS/userspace/vendor/ffmpeg_src/../ffmpeg
+exec_prefix=${prefix}
+libdir=/mnt/storage/LINUX-WIN/Codes/RUST/EOS/userspace/vendor/ffmpeg_src/../ffmpeg/lib
+includedir=/mnt/storage/LINUX-WIN/Codes/RUST/EOS/userspace/vendor/ffmpeg_src/../ffmpeg/include
+
+Name: libavutil
+Description: FFmpeg utility library
+Version: 59.39.100
+Requires: 
+Requires.private: 
+Conflicts:
+Libs: -L${libdir}  -lavutil -lm -latomic
+Libs.private: 
+Cflags: -I${includedir}

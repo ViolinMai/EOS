@@ -73,11 +73,7 @@ impl SmartLogger {
             logs.push(entry.trim_end().to_string());
         }
 
-        let _ = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("RootFS/perf_bottlenecks.log")
-            .and_then(|mut f| f.write_all(entry.as_bytes()));
+        // يُحفظ في الذاكرة (RECENT_LOGS) لعرضه في Settings -> Detective بدون ضرب القرص في كل إطار
     }
 
     pub fn get_recent_entries() -> Vec<String> {

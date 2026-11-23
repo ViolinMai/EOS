@@ -7,7 +7,7 @@ pub fn decode_png(data: &[u8]) -> Result<(Vec<u32>, usize, usize), String> {
     let mut decoder = png::Decoder::new(cursor);
 
     decoder.set_limits(png::Limits { bytes: usize::MAX });
-    decoder.set_transformations(png::Transformations::EXPAND);
+    decoder.set_transformations(png::Transformations::EXPAND | png::Transformations::STRIP_16);
 
     let mut reader = decoder.read_info().map_err(|e| format!("Failed to parse PNG header: {:?}", e))?;
     let t_header = t_start.elapsed();

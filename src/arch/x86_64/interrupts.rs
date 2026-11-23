@@ -158,7 +158,8 @@ pub extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: Inte
         log_error!("CPU", "============================================");
         crate::task::force_exit_user_process();
     } else {
-        log_fatal!("CPU", "KERNEL #GP FAULT at RIP {:#018x} (Code: {:#x})", stack_frame.instruction_pointer, code);
+        log_fatal!("CPU", "KERNEL #GP FAULT at RIP {:#018x} RSP {:#018x} CS {:#x} (Code: {:#x})",
+            stack_frame.instruction_pointer, stack_frame.stack_pointer, stack_frame.code_segment, code);
         loop { core::hint::spin_loop(); }
     }
 }

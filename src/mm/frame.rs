@@ -146,3 +146,24 @@ pub fn free_frame_safe(phys: u64) {
     }
     ALLOCATOR_LOCK.unlock();
 }
+
+pub fn reserve_physical_range(phys_start: u64, size_bytes: usize) {
+    ALLOCATOR_LOCK.lock();
+    unsafe {
+        if let Some(alloc) = (*core::ptr::addr_of_mut!(ALLOCATOR_INSTANCE)).as_mut() {
+            let start_frame = (phys_start as usize) / PAGE_SIZE;
+            let count = (size_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+            for i in 0..count {
+                alloc.mark_frame_used(start_frame + i);
+            }
+            crate::log_info!(
+                "PMM",
+                "Reserved physical range {:#010x}..{:#010x} ({} MB)",
+                phys_start,
+                phys_start + size_bytes as u64,
+                size_bytes / (1024 * 1024)
+            );
+        }
+    }
+    ALLOCATOR_LOCK.unlock();
+}

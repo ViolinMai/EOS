@@ -131,6 +131,15 @@ def get_project_data(startpath='.'):
     return "\n".join(tree_lines), source_files
 
 
+def should_dump_content(clean_fpath):
+    lower = clean_fpath.lower()
+    if lower.endswith(('.asm', '.s', '.lock', '.tag', '.nsh')):
+        return False
+    if '/vendor/' in f"/{lower}":
+        return False
+    return True
+
+
 def write_full_dump(tree_str, source_files, output_file=DUMP_FILENAME, dump_scope=None):
     norm_scope = None
     if dump_scope:
@@ -144,6 +153,9 @@ def write_full_dump(tree_str, source_files, output_file=DUMP_FILENAME, dump_scop
 
         for fpath in source_files:
             clean_fpath = os.path.normpath(fpath).replace("\\", "/")
+            if not should_dump_content(clean_fpath):
+                continue
+
             dump.write(f"\n{'=' * 80}\n--- FILE: {clean_fpath} ---\n{'=' * 80}\n\n")
 
             if norm_scope and not (clean_fpath + "/").startswith(norm_scope) and not clean_fpath.startswith(norm_scope):

@@ -162,7 +162,26 @@ pub fn vfs_stat(path: &str) -> Result<(u64, u32), &'static str> {
     Err("Not found")
 }
 
+static VFS_GLOBAL_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+fn lock_vfs() {
+    while VFS_GLOBAL_LOCK.compare_exchange_weak(false, true, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+}
+
+fn unlock_vfs() {
+    VFS_GLOBAL_LOCK.store(false, core::sync::atomic::Ordering::Release);
+}
+
 pub fn vfs_read_bytes(path: &str) -> Result<Vec<u8>, &'static str> {
+    lock_vfs();
+    let res = vfs_read_bytes_inner(path);
+    unlock_vfs();
+    res
+}
+
+fn vfs_read_bytes_inner(path: &str) -> Result<Vec<u8>, &'static str> {
     let p = resolve_path(path);
     let clean = p.trim_matches('/');
 

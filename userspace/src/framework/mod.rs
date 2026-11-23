@@ -29,3 +29,11 @@ pub use tools::*;
 pub use animator::*;
 
 pub mod animator;
+pub mod features;
+pub mod portal;
+pub mod svg;
+pub mod icons;
+pub use features::*;
+pub use portal::*;
+pub use svg::*;
+pub use icons::*;

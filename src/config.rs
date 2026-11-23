@@ -7,6 +7,8 @@ pub struct KernelConfig {
     pub log_queue_capacity: usize,
     pub ui_scale: AtomicUsize,
     pub dark_mode: AtomicBool,
+    pub hw_accel_3d: AtomicBool,
+    pub hw_cursor: AtomicBool,
 }
 
 pub static CONFIG: KernelConfig = KernelConfig {
@@ -16,9 +18,13 @@ pub static CONFIG: KernelConfig = KernelConfig {
     log_queue_capacity: 1024,
     ui_scale: AtomicUsize::new(2),
     dark_mode: AtomicBool::new(true),
+    hw_accel_3d: AtomicBool::new(true),
+    hw_cursor: AtomicBool::new(true),
 };
 
 impl KernelConfig {
+    pub fn is_hw_accel_3d(&self) -> bool { self.hw_accel_3d.load(Ordering::Relaxed) }
+    pub fn is_hw_cursor(&self) -> bool { self.hw_cursor.load(Ordering::Relaxed) }
     pub fn is_dark_mode(&self) -> bool { self.dark_mode.load(Ordering::Relaxed) }
     pub fn toggle_dark_mode(&self) {
         let new_val = !self.is_dark_mode();

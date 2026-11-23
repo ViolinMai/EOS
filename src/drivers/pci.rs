@@ -59,6 +59,48 @@ pub unsafe fn pci_read_u16(bus: u8, device: u8, func: u8, offset: u8) -> u16 {
     }
 }
 
+pub unsafe fn pci_read_u8(bus: u8, device: u8, func: u8, offset: u8) -> u8 {
+    let val = unsafe { pci_read_u32(bus, device, func, offset) };
+    ((val >> ((offset & 3) * 8)) & 0xFF) as u8
+}
+
+pub unsafe fn pci_write_u32(bus: u8, device: u8, func: u8, offset: u8, val: u32) {
+    let address = (1u32 << 31)
+        | ((bus as u32) << 16)
+        | ((device as u32) << 11)
+        | ((func as u32) << 8)
+        | ((offset as u32) & 0xFC);
+    unsafe {
+        outl(PCI_CONFIG_ADDRESS, address);
+        outl(PCI_CONFIG_DATA, val);
+    }
+}
+
+pub unsafe fn pci_enable_bus_mastering(bus: u8, device: u8, func: u8) {
+    unsafe {
+        let mut cmd = pci_read_u32(bus, device, func, 0x04);
+        cmd |= (1 << 2) | (1 << 1) | (1 << 0); // Bus Master + Memory + I/O
+        pci_write_u32(bus, device, func, 0x04, cmd);
+    }
+}
+
+pub unsafe fn pci_read_bar(bus: u8, device: u8, func: u8, bar_idx: u8) -> u64 {
+    if bar_idx >= 6 { return 0; }
+    let offset = 0x10 + (bar_idx * 4);
+    let low = unsafe { pci_read_u32(bus, device, func, offset) };
+    if (low & 1) != 0 {
+        return (low & !0x3) as u64;
+    }
+    let bar_type = (low >> 1) & 0x3;
+    let base_low = (low & !0xF) as u64;
+    if bar_type == 2 && bar_idx < 5 {
+        let high = unsafe { pci_read_u32(bus, device, func, offset + 4) } as u64;
+        (high << 32) | base_low
+    } else {
+        base_low
+    }
+}
+
 #[allow(dead_code)]
 pub fn class_name(class: u8, subclass: u8) -> &'static str {
     match (class, subclass) {

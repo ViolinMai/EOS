@@ -104,6 +104,8 @@ pub struct WindowFrame {
     pub is_closed: bool,
     pub is_minimized: bool,
     pub is_maximized: bool,
+    pub is_fullscreen: bool,
+    pub always_on_top: bool,
     pub tile_state: WindowTileState,
     pub is_dragging: bool,
     pub drag_offset_x: i32,
@@ -134,6 +136,8 @@ impl WindowFrame {
             is_closed: false,
             is_minimized: false,
             is_maximized: false,
+            is_fullscreen: false,
+            always_on_top: false,
             tile_state: WindowTileState::None,
             is_dragging: false,
             drag_offset_x: 0,
@@ -153,17 +157,27 @@ impl WindowFrame {
     }
 
     fn relayout_content(&mut self) {
-        let tbh = self.title_bar_height();
-        let border = 1;
-        self.content.layout(
-            self.bounds.x + border,
-            self.bounds.y + tbh,
-            (self.bounds.w - (border * 2)).max(10),
-            (self.bounds.h - tbh - border).max(10),
-        );
+        if self.is_fullscreen {
+            self.content.layout(
+                self.bounds.x,
+                self.bounds.y,
+                self.bounds.w.max(10),
+                self.bounds.h.max(10),
+            );
+        } else {
+            let tbh = self.title_bar_height();
+            let border = 1;
+            self.content.layout(
+                self.bounds.x + border,
+                self.bounds.y + tbh,
+                (self.bounds.w - (border * 2)).max(10),
+                (self.bounds.h - tbh - border).max(10),
+            );
+        }
     }
 
     pub fn toggle_maximize(&mut self, work_area: &Rect) {
+        self.is_fullscreen = false;
         if self.is_maximized {
             self.layout(self.prev_bounds.x, self.prev_bounds.y, self.prev_bounds.w, self.prev_bounds.h);
             self.is_maximized = false;
@@ -173,6 +187,20 @@ impl WindowFrame {
             self.layout(work_area.x, work_area.y, work_area.w, work_area.h);
             self.is_maximized = true;
             self.tile_state = WindowTileState::None;
+        }
+    }
+
+    pub fn toggle_fullscreen(&mut self, screen_rect: &Rect) {
+        if self.is_fullscreen {
+            self.is_fullscreen = false;
+            self.layout(self.prev_bounds.x, self.prev_bounds.y, self.prev_bounds.w, self.prev_bounds.h);
+        } else {
+            if !self.is_maximized {
+                self.prev_bounds = self.bounds;
+            }
+            self.is_fullscreen = true;
+            self.bounds = *screen_rect;
+            self.relayout_content();
         }
     }
 
@@ -203,6 +231,10 @@ impl Widget for WindowFrame {
 
     fn paint(&self, canvas: &mut Canvas) {
         if self.is_closed || self.is_minimized { return; }
+        if self.is_fullscreen {
+            self.content.paint(canvas);
+            return;
+        }
         unsafe {
             if !WIN7_CHROME_AUDIT_EMITTED {
                 WIN7_CHROME_AUDIT_EMITTED = true;
@@ -212,18 +244,19 @@ impl Widget for WindowFrame {
 
         let theme = get_theme();
         let tbh = self.title_bar_height();
+        let r_win = if self.is_maximized { 0 } else { theme.r_win() };
 
-        // 1. Windows 7 Outer Aero Glow + Inner White Frost Border Highlight
-        let outer_border = if self.is_active { theme.border_window } else { 0xFF334155 };
-        canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, outer_border, theme.pt(6.0) as usize);
-        canvas.draw_rect_outline(self.bounds.x + 1, self.bounds.y + 1, self.bounds.w - 2, self.bounds.h - 2, theme.border_frost_highlight, theme.pt(5.0) as usize);
-
-        // 2. Translucent Aero Glass Titlebar + Glass Reflection Stripes
+        // 1. Soft Rounded Window Body Backdrop + Aero Glass Titlebar
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, r_win);
         let tb_bg = if self.is_active { theme.bg_titlebar } else { theme.bg_titlebar_inactive };
-        canvas.draw_frosted_glass_rect(self.bounds.x + 1, self.bounds.y + 1, self.bounds.w - 2, tbh - 1, tb_bg, theme.pt(5.0) as usize);
-        // Upper glossy reflection stripe
-        canvas.draw_rect(self.bounds.x + 2, self.bounds.y + 2, self.bounds.w - 4, tbh / 3, 0x33FFFFFF, theme.pt(4.0) as usize);
+        canvas.draw_frosted_glass_rect(self.bounds.x + 1, self.bounds.y + 1, self.bounds.w - 2, tbh - 1, tb_bg, r_win.saturating_sub(1));
+        canvas.draw_rect(self.bounds.x + 2, self.bounds.y + 2, self.bounds.w - 4, tbh / 3, 0x2AFFFFFF, r_win.saturating_sub(2));
         canvas.draw_line_h(self.bounds.x + 1, self.bounds.y + tbh - 1, self.bounds.w - 2, theme.border_frost_highlight);
+
+        // Smooth Anti-Aliased Rounded Outer Glow & Inner Frost Border
+        let outer_border = if self.is_active { theme.border_window } else { 0xFF334155 };
+        canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, outer_border, r_win);
+        canvas.draw_rect_outline(self.bounds.x + 1, self.bounds.y + 1, self.bounds.w - 2, self.bounds.h - 2, theme.border_frost_highlight, r_win.saturating_sub(1));
 
         // 3. Window Title with subtle text glow
         let txt_c = if self.is_active { theme.text_primary } else { theme.text_muted };
@@ -245,10 +278,20 @@ impl Widget for WindowFrame {
         canvas.draw_rect(min_x, grp_y, cluster_w, grp_h, 0x550F172A, 3);
         canvas.draw_rect_outline(min_x, grp_y, cluster_w, grp_h, 0x99E0F2FE, 3);
 
-        // Minimize button `_`
+        let sym_sz = theme.pt(9.0).max(8);
+        let stroke = theme.pt(1.5).max(2);
+
+        // Minimize button `_` (موسّط ومتناسب مع 2x)
         let min_bg = if self.hover_btn == Some(2) { 0xAA38BDF8 } else { 0x331E3A8A };
         canvas.draw_rect(min_x + 1, grp_y + 1, std_btn_w - 1, grp_h - 2, min_bg, 2);
-        canvas.draw_rect(min_x + (std_btn_w - 10) / 2, grp_y + grp_h - 7, 10, 2, 0xFFFFFFFF, 0);
+        canvas.draw_rect(
+            min_x + (std_btn_w - sym_sz) / 2,
+            grp_y + (grp_h + sym_sz / 2) / 2 - stroke,
+            sym_sz,
+            stroke,
+            0xFFFFFFFF,
+            0,
+        );
 
         // Divider
         canvas.draw_line_v(max_x, grp_y + 1, grp_h - 2, 0x77E0F2FE);
@@ -256,8 +299,10 @@ impl Widget for WindowFrame {
         // Maximize / Restore button `□`
         let max_bg = if self.hover_btn == Some(1) { 0xAA38BDF8 } else { 0x331E3A8A };
         canvas.draw_rect(max_x + 1, grp_y + 1, std_btn_w - 1, grp_h - 2, max_bg, 0);
-        canvas.draw_rect_outline(max_x + (std_btn_w - 10) / 2, grp_y + (grp_h - 10) / 2, 10, 10, 0xFFFFFFFF, 1);
-        canvas.draw_line_h(max_x + (std_btn_w - 10) / 2, grp_y + (grp_h - 10) / 2 + 1, 10, 0xFFFFFFFF);
+        let mx_bx = max_x + (std_btn_w - sym_sz) / 2;
+        let mx_by = grp_y + (grp_h - sym_sz) / 2;
+        canvas.draw_rect_outline(mx_bx, mx_by, sym_sz, sym_sz, 0xFFFFFFFF, 0);
+        canvas.draw_rect(mx_bx, mx_by, sym_sz, stroke, 0xFFFFFFFF, 0);
 
         // Divider
         canvas.draw_line_v(close_x, grp_y + 1, grp_h - 2, 0x77E0F2FE);
@@ -266,7 +311,15 @@ impl Widget for WindowFrame {
         let close_bg = if self.hover_btn == Some(0) { theme.btn_close_glow } else { theme.btn_close };
         canvas.draw_rect(close_x + 1, grp_y + 1, close_w - 2, grp_h - 2, close_bg, 2);
         canvas.draw_rect(close_x + 2, grp_y + 2, close_w - 4, (grp_h - 4) / 2, 0x44FFFFFF, 1);
-        draw_vector_icon(canvas, "close", close_x + (close_w - 12) / 2, grp_y + (grp_h - 12) / 2, 12, 12, Some(0xFFFFFFFF));
+        draw_vector_icon(
+            canvas,
+            "close",
+            close_x + (close_w - sym_sz) / 2,
+            grp_y + (grp_h - sym_sz) / 2,
+            sym_sz,
+            sym_sz,
+            Some(0xFFFFFFFF),
+        );
 
         // 5. Inner Window Content
         canvas.push_clip(Rect::new(self.bounds.x + 2, self.bounds.y + tbh, self.bounds.w - 4, self.bounds.h - tbh - 2));
@@ -276,6 +329,9 @@ impl Widget for WindowFrame {
 
     fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
         if self.is_closed || self.is_minimized { return false; }
+        if self.is_fullscreen {
+            return self.content.handle_mouse(mx, my, pressed);
+        }
         let theme = get_theme();
         let tbh = self.title_bar_height();
         let close_w = theme.pt(44.0);
@@ -294,7 +350,7 @@ impl Widget for WindowFrame {
             } else if mx >= max_x && mx < close_x {
                 self.hover_btn = Some(1); // Maximize
                 if pressed {
-                    let work = Rect::new(0, 0, 1920, 1080 - theme.pt(40.0));
+                    let work = Rect::new(0, 0, 2560, 1440 - theme.pt(40.0));
                     self.toggle_maximize(&work);
                 }
                 return true;

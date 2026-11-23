@@ -4,3 +4,5 @@ pub mod gamepad;
 pub mod mouse;
 pub mod pci;
 pub mod rtc;
+pub mod virtio_gpu;
+pub mod ac97;

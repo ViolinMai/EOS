@@ -413,3 +413,131 @@ impl Widget for ScrollViewWidget {
         self.child.handle_char(c)
     }
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageFitMode {
+    /// يحافظ على نسبة العرض للارتفاع كاملة داخل الإطار بدون قص أو مط
+    Contain,
+    /// يملأ الإطار بالكامل مع قص الأطراف الزائدة دون تشويه الأبعاد
+    Cover,
+}
+
+/// عنصر عرض صور معياري في الـ Framework مع الحفاظ الصحيح على نسبة الأبعاد (Upstream ImageWidget)
+#[derive(Clone)]
+pub struct ImageWidget {
+    pub bounds: Rect,
+    pub pixels: Vec<u32>,
+    pub img_w: usize,
+    pub img_h: usize,
+    pub fit: ImageFitMode,
+}
+
+impl ImageWidget {
+    pub fn new(pixels: Vec<u32>, img_w: usize, img_h: usize) -> Self {
+        Self { bounds: Rect::default(), pixels, img_w, img_h, fit: ImageFitMode::Contain }
+    }
+
+    pub fn new_cover(pixels: Vec<u32>, img_w: usize, img_h: usize) -> Self {
+        Self { bounds: Rect::default(), pixels, img_w, img_h, fit: ImageFitMode::Cover }
+    }
+}
+
+impl Widget for ImageWidget {
+    fn as_any(&self) -> &dyn Any { self }
+    fn as_any_mut(&mut self) -> &mut dyn Any { self }
+    fn layout(&mut self, x: i32, y: i32, w: i32, h: i32) -> Rect {
+        self.bounds = Rect::new(x, y, w, h);
+        self.bounds
+    }
+    fn paint(&self, canvas: &mut Canvas) {
+        if self.img_w == 0 || self.img_h == 0 || self.pixels.is_empty() || self.bounds.w <= 0 || self.bounds.h <= 0 {
+            return;
+        }
+        let clip = canvas.current_clip();
+        let bw = self.bounds.w as f32;
+        let bh = self.bounds.h as f32;
+        let iw = self.img_w as f32;
+        let ih = self.img_h as f32;
+
+        let (draw_x, draw_y, draw_w, draw_h, src_x0, src_y0, src_w, src_h) = match self.fit {
+            ImageFitMode::Contain => {
+                let scale = (bw / iw).min(bh / ih);
+                let dw = (iw * scale).round().max(1.0) as i32;
+                let dh = (ih * scale).round().max(1.0) as i32;
+                let dx = self.bounds.x + (self.bounds.w - dw) / 2;
+                let dy = self.bounds.y + (self.bounds.h - dh) / 2;
+                (dx, dy, dw, dh, 0.0f32, 0.0f32, iw, ih)
+            }
+            ImageFitMode::Cover => {
+                let scale = (bw / iw).max(bh / ih);
+                let crop_w = (bw / scale).min(iw);
+                let crop_h = (bh / scale).min(ih);
+                let sx0 = (iw - crop_w) * 0.5;
+                let sy0 = (ih - crop_h) * 0.5;
+                (self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, sx0, sy0, crop_w, crop_h)
+            }
+        };
+
+        let target_rect = Rect::new(draw_x, draw_y, draw_w, draw_h).intersect(&clip);
+        if target_rect.w <= 0 || target_rect.h <= 0 { return; }
+
+        let x1 = target_rect.x.max(0);
+        let y1 = target_rect.y.max(0);
+        let x2 = (target_rect.x + target_rect.w).min(canvas.width as i32);
+        let y2 = (target_rect.y + target_rect.h).min(canvas.height as i32);
+
+        for py in y1..y2 {
+            let v = (py - draw_y) as f32 / (draw_h.max(1) as f32);
+            let sy = (src_y0 + v * src_h) as usize;
+            let src_row = sy.min(self.img_h - 1) * self.img_w;
+            let dst_row = (py as usize) * canvas.width;
+            for px in x1..x2 {
+                let u = (px - draw_x) as f32 / (draw_w.max(1) as f32);
+                let sx = (src_x0 + u * src_w) as usize;
+                let fg = self.pixels[src_row + sx.min(self.img_w - 1)];
+                let a = (fg >> 24) & 0xFF;
+                let idx = dst_row + (px as usize);
+                if a == 255 {
+                    canvas.buffer[idx] = fg;
+                } else if a > 0 {
+                    let bg = canvas.buffer[idx];
+                    let inv = 255 - a;
+                    let rb = (((fg & 0x00FF00FF) * a + (bg & 0x00FF00FF) * inv + 0x00800080) >> 8) & 0x00FF00FF;
+                    let g = (((fg & 0x0000FF00) * a + (bg & 0x0000FF00) * inv + 0x00008000) >> 8) & 0x0000FF00;
+                    canvas.buffer[idx] = 0xFF000000 | rb | g;
+                }
+            }
+        }
+    }
+}
+
+/// شريط تمرير ناعم بأنميشن وتوسّع عند التمرير (Upstream SmoothScrollBar)
+pub struct SmoothScrollBar {
+    pub value: f32,
+    pub target: f32,
+    pub hovered: bool,
+}
+
+impl SmoothScrollBar {
+    pub fn new() -> Self { Self { value: 0.0, target: 0.0, hovered: false } }
+    pub fn scroll_by(&mut self, delta: f32) { self.target = (self.target + delta).clamp(0.0, 1.0); }
+    pub fn tick(&mut self) -> bool {
+        let diff = self.target - self.value;
+        if diff.abs() > 0.002 {
+            self.value += diff * 0.22;
+            true
+        } else {
+            self.value = self.target;
+            false
+        }
+    }
+    pub fn paint(&self, canvas: &mut Canvas, x: i32, y: i32, h: i32) {
+        let theme = get_theme();
+        let w = if self.hovered { theme.pt(10.0) } else { theme.pt(6.0) };
+        let thumb_h = (h / 4).max(theme.pt(24.0));
+        let thumb_y = y + ((h - thumb_h) as f32 * self.value) as i32;
+        canvas.draw_rect(x, y, w, h, 0x331E293B, (w / 2) as usize);
+        let col = if self.hovered { theme.accent_hover } else { theme.accent };
+        canvas.draw_rect(x, thumb_y, w, thumb_h, col, (w / 2) as usize);
+    }
+}

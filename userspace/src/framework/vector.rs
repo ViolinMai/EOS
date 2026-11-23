@@ -138,6 +138,7 @@ impl VectorGraphic {
 
 pub struct VectorStore {
     cache: HashMap<String, VectorGraphic>,
+    missing: std::collections::HashSet<String>,
 }
 
 pub static mut VECTOR_STORE: Option<VectorStore> = None;
@@ -146,7 +147,10 @@ impl VectorStore {
     pub fn instance() -> &'static mut Self {
         unsafe {
             if VECTOR_STORE.is_none() {
-                let mut vs = VectorStore { cache: HashMap::new() };
+                let mut vs = VectorStore {
+                    cache: HashMap::new(),
+                    missing: std::collections::HashSet::new(),
+                };
                 vs.init_builtins();
                 VECTOR_STORE = Some(vs);
             }
@@ -273,18 +277,15 @@ impl VectorStore {
     }
 
     pub fn register_and_persist(&mut self, graphic: VectorGraphic) {
-        let name = graphic.name.clone();
-        let bytes = graphic.to_bytes();
-        self.cache.insert(name.clone(), graphic);
-
-        let ext2_path = format!("RootFS/icons/{}.vec", name);
-        let _ = fs::create_dir_all("RootFS/icons");
-        let _ = fs::write(&ext2_path, &bytes);
+        self.cache.insert(graphic.name.clone(), graphic);
     }
 
     pub fn get(&mut self, name: &str) -> Option<&VectorGraphic> {
         if self.cache.contains_key(name) {
             return self.cache.get(name);
+        }
+        if self.missing.contains(name) {
+            return None;
         }
 
         let ext2_path = format!("RootFS/icons/{}.vec", name);
@@ -294,6 +295,7 @@ impl VectorStore {
                 return self.cache.get(name);
             }
         }
+        self.missing.insert(name.to_string());
         None
     }
 }

@@ -90,10 +90,12 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
+    let heap_bytes = config::CONFIG.default_heap_size_mb * 1024 * 1024;
+    mm::frame::reserve_physical_range(0x10000000, heap_bytes);
     unsafe {
         mm::heap::HEAP_ALLOCATOR.init(
             (0x10000000 + hhdm_offset) as *mut u8,
-            config::CONFIG.default_heap_size_mb * 1024 * 1024
+            heap_bytes
         );
     }
 
@@ -110,6 +112,8 @@ pub extern "C" fn _start() -> ! {
     }
 
     drivers::pci::init();
+    drivers::virtio_gpu::init();
+    drivers::ac97::init();
     drivers::e1000::init();
     net::init();
 
@@ -125,6 +129,9 @@ pub extern "C" fn _start() -> ! {
 
     config::CONFIG.load_from_disk();
     task::init();
+    task::register_proc(0, 0, "eos_kernel", 0);
+    task::register_proc(1, 0, "virtio_gpu", (2560 * 1440 * 4 * 2) as u64);
+    task::register_proc(2, 0, "e1000_net", 256 * 1024);
 
     // تحديث النقطة الثالثة لمؤشر الإقلاع
     unsafe {

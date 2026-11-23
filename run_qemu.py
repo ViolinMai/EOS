@@ -335,7 +335,7 @@ def prepare_and_run(cli_args=None):
     parser = argparse.ArgumentParser(description="EOS Builder & QEMU Runner")
     parser.add_argument("--build-only", action="store_true", help="Build kernel and disk images without launching QEMU")
     parser.add_argument("--skip-build", action="store_true", help="Launch QEMU using existing disk images without rebuilding")
-    parser.add_argument("--mem", type=str, default="1536M", help="Guest RAM allocation for QEMU (default: 1536M)")
+    parser.add_argument("--mem", type=str, default="4096M", help="Guest RAM allocation for QEMU (default: 4096M)")
     parser.add_argument("--qmp", type=str, default=None, help="QMP socket path or tcp spec (e.g. tcp:127.0.0.1:4445,server,nowait)")
     parser.add_argument("--serial-file", type=str, default=None, help="Redirect serial output to file instead of stdio")
     parser.add_argument("--headless", action="store_true", help="Run QEMU with -display none")
@@ -498,14 +498,16 @@ def prepare_and_run(cli_args=None):
     if args.qmp:
         extra_qemu_args += ["-qmp", args.qmp]
     if args.headless:
-        extra_qemu_args += ["-display", "none"]
+        extra_qemu_args += ["-vga", "none", "-device", "virtio-gpu-pci,xres=2560,yres=1440", "-audiodev", "none,id=snd0", "-device", "AC97,audiodev=snd0", "-display", "none"]
+    elif os.name != "nt":
+        extra_qemu_args += ["-vga", "none", "-device", "virtio-gpu-gl-pci,xres=2560,yres=1440", "-audiodev", "sdl,id=snd0", "-device", "AC97,audiodev=snd0", "-display", "sdl,gl=on"]
 
     accel_args = ["-accel", "tcg,thread=multi"]
     if os.name != "nt" and os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK):
         accel_args = ["-accel", "kvm", "-accel", "tcg,thread=multi"]
 
     qemu_cmd = [
-        QEMU_EXE, "-M", "q35", "-m", args.mem, "-smp", "5",
+        QEMU_EXE, "-M", "q35", "-m", args.mem, "-smp", "8",
     ] + accel_args + [
         "-drive", f"if=pflash,format=raw,readonly=on,file={code_fd}",
     ] + pflash_vars_args + [

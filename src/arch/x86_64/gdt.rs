@@ -69,16 +69,18 @@ struct GdtDescriptor {
     base: u64,
 }
 
+const KERNEL_STACK_SIZE: usize = 65536;
+
 #[derive(Copy, Clone)]
 #[repr(align(16))]
 struct CoreStacks {
-    emergency: [u8; 8192],
-    syscall: [u8; 8192],
+    emergency: [u8; KERNEL_STACK_SIZE],
+    syscall: [u8; KERNEL_STACK_SIZE],
 }
 
 static mut GDTS: [Gdt; MAX_CORES] = [Gdt { entries: [0; 8] }; MAX_CORES];
 static mut TSSES: [TaskStateSegment; MAX_CORES] = [TaskStateSegment::zeroed(); MAX_CORES];
-static mut STACKS: [CoreStacks; MAX_CORES] = [CoreStacks { emergency: [0; 8192], syscall: [0; 8192] }; MAX_CORES];
+static mut STACKS: [CoreStacks; MAX_CORES] = [CoreStacks { emergency: [0; KERNEL_STACK_SIZE], syscall: [0; KERNEL_STACK_SIZE] }; MAX_CORES];
 
 pub fn init_core(core_id: usize) {
     if core_id >= MAX_CORES {
@@ -89,8 +91,8 @@ pub fn init_core(core_id: usize) {
         let tss = &mut (*addr_of_mut!(TSSES))[core_id];
         let st = &mut (*addr_of_mut!(STACKS))[core_id];
 
-        let stack_top = st.emergency.as_ptr() as u64 + 8192;
-        let syscall_stack_top = st.syscall.as_ptr() as u64 + 8192;
+        let stack_top = st.emergency.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
+        let syscall_stack_top = st.syscall.as_ptr() as u64 + KERNEL_STACK_SIZE as u64;
 
         tss.ist1 = stack_top;
         tss.rsp0 = syscall_stack_top;

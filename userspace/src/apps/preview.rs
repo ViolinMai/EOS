@@ -52,21 +52,13 @@ impl PreviewApp {
         let total_bytes = data.len();
         self.status = format!("Decoding image ({} KB)...", total_bytes / 1024);
 
-        // 1. فك تشفير PNG
-        if data.len() >= 8 && &data[0..8] == &[0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A] {
-            match crate::png::decode_png(&data) {
-                Ok((px, w, h)) => {
-                    self.pixels = px;
-                    self.img_w = w;
-                    self.img_h = h;
-                    self.status = format!("PNG ({}x{} px | {} KB)", w, h, total_bytes / 1024);
-                    return;
-                }
-                Err(e) => {
-                    self.status = format!("PNG Decode Error: {}", e);
-                    return;
-                }
-            }
+        // 1. فك التشفير الموحد عبر Syscall 510 (يدعم PNG و JPEG)
+        if let Ok((px, w, h, backend)) = crate::sdk::media::decode_image(&data) {
+            self.pixels = px;
+            self.img_w = w;
+            self.img_h = h;
+            self.status = format!("{} ({}x{} px | {} KB)", backend, w, h, total_bytes / 1024);
+            return;
         }
 
         // 2. فك تشفير JPEG عبر zune-jpeg مباشرة في مساحة الـ Userspace

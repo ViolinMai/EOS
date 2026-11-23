@@ -1,10 +1,13 @@
 {
   "modified": [
+    "userspace/src/framework/features.rs",
+    "userspace/src/framework/theme.rs",
     "userspace/src/framework/canvas.rs",
-    "src/arch/x86_64/syscall.rs",
-    "run_qemu.py",
-    "setup_test_subject.py",
-    "test_eos_audit.py"
+    "userspace/src/framework/menu.rs",
+    "userspace/src/apps/settings.rs",
+    "userspace/src/apps/finder.rs",
+    "userspace/src/main.rs",
+    "userspace/src/framework/app.rs"
   ],
   "created": []
 }

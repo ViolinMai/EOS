@@ -7,6 +7,8 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_PRESENT: u64 = 1 << 0;
 pub const PAGE_WRITABLE: u64 = 1 << 1;
 pub const PAGE_USER: u64 = 1 << 2;
+pub const PAGE_CACHE_DISABLE: u64 = 1 << 4;
+pub const PAGE_HUGE: u64 = 1 << 7;
 #[allow(dead_code)]
 pub const PAGE_NO_EXECUTE: u64 = 1 << 63;
 const PHYSICAL_ADDRESS_MASK: u64 = 0x000F_FFFF_FFFF_F000;
@@ -143,6 +145,54 @@ pub fn read_cr3() -> u64 {
 #[inline]
 pub unsafe fn invalidate_tlb(virt_addr: u64) {
     unsafe { asm!("invlpg [{}]", in(reg) virt_addr, options(nostack, preserves_flags)); }
+}
+
+pub fn map_mmio_pages(phys_addr: u64, pages: usize) -> Result<u64, &'static str> {
+    let vmm = unsafe { (*addr_of!(VMM)).ok_or("VMM not initialized")? };
+    let pml4_phys = read_cr3() & PHYSICAL_ADDRESS_MASK;
+    let pml4 = unsafe { &mut *((pml4_phys + vmm.hhdm_offset) as *mut PageTable) };
+    let table_flags = PAGE_PRESENT | PAGE_WRITABLE;
+    let mmio_flags = PAGE_PRESENT | PAGE_WRITABLE | PAGE_CACHE_DISABLE;
+
+    let base_phys = phys_addr & !0xFFF;
+    for i in 0..pages {
+        let curr_phys = base_phys + (i as u64 * 4096);
+        let curr_vaddr = curr_phys + vmm.hhdm_offset;
+
+        let p4_idx = ((curr_vaddr >> 39) & 0x1FF) as usize;
+        let p3_idx = ((curr_vaddr >> 30) & 0x1FF) as usize;
+        let p2_idx = ((curr_vaddr >> 21) & 0x1FF) as usize;
+        let p1_idx = ((curr_vaddr >> 12) & 0x1FF) as usize;
+
+        if !pml4.entries[p4_idx].is_present() {
+            let f = crate::mm::frame::allocate_frame_safe().ok_or("OOM: MMIO PT4")?;
+            unsafe { core::ptr::write_bytes((f + vmm.hhdm_offset) as *mut u8, 0, 4096); }
+            pml4.entries[p4_idx].set(f, table_flags);
+        }
+        let pt4 = unsafe { &mut *((pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
+
+        if !pt4.entries[p3_idx].is_present() {
+            let f = crate::mm::frame::allocate_frame_safe().ok_or("OOM: MMIO PT3")?;
+            unsafe { core::ptr::write_bytes((f + vmm.hhdm_offset) as *mut u8, 0, 4096); }
+            pt4.entries[p3_idx].set(f, table_flags);
+        } else if (pt4.entries[p3_idx].0 & PAGE_HUGE) != 0 {
+            continue;
+        }
+        let pt3 = unsafe { &mut *((pt4.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
+
+        if !pt3.entries[p2_idx].is_present() {
+            let f = crate::mm::frame::allocate_frame_safe().ok_or("OOM: MMIO PT2")?;
+            unsafe { core::ptr::write_bytes((f + vmm.hhdm_offset) as *mut u8, 0, 4096); }
+            pt3.entries[p2_idx].set(f, table_flags);
+        } else if (pt3.entries[p2_idx].0 & PAGE_HUGE) != 0 {
+            continue;
+        }
+        let pt2 = unsafe { &mut *((pt3.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
+
+        pt2.entries[p1_idx].set(curr_phys, mmio_flags);
+        unsafe { invalidate_tlb(curr_vaddr); }
+    }
+    Ok(phys_addr + vmm.hhdm_offset)
 }
 
 pub fn is_user_mapped(pml4_phys: u64, virt_addr: u64) -> bool {
