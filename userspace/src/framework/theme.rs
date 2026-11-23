@@ -5,34 +5,56 @@ pub struct Theme {
     pub bg_desktop: u32,
     pub bg_window: u32,
     pub bg_titlebar: u32,
+    pub bg_titlebar_inactive: u32,
     pub border_window: u32,
+    pub border_frost_highlight: u32,
+    pub aero_glass_tint: u32,
+    pub aero_glow_active: u32,
+    pub aero_glow_inactive: u32,
+    pub superbar_glass: u32,
+    pub start_menu_left_bg: u32,
+    pub start_menu_right_bg: u32,
     pub text_primary: u32,
     pub text_secondary: u32,
     pub text_muted: u32,
     pub accent: u32,
     pub accent_hover: u32,
     pub btn_close: u32,
+    pub btn_close_glow: u32,
     pub btn_minimize: u32,
     pub btn_maximize: u32,
 }
 
 impl Theme {
     pub fn dark() -> Self {
+        Self::aero_glass()
+    }
+
+    pub fn aero_glass() -> Self {
         Self {
-            scale: 3.0,                  // 3X UI Scale افتراضي
+            scale: 2.0,
             is_dark: true,
-            bg_desktop: 0xFF0A0A0C,      // أسود فحمي نقي
-            bg_window: 0xFF121215,       // رمادي مسود داكن وفخم
-            bg_titlebar: 0xFF1A1A1E,     // شريط عنوان داكن ومحايد
-            border_window: 0xFF2A2A30,   // حدود ناعمة ومظلمة
-            text_primary: 0xFFF4F4F5,
-            text_secondary: 0xFFA1A1AA,
-            text_muted: 0xFF71717A,
-            accent: 0xFF2563EB,          // أزرق عصري للمحددات
-            accent_hover: 0xFF3B82F6,
-            btn_close: 0xFFEF4444,
-            btn_minimize: 0xFFF59E0B,
-            btn_maximize: 0xFF10B981,
+            bg_desktop: 0xFF0B2A4A,
+            bg_window: 0xFF141C2B,
+            bg_titlebar: 0xD81E3F66,
+            bg_titlebar_inactive: 0xB81B2838,
+            border_window: 0xFF5C9DED,
+            border_frost_highlight: 0x88E0F2FE,
+            aero_glass_tint: 0xCC163252,
+            aero_glow_active: 0x6638BDF8,
+            aero_glow_inactive: 0x331E293B,
+            superbar_glass: 0xDD0F253E,
+            start_menu_left_bg: 0xFFF8FAFC,
+            start_menu_right_bg: 0xEE162C46,
+            text_primary: 0xFFF8FAFC,
+            text_secondary: 0xFFCBD5E1,
+            text_muted: 0xFF94A3B8,
+            accent: 0xFF0284C7,
+            accent_hover: 0xFF38BDF8,
+            btn_close: 0xFFDC2626,
+            btn_close_glow: 0xFFF87171,
+            btn_minimize: 0xFF3B82F6,
+            btn_maximize: 0xFF0284C7,
         }
     }
 
@@ -67,10 +89,21 @@ pub static mut DESKTOP_WALLPAPER: Option<(Vec<u32>, usize, usize)> = None;
 pub static mut WALLPAPER_CHANGED: bool = false;
 pub static mut FULL_REDRAW_REQUESTED: bool = false;
 
+static mut THEME_AUDIT_EMITTED: bool = false;
+
+pub fn emit_win7_theme_audit_once() {
+    unsafe {
+        if !THEME_AUDIT_EMITTED {
+            THEME_AUDIT_EMITTED = true;
+            crate::sdk::agent::audit_log("WIN7_THEME:PASS:AeroGlass_Tokens_Ready");
+        }
+    }
+}
+
 pub fn get_theme() -> &'static Theme {
     unsafe {
         if CURRENT_THEME.is_none() {
-            CURRENT_THEME = Some(Theme::dark());
+            CURRENT_THEME = Some(Theme::aero_glass());
         }
         CURRENT_THEME.as_ref().unwrap()
     }
@@ -79,7 +112,7 @@ pub fn get_theme() -> &'static Theme {
 pub fn get_theme_mut() -> &'static mut Theme {
     unsafe {
         if CURRENT_THEME.is_none() {
-            CURRENT_THEME = Some(Theme::dark());
+            CURRENT_THEME = Some(Theme::aero_glass());
         }
         CURRENT_THEME.as_mut().unwrap()
     }

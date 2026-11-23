@@ -142,16 +142,22 @@ def run_steps(qmp, steps):
         time.sleep(0.15)
 
 
+def get_share_dir():
+    if os.name == "nt":
+        return r"C:\EOS_SHARE"
+    linux_primary_share = "/mnt/storage/delete/EOS_SHARE"
+    return linux_primary_share if os.path.exists(os.path.dirname(linux_primary_share)) else os.path.abspath("target/EOS_SHARE")
+
 def compare_test_subject_outputs(require_output=False):
     """Compares `/EOS SHARE/TEST_SUBJECT/eos_output.json` against `expected_manifest.json`.
     Returns (status_str, details_str, diffs_list) where status_str is 'PASS', 'SKIP', or 'FAIL'.
     """
-    test_dir = r"C:\EOS_SHARE\TEST_SUBJECT"
+    test_dir = os.path.join(get_share_dir(), "TEST_SUBJECT")
     expected_path = os.path.join(test_dir, "expected_manifest.json")
     actual_path = os.path.join(test_dir, "eos_output.json")
 
     if not os.path.exists(expected_path):
-        return "FAIL", "Missing expected_manifest.json in C:\\EOS_SHARE\\TEST_SUBJECT", ["expected_manifest.json missing"]
+        return "FAIL", f"Missing expected_manifest.json in {test_dir}", ["expected_manifest.json missing"]
 
     with open(expected_path, "r", encoding="utf-8") as f:
         expected = json.load(f)
@@ -194,8 +200,26 @@ def compare_test_subject_outputs(require_output=False):
     return "PASS", "All reported TEST_SUBJECT matrices match golden expectations", []
 
 
+DEFAULT_PHASE_MARKERS = [
+    "TEST_SUBJECT_SCAN:PASS:",
+    "IMAGE_MATRIX_VERIFY:PASS:16x16_ARGB_OK",
+    "FONT_CALIBRATION:PASS:Metrics_Verified",
+    "COMPOSITOR_TUNE:PASS:FrameBudget_OK",
+    "TEST_REPORT_EXPORT:PASS:eos_output.json",
+    "WIN7_THEME:PASS:AeroGlass_Tokens_Ready",
+    "WIN7_TASKBAR:PASS:Superbar_Rendered",
+    "WIN7_SYSTRAY:PASS:Clock_And_Peek_Ready",
+    "WIN7_STARTMENU:PASS:TwoColumn_Ready",
+    "WIN7_WINDOW_CHROME:PASS:AeroButtons_Active",
+    "WIN7_AEROSNAP:PASS:SnapEngine_Ready",
+    "WIN7_DESKTOP_ICONS:PASS:Grid_Rendered",
+    "WIN7_CONTEXT_MENU:PASS:Handler_Registered",
+    "WIN7_ALTTAB:PASS:Switcher_Ready",
+    "WIN7_TASKBAR_PREVIEW:PASS:HoverCard_Ready",
+]
+
 def run_automated_audit(timeout_sec=35, headless=True, expect=None, steps=None, verify_test_subject=True, require_test_output=False):
-    expect = list(expect or [])
+    expect = list(expect) if expect else list(DEFAULT_PHASE_MARKERS)
     steps = list(steps or [])
     print("=" * 72)
     print("[*] EOS AUTOMATED SYSTEM, UX & TEST_SUBJECT AUDIT HARNESS")

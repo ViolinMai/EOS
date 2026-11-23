@@ -1,6 +1,10 @@
 {
   "modified": [
-    "updateMAX.py"
+    "userspace/src/framework/canvas.rs",
+    "src/arch/x86_64/syscall.rs",
+    "run_qemu.py",
+    "setup_test_subject.py",
+    "test_eos_audit.py"
   ],
   "created": []
 }

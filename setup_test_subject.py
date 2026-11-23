@@ -5,7 +5,13 @@ import struct
 import wave
 import math
 
-SHARE_DIR = r"C:\EOS_SHARE"
+def get_share_dir():
+    if os.name == "nt":
+        return r"C:\EOS_SHARE"
+    linux_primary_share = "/mnt/storage/delete/EOS_SHARE"
+    return linux_primary_share if os.path.exists(os.path.dirname(linux_primary_share)) else os.path.abspath("target/EOS_SHARE")
+
+SHARE_DIR = get_share_dir()
 TEST_SUBJECT_DIR = os.path.join(SHARE_DIR, "TEST_SUBJECT")
 
 

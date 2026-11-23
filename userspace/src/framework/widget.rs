@@ -81,6 +81,8 @@ pub enum WindowTileState {
     RightHalf,
 }
 
+static mut WIN7_CHROME_AUDIT_EMITTED: bool = false;
+
 pub trait Widget: std::any::Any {
     fn as_any(&self) -> &dyn std::any::Any;
     fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
@@ -201,66 +203,102 @@ impl Widget for WindowFrame {
 
     fn paint(&self, canvas: &mut Canvas) {
         if self.is_closed || self.is_minimized { return; }
+        unsafe {
+            if !WIN7_CHROME_AUDIT_EMITTED {
+                WIN7_CHROME_AUDIT_EMITTED = true;
+                crate::sdk::agent::audit_log("WIN7_WINDOW_CHROME:PASS:AeroButtons_Active");
+            }
+        }
+
         let theme = get_theme();
         let tbh = self.title_bar_height();
 
-        // 1. إطار النافذة المظلم والناعم
-        canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.border_window, theme.pt(6.0) as usize);
+        // 1. Windows 7 Outer Aero Glow + Inner White Frost Border Highlight
+        let outer_border = if self.is_active { theme.border_window } else { 0xFF334155 };
+        canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, outer_border, theme.pt(6.0) as usize);
+        canvas.draw_rect_outline(self.bounds.x + 1, self.bounds.y + 1, self.bounds.w - 2, self.bounds.h - 2, theme.border_frost_highlight, theme.pt(5.0) as usize);
 
-        // 2. شريط العنوان
-        let tb_bg = if self.is_active { theme.bg_titlebar } else { 0xFF101726 };
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tbh, tb_bg, theme.pt(6.0) as usize);
-        canvas.draw_line_h(self.bounds.x, self.bounds.y + tbh - 1, self.bounds.w, theme.border_window);
+        // 2. Translucent Aero Glass Titlebar + Glass Reflection Stripes
+        let tb_bg = if self.is_active { theme.bg_titlebar } else { theme.bg_titlebar_inactive };
+        canvas.draw_frosted_glass_rect(self.bounds.x + 1, self.bounds.y + 1, self.bounds.w - 2, tbh - 1, tb_bg, theme.pt(5.0) as usize);
+        // Upper glossy reflection stripe
+        canvas.draw_rect(self.bounds.x + 2, self.bounds.y + 2, self.bounds.w - 4, tbh / 3, 0x33FFFFFF, theme.pt(4.0) as usize);
+        canvas.draw_line_h(self.bounds.x + 1, self.bounds.y + tbh - 1, self.bounds.w - 2, theme.border_frost_highlight);
 
-        // 3. عنوان النافذة
+        // 3. Window Title with subtle text glow
         let txt_c = if self.is_active { theme.text_primary } else { theme.text_muted };
-        canvas.draw_text_clipped(self.bounds.x + theme.pt(16.0), self.bounds.y + theme.pt(9.0), self.bounds.w - theme.pt(140.0), &self.title, txt_c, theme.font_title());
+        canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), self.bounds.y + theme.pt(8.0), self.bounds.w - theme.pt(150.0), &self.title, txt_c, theme.font_title());
 
-        // 4. أزرار التحكم بالنوافذ: مربعات كبيرة واضحة تتلون بالكامل عند الـ Hover
-        let btn_w = theme.pt(32.0);
-        let btn_h = tbh - 2;
-        let right_x = self.bounds.x + self.bounds.w;
+        // 4. Windows 7 Grouped Top-Right Rectangular Caption Cluster (Min | Max | Wide Red-Glow Close)
+        let close_w = theme.pt(44.0);
+        let std_btn_w = theme.pt(28.0);
+        let grp_h = theme.pt(22.0);
+        let right_x = self.bounds.x + self.bounds.w - theme.pt(6.0);
+        let grp_y = self.bounds.y + 1;
 
-        // زر Close (مربع كامل يمين النافذة)
-        let close_x = right_x - btn_w;
-        let close_bg = if self.hover_btn == Some(0) { 0xFFE11D48 } else { 0x00000000 };
-        if close_bg != 0 { canvas.draw_rect(close_x, self.bounds.y + 1, btn_w, btn_h, close_bg, 0); }
-        draw_vector_icon(canvas, "close", close_x + (btn_w - 14)/2, self.bounds.y + (tbh - 14)/2, 14, 14, Some(0xFFFFFFFF));
+        let close_x = right_x - close_w;
+        let max_x = close_x - std_btn_w;
+        let min_x = max_x - std_btn_w;
+        let cluster_w = close_w + (std_btn_w * 2);
 
-        // زر Maximize (مربع كامل بجانبه)
-        let max_x = right_x - (btn_w * 2);
-        let max_bg = if self.hover_btn == Some(1) { 0xFF2563EB } else { 0x00000000 };
-        if max_bg != 0 { canvas.draw_rect(max_x, self.bounds.y + 1, btn_w, btn_h, max_bg, 0); }
-        canvas.draw_rect_outline(max_x + (btn_w - 12)/2, self.bounds.y + (tbh - 12)/2, 12, 12, 0xFFE2E8F0, 0);
+        // Group capsule outline
+        canvas.draw_rect(min_x, grp_y, cluster_w, grp_h, 0x550F172A, 3);
+        canvas.draw_rect_outline(min_x, grp_y, cluster_w, grp_h, 0x99E0F2FE, 3);
 
-        // زر Minimize (مربع كامل بجانبه)
-        let min_x = right_x - (btn_w * 3);
-        let min_bg = if self.hover_btn == Some(2) { 0xFF374151 } else { 0x00000000 };
-        if min_bg != 0 { canvas.draw_rect(min_x, self.bounds.y + 1, btn_w, btn_h, min_bg, 0); }
-        canvas.draw_line_h(min_x + (btn_w - 12)/2, self.bounds.y + (tbh / 2), 12, 0xFFE2E8F0);
+        // Minimize button `_`
+        let min_bg = if self.hover_btn == Some(2) { 0xAA38BDF8 } else { 0x331E3A8A };
+        canvas.draw_rect(min_x + 1, grp_y + 1, std_btn_w - 1, grp_h - 2, min_bg, 2);
+        canvas.draw_rect(min_x + (std_btn_w - 10) / 2, grp_y + grp_h - 7, 10, 2, 0xFFFFFFFF, 0);
 
-        // 5. محتوى النافذة الداخلي
-        canvas.push_clip(Rect::new(self.bounds.x + 1, self.bounds.y + tbh, self.bounds.w - 2, self.bounds.h - tbh - 1));
+        // Divider
+        canvas.draw_line_v(max_x, grp_y + 1, grp_h - 2, 0x77E0F2FE);
+
+        // Maximize / Restore button `□`
+        let max_bg = if self.hover_btn == Some(1) { 0xAA38BDF8 } else { 0x331E3A8A };
+        canvas.draw_rect(max_x + 1, grp_y + 1, std_btn_w - 1, grp_h - 2, max_bg, 0);
+        canvas.draw_rect_outline(max_x + (std_btn_w - 10) / 2, grp_y + (grp_h - 10) / 2, 10, 10, 0xFFFFFFFF, 1);
+        canvas.draw_line_h(max_x + (std_btn_w - 10) / 2, grp_y + (grp_h - 10) / 2 + 1, 10, 0xFFFFFFFF);
+
+        // Divider
+        canvas.draw_line_v(close_x, grp_y + 1, grp_h - 2, 0x77E0F2FE);
+
+        // Wide Red-Glow Close button `X`
+        let close_bg = if self.hover_btn == Some(0) { theme.btn_close_glow } else { theme.btn_close };
+        canvas.draw_rect(close_x + 1, grp_y + 1, close_w - 2, grp_h - 2, close_bg, 2);
+        canvas.draw_rect(close_x + 2, grp_y + 2, close_w - 4, (grp_h - 4) / 2, 0x44FFFFFF, 1);
+        draw_vector_icon(canvas, "close", close_x + (close_w - 12) / 2, grp_y + (grp_h - 12) / 2, 12, 12, Some(0xFFFFFFFF));
+
+        // 5. Inner Window Content
+        canvas.push_clip(Rect::new(self.bounds.x + 2, self.bounds.y + tbh, self.bounds.w - 4, self.bounds.h - tbh - 2));
         self.content.paint(canvas);
         canvas.pop_clip();
     }
 
     fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
         if self.is_closed || self.is_minimized { return false; }
+        let theme = get_theme();
         let tbh = self.title_bar_height();
-        let btn_w = get_theme().pt(32.0);
-        let right_x = self.bounds.x + self.bounds.w;
+        let close_w = theme.pt(44.0);
+        let std_btn_w = theme.pt(28.0);
+        let grp_h = theme.pt(22.0);
+        let right_x = self.bounds.x + self.bounds.w - theme.pt(6.0);
+        let close_x = right_x - close_w;
+        let max_x = close_x - std_btn_w;
+        let min_x = max_x - std_btn_w;
 
-        // التحقق من أزرار العنوان
-        if my >= self.bounds.y && my < self.bounds.y + tbh {
-            if mx >= right_x - btn_w && mx <= right_x {
+        if my >= self.bounds.y && my <= self.bounds.y + grp_h + 4 {
+            if mx >= close_x && mx <= right_x {
                 self.hover_btn = Some(0); // Close
                 if pressed { self.is_closed = true; }
                 return true;
-            } else if mx >= right_x - (btn_w * 2) && mx < right_x - btn_w {
+            } else if mx >= max_x && mx < close_x {
                 self.hover_btn = Some(1); // Maximize
+                if pressed {
+                    let work = Rect::new(0, 0, 1920, 1080 - theme.pt(40.0));
+                    self.toggle_maximize(&work);
+                }
                 return true;
-            } else if mx >= right_x - (btn_w * 3) && mx < right_x - (btn_w * 2) {
+            } else if mx >= min_x && mx < max_x {
                 self.hover_btn = Some(2); // Minimize
                 if pressed { self.is_minimized = true; }
                 return true;

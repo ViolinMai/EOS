@@ -746,33 +746,35 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             let target_w = core::cmp::min(frame.r10 as usize, 1920);
             let target_h = core::cmp::min(frame.r8 as usize, 1080);
             let total_bytes = target_w * target_h * 4;
-            let rects_ptr = frame.rsi as *const [u32; 4];
-            let rects_len = frame.rdx as usize;
+            let rects_len = (frame.rdx as usize).min(256);
+            let rects_bytes = rects_len * 16;
 
-            if target_w > 0 && target_h > 0 && validate_user_range(frame.rdi, total_bytes) && validate_user_range(frame.rsi, rects_len * 16) {
+            if target_w > 0 && target_h > 0 && rects_len > 0 && validate_user_range(frame.rdi, total_bytes) && validate_user_range(frame.rsi, rects_bytes) {
+                let mut rects = alloc::vec![[0u32; 4]; rects_len];
                 unsafe {
+                    core::ptr::copy_nonoverlapping(frame.rsi as *const [u32; 4], rects.as_mut_ptr(), rects_len);
                     if let Some(writer) = &mut *core::ptr::addr_of_mut!(crate::writer::WRITER) {
                         let src = frame.rdi as *const u32;
                         let dst = writer.buffer as *mut u32;
                         let pitch = writer.pitch / 4;
+                        let max_w = target_w.min(writer.width);
+                        let max_h = target_h.min(writer.height);
 
-                        for i in 0..rects_len {
-                            let mut rect = [0u32; 4];
-                            if copy_from_user(core::slice::from_raw_parts_mut(rect.as_mut_ptr() as *mut u8, 16), rects_ptr as u64 + (i * 16) as u64, 16).is_ok() {
-                                let rx = rect[0] as usize;
-                                let ry = rect[1] as usize;
-                                let rw = rect[2] as usize;
-                                let rh = rect[3] as usize;
+                        for rect in &rects {
+                            let rx = rect[0] as usize;
+                            let ry = rect[1] as usize;
+                            let rw = rect[2] as usize;
+                            let rh = rect[3] as usize;
 
-                                let ex = core::cmp::min(rx + rw, target_w).min(writer.width);
-                                let ey = core::cmp::min(ry + rh, target_h).min(writer.height);
+                            let ex = rx.saturating_add(rw).min(max_w);
+                            let ey = ry.saturating_add(rh).min(max_h);
+                            if rx >= ex || ry >= ey { continue; }
+                            let line_len = ex - rx;
 
-                                for y in ry..ey {
-                                    let src_idx = y * target_w + rx;
-                                    let dst_idx = y * pitch + rx;
-                                    let line_len = ex - rx;
-                                    core::ptr::copy_nonoverlapping(src.add(src_idx), dst.add(dst_idx), line_len);
-                                }
+                            for y in ry..ey {
+                                let src_idx = y * target_w + rx;
+                                let dst_idx = y * pitch + rx;
+                                core::ptr::copy_nonoverlapping(src.add(src_idx), dst.add(dst_idx), line_len);
                             }
                         }
                     }

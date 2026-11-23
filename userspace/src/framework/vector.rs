@@ -251,6 +251,25 @@ impl VectorStore {
         check.commands.push(PathCommand::LineTo(7.0, 12.0));
         check.commands.push(PathCommand::LineTo(13.0, 4.0));
         self.register_and_persist(check);
+
+        // أيقونة Computer لسطح المكتب
+        let mut computer = VectorGraphic::new("computer", 24.0, 24.0);
+        computer.fill_color = Some(0xFF38BDF8);
+        computer.stroke_color = Some(0xFFE0F2FE);
+        computer.stroke_width = 1.5;
+        computer.commands.push(PathCommand::Rect(3.0, 4.0, 18.0, 12.0, 2.0));
+        computer.commands.push(PathCommand::Rect(9.0, 16.0, 6.0, 3.0, 0.0));
+        computer.commands.push(PathCommand::Rect(6.0, 19.0, 12.0, 2.0, 1.0));
+        self.register_and_persist(computer);
+
+        // أيقونة Recycle Bin لسطح المكتب
+        let mut trash = VectorGraphic::new("recycle_bin", 24.0, 24.0);
+        trash.fill_color = Some(0xFF64748B);
+        trash.stroke_color = Some(0xFFE2E8F0);
+        trash.stroke_width = 1.5;
+        trash.commands.push(PathCommand::Rect(5.0, 4.0, 14.0, 2.5, 1.0));
+        trash.commands.push(PathCommand::Rect(6.0, 7.0, 12.0, 14.0, 2.0));
+        self.register_and_persist(trash);
     }
 
     pub fn register_and_persist(&mut self, graphic: VectorGraphic) {

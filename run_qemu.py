@@ -11,16 +11,21 @@ import argparse
 
 LIMINE_BOOTX64_URL = "https://raw.githubusercontent.com/limine-bootloader/limine/v10.x-binary/BOOTX64.EFI"
 
-USER_CARGO_DIR = os.path.expanduser(r"~\.cargo\bin")
+USER_CARGO_DIR = os.path.expanduser("~/.cargo/bin")
 if USER_CARGO_DIR not in os.environ.get("PATH", ""):
     os.environ["PATH"] = USER_CARGO_DIR + os.pathsep + os.environ.get("PATH", "")
 
-CARGO_BIN = shutil.which("cargo") or os.path.join(USER_CARGO_DIR, "cargo.exe")
-QEMU_DEFAULT_DIR = r"C:\Program Files\qemu"
-if os.path.exists(QEMU_DEFAULT_DIR) and QEMU_DEFAULT_DIR not in os.environ.get("PATH", ""):
-    os.environ["PATH"] = QEMU_DEFAULT_DIR + os.pathsep + os.environ.get("PATH", "")
+CARGO_BIN = shutil.which("cargo") or (
+    os.path.join(USER_CARGO_DIR, "cargo.exe") if os.name == "nt" else os.path.join(USER_CARGO_DIR, "cargo")
+)
 
-QEMU_EXE = shutil.which("qemu-system-x86_64") or os.path.join(QEMU_DEFAULT_DIR, "qemu-system-x86_64.exe")
+if os.name == "nt":
+    QEMU_DEFAULT_DIR = r"C:\Program Files\qemu"
+    if os.path.exists(QEMU_DEFAULT_DIR) and QEMU_DEFAULT_DIR not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = QEMU_DEFAULT_DIR + os.pathsep + os.environ.get("PATH", "")
+    QEMU_EXE = shutil.which("qemu-system-x86_64") or os.path.join(QEMU_DEFAULT_DIR, "qemu-system-x86_64.exe")
+else:
+    QEMU_EXE = shutil.which("qemu-system-x86_64") or "/usr/bin/qemu-system-x86_64"
 
 def lfn_checksum(short_name_bytes):
     chk = 0
@@ -47,7 +52,7 @@ def build_userspace_app():
     env = os.environ.copy()
     env.pop("RUSTFLAGS", None)
     print(f"[*] Executing Cargo Build for Userspace: {' '.join(cmd)}")
-    res = subprocess.run(cmd, shell=True, env=env)
+    res = subprocess.run(cmd, shell=(os.name == "nt"), env=env)
     if res.returncode != 0: return None
     bin_path = os.path.join(userspace_dir, "target", "x86_64-unknown-linux-musl", "release", "user_app")
     if os.path.exists(bin_path):
@@ -336,10 +341,33 @@ def prepare_and_run(cli_args=None):
     parser.add_argument("--headless", action="store_true", help="Run QEMU with -display none")
     args = parser.parse_args(cli_args)
 
-    share_dir = r"C:\EOS_SHARE"
+    if os.name == "nt":
+        share_dir = r"C:\EOS_SHARE"
+    else:
+        linux_primary_share = "/mnt/storage/delete/EOS_SHARE"
+        share_dir = linux_primary_share if os.path.exists(os.path.dirname(linux_primary_share)) else os.path.abspath("target/EOS_SHARE")
+
     target_dir = "target"
-    os.makedirs(share_dir, exist_ok=True); os.makedirs(os.path.join(share_dir, "fonts"), exist_ok=True)
+    fonts_dir = os.path.join(share_dir, "fonts")
+    os.makedirs(share_dir, exist_ok=True)
+    os.makedirs(fonts_dir, exist_ok=True)
     os.makedirs(target_dir, exist_ok=True)
+
+    target_font = os.path.join(fonts_dir, "segoeui.ttf")
+    if not os.path.exists(target_font):
+        host_font_candidates = [
+            r"C:\Windows\Fonts\segoeui.ttf",
+            "/usr/share/fonts/TTF/DejaVuSans.ttf",
+            "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+            "/usr/share/fonts/liberation/LiberationSans-Regular.ttf",
+            "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+            "/usr/share/fonts/gnu-free/FreeSans.ttf",
+        ]
+        for hf in host_font_candidates:
+            if os.path.exists(hf):
+                shutil.copyfile(hf, target_font)
+                print(f"[*] Provisioned TrueType font: {hf} -> {target_font}")
+                break
 
     img_path = os.path.join(target_dir, "uefi_hdd.img")
     ext2_img_path = os.path.join(target_dir, "rootfs.ext2")
@@ -354,7 +382,7 @@ def prepare_and_run(cli_args=None):
 
     print("[*] Building EOS Kernel (Release, LTO)...")
     env = os.environ.copy(); env.pop("RUSTFLAGS", None)
-    res = subprocess.run([CARGO_BIN, "build", "--release", "-Z", "build-std=core,alloc"], shell=True, env=env)
+    res = subprocess.run([CARGO_BIN, "build", "--release", "-Z", "build-std=core,alloc"], shell=(os.name == "nt"), env=env)
     if res.returncode != 0:
         print("\n[!] ABORTING: kernel build failed.")
         sys.exit(1)
@@ -411,18 +439,54 @@ def prepare_and_run(cli_args=None):
             print("[+] Build and disk image packaging completed (--build-only).")
             return
 
-    qemu_share = os.path.join(os.path.dirname(QEMU_EXE), "share")
-    if not os.path.exists(qemu_share): qemu_share = r"C:\Program Files\qemu\share"
-    code_fd = os.path.join(qemu_share, "edk2-x86_64-code.fd")
+    code_fd = None
+    orig_vars = None
+
+    if os.name == "nt":
+        qemu_share = os.path.join(os.path.dirname(QEMU_EXE), "share")
+        if not os.path.exists(qemu_share):
+            qemu_share = r"C:\Program Files\qemu\share"
+        code_fd = os.path.join(qemu_share, "edk2-x86_64-code.fd")
+        orig_vars = os.path.join(qemu_share, "edk2-i386-vars.fd")
+    else:
+        linux_code_candidates = [
+            "/usr/share/edk2/x64/OVMF_CODE.4m.fd",
+            "/usr/share/edk2/x64/OVMF_CODE.fd",
+            "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
+            "/usr/share/OVMF/OVMF_CODE.fd",
+            "/usr/share/ovmf/x64/OVMF_CODE.fd",
+            "/usr/share/ovmf/OVMF_CODE.fd",
+            "/usr/share/qemu/edk2-x86_64-code.fd",
+        ]
+        linux_vars_candidates = [
+            "/usr/share/edk2/x64/OVMF_VARS.4m.fd",
+            "/usr/share/edk2/x64/OVMF_VARS.fd",
+            "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
+            "/usr/share/OVMF/OVMF_VARS.fd",
+            "/usr/share/ovmf/x64/OVMF_VARS.fd",
+            "/usr/share/ovmf/OVMF_VARS.fd",
+            "/usr/share/qemu/edk2-i386-vars.fd",
+        ]
+        for path in linux_code_candidates:
+            if os.path.exists(path):
+                code_fd = path
+                break
+        for path in linux_vars_candidates:
+            if os.path.exists(path):
+                orig_vars = path
+                break
+
+    if not code_fd or not os.path.exists(code_fd):
+        print("\n[!] ABORTING: UEFI firmware (OVMF / edk2-x86_64-code.fd) not found.")
+        sys.exit(1)
 
     vars_dst = os.path.join(target_dir, "vars.fd")
     if os.path.exists(vars_dst):
         try: os.remove(vars_dst)
         except Exception: pass
 
-    orig_vars = os.path.join(qemu_share, "edk2-i386-vars.fd")
     pflash_vars_args = []
-    if os.path.exists(orig_vars):
+    if orig_vars and os.path.exists(orig_vars):
         shutil.copyfile(orig_vars, vars_dst)
         pflash_vars_args = ["-drive", f"if=pflash,format=raw,file={vars_dst}"]
 
@@ -436,9 +500,13 @@ def prepare_and_run(cli_args=None):
     if args.headless:
         extra_qemu_args += ["-display", "none"]
 
+    accel_args = ["-accel", "tcg,thread=multi"]
+    if os.name != "nt" and os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK):
+        accel_args = ["-accel", "kvm", "-accel", "tcg,thread=multi"]
+
     qemu_cmd = [
         QEMU_EXE, "-M", "q35", "-m", args.mem, "-smp", "5",
-        "-accel", "tcg,thread=multi",
+    ] + accel_args + [
         "-drive", f"if=pflash,format=raw,readonly=on,file={code_fd}",
     ] + pflash_vars_args + [
         "-device", "piix3-ide,id=ide",
@@ -446,7 +514,7 @@ def prepare_and_run(cli_args=None):
         "-drive", f"id=disk1,file=fat:rw:{share_dir},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
         "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",
         "-drive", f"id=disk3,file={settings_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=1,drive=disk3",
-        "-netdev", "user,id=n0,hostfwd=udp::68-:68", "-device", "e1000,netdev=n0",
+        "-netdev", ("user,id=n0,hostfwd=udp::68-:68" if os.name == "nt" else "user,id=n0,hostfwd=udp::6868-:68"), "-device", "e1000,netdev=n0",
         "-serial", serial_arg, "-d", "guest_errors", "-no-reboot", "-no-shutdown"
     ] + extra_qemu_args
     try: subprocess.run(qemu_cmd)
