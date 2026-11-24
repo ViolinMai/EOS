@@ -118,12 +118,11 @@ int eos_py_init(void) {
     config.faulthandler = 0;
     config.module_search_paths_set = 1;
 
-    PyWideStringList_Append(&config.module_search_paths, L"/EOS SHARE/python312.zip");
-    PyWideStringList_Append(&config.module_search_paths, L"EOS SHARE/python312.zip");
+    PyWideStringList_Append(&config.module_search_paths, L"/EOS SHARE/python_stdlib");
+    PyWideStringList_Append(&config.module_search_paths, L"EOS SHARE/python_stdlib");
     PyWideStringList_Append(&config.module_search_paths, L"/EOS SHARE/python_libs");
     PyWideStringList_Append(&config.module_search_paths, L"EOS SHARE/python_libs");
     PyWideStringList_Append(&config.module_search_paths, L"/r/lib/python3.12/site-packages");
-    PyWideStringList_Append(&config.module_search_paths, L"/Initrd/python312.zip");
 
     PyStatus status = Py_InitializeFromConfig(&config);
     if (PyStatus_Exception(status)) {

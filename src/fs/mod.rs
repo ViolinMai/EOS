@@ -286,6 +286,20 @@ fn vfs_read_bytes_inner(path: &str) -> Result<Vec<u8>, &'static str> {
         }
     }
 
+    // Dynamic linker & shared library resolution fallback (/lib/*, /usr/lib/*, /bin/* -> EOS SHARE)
+    if let Some(rest) = clean.strip_prefix("lib/").or_else(|| clean.strip_prefix("usr/lib/")) {
+        let fat_lib = alloc::format!("lib/{}", rest);
+        if let Ok(bytes) = FAT_FS.read_bytes(&fat_lib) {
+            return Ok(bytes);
+        }
+    }
+    if let Some(rest) = clean.strip_prefix("bin/").or_else(|| clean.strip_prefix("usr/bin/")) {
+        let fat_bin = alloc::format!("bin/{}", rest);
+        if let Ok(bytes) = FAT_FS.read_bytes(&fat_bin) {
+            return Ok(bytes);
+        }
+    }
+
     Err("File not found")
 }
 

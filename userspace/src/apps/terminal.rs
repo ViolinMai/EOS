@@ -14,16 +14,28 @@ struct TextPos {
 #[derive(Clone, Debug)]
 struct StyledLine {
     spans: Vec<(String, u32)>,
+    grid_cols: usize,
 }
 
 impl StyledLine {
     fn plain(text: impl Into<String>, color: u32) -> Self {
-        Self { spans: vec![(text.into(), color)] }
+        Self { spans: vec![(text.into(), color)], grid_cols: 0 }
+    }
+
+    fn spans(spans: Vec<(String, u32)>) -> Self {
+        Self { spans, grid_cols: 0 }
+    }
+
+    fn grid(spans: Vec<(String, u32)>, grid_cols: usize) -> Self {
+        Self { spans, grid_cols }
     }
 
     fn full_text(&self) -> String {
         let mut out = String::new();
-        for (s, _) in &self.spans {
+        for (i, (s, _)) in self.spans.iter().enumerate() {
+            if self.grid_cols > 0 && i > 0 {
+                out.push_str("  ");
+            }
             out.push_str(s);
         }
         out
@@ -54,14 +66,12 @@ impl TerminalApp {
         let mut app = Self {
             bounds: Rect::default(),
             history: vec![
-                StyledLine {
-                    spans: vec![
-                        ("EOS 0.1.0".into(), 0xFF38BDF8),
-                        ("  •  ".into(), 0xFF475569),
-                        ("root@eos".into(), 0xFF34D399),
-                        ("  •  Ctrl+Shift+C: Copy  |  Ctrl+C: Cancel".into(), 0xFF64748B),
-                    ],
-                },
+                StyledLine::spans(vec![
+                    ("EOS 0.1.0".into(), 0xFF38BDF8),
+                    ("  •  ".into(), 0xFF475569),
+                    ("root@eos".into(), 0xFF34D399),
+                    ("  •  Ctrl+Shift+C: Copy  |  Ctrl+C: Cancel".into(), 0xFF64748B),
+                ]),
                 StyledLine::plain("", 0xFFFFFFFF),
             ],
             input: String::new(),
@@ -155,7 +165,8 @@ impl TerminalApp {
         if !self.input.contains(' ') {
             let builtins = [
                 "help", "whoami", "pwd", "history", "ls", "cd", "cat", "rm", "clear",
-                "uname", "echo", "ps", "kill", "free", "lspci", "reboot", "shutdown", "python",
+                "uname", "echo", "ps", "kill", "free", "lspci", "ifconfig", "dhcp", "arp",
+                "ping", "ssh", "reboot", "shutdown", "python",
             ];
             for b in builtins {
                 if b.len() > self.input.len() && b.starts_with(&self.input) {
@@ -168,12 +179,10 @@ impl TerminalApp {
 
     fn execute(&mut self) {
         let raw_cmd = self.input.trim().to_string();
-        self.history.push(StyledLine {
-            spans: vec![
-                (self.prompt_prefix(), 0xFF38BDF8),
-                (self.input.clone(), 0xFFF8FAFC),
-            ],
-        });
+        self.history.push(StyledLine::spans(vec![
+            (self.prompt_prefix(), 0xFF38BDF8),
+            (self.input.clone(), 0xFFF8FAFC),
+        ]));
 
         if !raw_cmd.is_empty() {
             self.cmd_history.retain(|x| x != &raw_cmd);
@@ -228,8 +237,36 @@ impl TerminalApp {
         match program {
             "help" => {
                 self.history.push(StyledLine::plain("ls [path]  cd <dir>  cat <file>  rm <file>  echo <txt>  clear", 0xFFE2E8F0));
-                self.history.push(StyledLine::plain("ps  kill <pid>  free  lspci  uname  whoami  pwd  history", 0xFF34D399));
-                self.history.push(StyledLine::plain("reboot  shutdown  |  Tab / Right: complete  |  Ctrl+Shift+C/V: Copy/Paste", 0xFF94A3B8));
+                self.history.push(StyledLine::plain("ps  kill <pid>  free  lspci  ifconfig  dhcp  arp [-scan]  ping <ip>", 0xFF34D399));
+                self.history.push(StyledLine::plain("python <script|-c>  reboot  shutdown  |  Ctrl+Shift+C/V: Copy/Paste", 0xFF94A3B8));
+            }
+            "ifconfig" | "ip" => {
+                for line in crate::net_manager::get_ifconfig_lines() {
+                    self.history.push(StyledLine::plain(line, 0xFF38BDF8));
+                }
+            }
+            "dhcp" => {
+                self.history.push(StyledLine::plain("Sending DHCPDISCOVER on eth0...", 0xFFFCD34D));
+                for line in crate::net_manager::renew_dhcp_sync() {
+                    self.history.push(StyledLine::plain(line, 0xFF34D399));
+                }
+            }
+            "arp" => {
+                let do_scan = args.iter().any(|a| a == "-scan" || a == "scan");
+                for line in crate::net_manager::get_arp_lines(do_scan) {
+                    self.history.push(StyledLine::plain(line, 0xFFE2E8F0));
+                }
+            }
+            "ping" => {
+                let target_str = args.first().map(|s| s.as_str()).unwrap_or("10.0.2.2");
+                if let Some(ip) = crate::net_manager::parse_ipv4(target_str) {
+                    for line in crate::net_manager::run_ping_sync(ip, 4) {
+                        let col = if line.contains("timeout") { 0xFFF87171 } else { 0xFF34D399 };
+                        self.history.push(StyledLine::plain(line, col));
+                    }
+                } else {
+                    self.history.push(StyledLine::plain(format!("ping: invalid IPv4 address '{}'", target_str), 0xFFEF4444));
+                }
             }
             "echo" => self.history.push(StyledLine::plain(args.join(" "), 0xFFE2E8F0)),
             "whoami" => self.history.push(StyledLine::plain("root", 0xFF34D399)),
@@ -293,12 +330,43 @@ impl TerminalApp {
                 }
             }
             "python" | "python3" => {
-                if args.is_empty() {
-                    if crate::ffi_python::is_available() {
-                        self.history.push(StyledLine::plain("Python 3.12 (EOS Static musl) — usage: python -c \"<code>\" | python <script.py>", 0xFF34D399));
+                let dyn_py = "/EOS SHARE/bin/python3";
+                let has_dyn_py = fs::metadata(dyn_py).is_ok() || fs::metadata("EOS SHARE/bin/python3").is_ok();
+                if has_dyn_py {
+                    if args.is_empty() {
+                        self.history.push(StyledLine::plain(
+                            "Python 3.12.7 Dynamic (musl + dlopen) — usage: python -c '<code>' | python <script.py>",
+                            0xFF34D399,
+                        ));
                     } else {
-                        self.history.push(StyledLine::plain("CPython 3.12 not linked yet. Run ./build_cpython_musl.sh on host.", 0xFFF59E0B));
+                        let mut quoted_args: Vec<String> = vec!["python3".to_string()];
+                        for a in args {
+                            let resolved = if !a.starts_with('-') && self.current_dir != "/" && !a.starts_with('/')
+                                && (a.ends_with(".py") || fs::metadata(format!("{}/{}", self.current_dir.trim_matches('/'), a)).is_ok())
+                            {
+                                format!("{}/{}", self.current_dir.trim_matches('/'), a)
+                            } else {
+                                a.clone()
+                            };
+                            if resolved.contains(' ') {
+                                quoted_args.push(format!("\"{}\"", resolved));
+                            } else {
+                                quoted_args.push(resolved);
+                            }
+                        }
+                        let arg_str = quoted_args.join(" ");
+                        let ret = crate::syscall::sys_spawn_elf("EOS SHARE/bin/python3", &arg_str);
+                        if ret >= 0 {
+                            self.history.push(StyledLine::plain(
+                                format!("[Dynamic CPython 3.12 + dlopen] Spawned on Core {}", ret),
+                                0xFF34D399,
+                            ));
+                        } else {
+                            self.history.push(StyledLine::plain("Failed to spawn dynamic python3", 0xFFEF4444));
+                        }
                     }
+                } else if args.is_empty() {
+                    self.history.push(StyledLine::plain("Python 3.12 — usage: python -c '<code>' | python <script.py>", 0xFF34D399));
                 } else if args[0] == "-c" && args.len() >= 2 {
                     let code = args[1..].join(" ");
                     match crate::ffi_python::run_code(&code) {
@@ -379,19 +447,12 @@ impl TerminalApp {
                         if items.is_empty() {
                             self.history.push(StyledLine::plain("(empty)", 0xFF64748B));
                         } else {
-                            // Kitty-style multi-column colored grid (3 columns)
-                            let cols = 3usize;
+                            // Pixel-aligned multi-column grid (adapts to long filenames)
+                            let max_len = items.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0);
+                            let cols = if max_len > 26 { 2usize } else { 3usize };
                             for chunk in items.chunks(cols) {
-                                let mut spans = Vec::new();
-                                for (idx, (label, col)) in chunk.iter().enumerate() {
-                                    let padded = if idx + 1 < chunk.len() {
-                                        format!("{:<24}", label)
-                                    } else {
-                                        label.clone()
-                                    };
-                                    spans.push((padded, *col));
-                                }
-                                self.history.push(StyledLine { spans });
+                                let spans: Vec<(String, u32)> = chunk.iter().cloned().collect();
+                                self.history.push(StyledLine::grid(spans, cols));
                             }
                         }
                         found = true;
@@ -650,14 +711,23 @@ impl Widget for TerminalApp {
                     }
                 }
 
-                // Draw colored spans
-                let mut sx = self.bounds.x + pad_x;
-                let max_x = self.bounds.x + pad_x + max_text_w;
-                for (span_txt, col) in &styled.spans {
-                    if sx >= max_x { break; }
-                    canvas.draw_text_mono_clipped(sx, cy, max_x - sx, span_txt, *col, font_size);
-                    let (sw, _) = canvas.measure_text_mono(span_txt, font_size);
-                    sx += sw as i32;
+                // Draw colored spans (pixel-aligned grid for `ls`, sequential for normal lines)
+                if styled.grid_cols > 0 {
+                    let col_w = (max_text_w / styled.grid_cols as i32).max(80);
+                    let cell_pad = theme.pt(14.0);
+                    for (idx, (span_txt, col)) in styled.spans.iter().enumerate() {
+                        let gx = self.bounds.x + pad_x + (idx as i32) * col_w;
+                        canvas.draw_text_mono_clipped(gx, cy, (col_w - cell_pad).max(20), span_txt, *col, font_size);
+                    }
+                } else {
+                    let mut sx = self.bounds.x + pad_x;
+                    let max_x = self.bounds.x + pad_x + max_text_w;
+                    for (span_txt, col) in &styled.spans {
+                        if sx >= max_x { break; }
+                        canvas.draw_text_mono_clipped(sx, cy, max_x - sx, span_txt, *col, font_size);
+                        let (sw, _) = canvas.measure_text_mono(span_txt, font_size);
+                        sx += sw as i32;
+                    }
                 }
             }
             cy += line_h;
@@ -727,11 +797,37 @@ impl Widget for TerminalApp {
         let line_h = self.line_h();
         let pad_x = theme.pt(20.0);
         let pad_y = theme.pt(18.0);
-        let avg_char_w = ((self.font_px() as f32 * 0.50).round() as i32).max(6);
-
         let rel_y = my - (self.bounds.y + pad_y) + self.scroll_y;
         let line_idx = if rel_y >= 0 { (rel_y / line_h) as usize } else { 0 };
-        let col_idx = ((mx - (self.bounds.x + pad_x)).max(0) / avg_char_w) as usize;
+        let target_x = (mx - (self.bounds.x + pad_x)).max(0);
+
+        // Exact pixel-to-column hit-testing using the active font's real glyph advance_width
+        let line_str = if line_idx < self.history.len() {
+            self.history[line_idx].full_text()
+        } else if line_idx == self.history.len() {
+            format!("{}{}", self.prompt_prefix(), self.input)
+        } else {
+            String::new()
+        };
+
+        let col_idx = if let Some(font) = crate::framework::fonts::get_font_for_role(crate::framework::fonts::FontRole::Mono) {
+            let scale = rusttype::Scale::uniform(self.font_px() as f32);
+            let mut acc_x = 0i32;
+            let mut found_col = 0usize;
+            for (i, c) in line_str.chars().enumerate() {
+                let adv = (font.glyph(c).scaled(scale).h_metrics().advance_width.round() as i32).max(1);
+                if target_x < acc_x + adv / 2 {
+                    found_col = i;
+                    break;
+                }
+                acc_x += adv;
+                found_col = i + 1;
+            }
+            found_col
+        } else {
+            let fallback_w = ((self.font_px() as f32 * 0.48).round() as i32).max(6);
+            (target_x / fallback_w) as usize
+        };
         let pos = TextPos { line: line_idx, col: col_idx };
 
         if pressed {
@@ -778,12 +874,10 @@ impl Widget for TerminalApp {
             }
             // Ctrl+C -> Interrupt / Cancel current command ONLY
             0x2E if is_ctrl => {
-                self.history.push(StyledLine {
-                    spans: vec![
-                        (self.prompt_prefix(), 0xFF38BDF8),
-                        (format!("{}^C", self.input), 0xFFF87171),
-                    ],
-                });
+                self.history.push(StyledLine::spans(vec![
+                    (self.prompt_prefix(), 0xFF38BDF8),
+                    (format!("{}^C", self.input), 0xFFF87171),
+                ]));
                 self.input.clear();
                 self.cursor_idx = 0;
                 self.sel_start = None;

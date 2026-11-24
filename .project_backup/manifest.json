@@ -1,7 +1,9 @@
 {
   "modified": [
-    "userspace/src/ffi_python.c",
-    "userspace/src/test_subject.rs"
+    "userspace/src/net_manager.rs",
+    "userspace/src/apps/terminal.rs",
+    "milestones.md",
+    "test_eos_audit.py"
   ],
   "created": []
 }

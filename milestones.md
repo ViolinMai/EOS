@@ -447,7 +447,7 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
     Phase 6: Local Networking, SSH & Network Storage (M33–M35)
 
-        [ ] Milestone 33: Local Network (LAN) DHCP Client, ARP Discovery & Host Ping
+        [x] Milestone 33: Local Network (LAN) DHCP Client, ARP Discovery & Host Ping
 
             ID: m33_lan_dhcp_discovery
 
@@ -471,14 +471,52 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
             Steps: []
 
-        [ ] Milestone 35: Network Storage Mount (SMB / WebDAV / 9P Share in Finder & VFS)
+            [ ] Milestone 35: Network Storage Mount (SMB / WebDAV / 9P Share in Finder & VFS)
 
-            ID: m35_network_storage_mount
+                ID: m35_network_storage_mount
 
-            Goal: Mount remote LAN network shares (SMB/WebDAV/HTTP-FS) directly into VFS under /net/<host> so Finder, Video Player, and Terminal can browse and stream remote files seamlessly. Emit NET_STORAGE:PASS:Remote_Share_Mounted.
+                Goal: Mount remote LAN network shares (SMB/WebDAV/HTTP-FS) directly into VFS under /net/<host> so Finder, Video Player, and Terminal can browse and stream remote files seamlessly. Emit NET_STORAGE:PASS:Remote_Share_Mounted.
 
-            Files: src/fs/mod.rs, userspace/src/net_manager.rs, userspace/src/apps/finder.rs
+                Files: src/fs/mod.rs, userspace/src/net_manager.rs, userspace/src/apps/finder.rs
 
-            Expect: NET_STORAGE:PASS:Remote_Share_Mounted
+                Expect: NET_STORAGE:PASS:Remote_Share_Mounted
 
-            Steps: []
+                Steps: []
+
+        Phase 7: Unix / POSIX Userland & Utilities Compatibility (M36–M37)
+
+            [ ] Milestone 36: Static musl BusyBox & POSIX Core Utilities (/r/bin PATH)
+
+                ID: m36_unix_busybox_coreutils
+
+                Goal: Cross-compile static musl BusyBox (grep, sed, awk, tar, gzip, wc, sort, find, head, tail, hexdump) into /r/bin/busybox.elf, wire /r/bin PATH lookup and stdout capture in Terminal and tty2, and emit UNIX_COREUTILS:PASS:BusyBox_Ready.
+
+                Files: userspace/src/apps/terminal.rs, src/fs/mod.rs, build_busybox_musl.sh
+
+                Expect: UNIX_COREUTILS:PASS:BusyBox_Ready
+
+                Steps: []
+
+            [ ] Milestone 37: POSIX Process Control (fork/execve/wait4 & pipe2/dup2)
+
+                ID: m37_posix_fork_pipes
+
+                Goal: Implement Copy-on-Write fork/clone, execve, wait4, and anonymous pipes (pipe2/dup2) in the kernel syscall layer to enable native Unix shell pipelines (cmd1 | cmd2) and standard POSIX CLI toolchains. Emit POSIX_PROC:PASS:Fork_And_Pipes_Ready.
+
+                Files: src/arch/x86_64/syscall.rs, src/mm/paging.rs, src/fs/elf.rs
+
+                Expect: POSIX_PROC:PASS:Fork_And_Pipes_Ready
+
+                Steps: []
+
+            [x] Milestone 38: Dynamic ELF Loader (PT_INTERP / dlopen) for Full CPython C-Extensions
+
+                ID: m38_dynamic_elf_dlopen
+
+                Goal: Support PT_INTERP and PT_DYNAMIC relocation in src/fs/elf.rs to run dynamically linked musl binaries (ld-musl-x86_64.so.1), enabling dlopen() and native .so Python C-extension wheels (numpy, pillow, pydantic-core) directly from /EOS SHARE/python_libs. Emit DYN_ELF:PASS:Dlopen_Ready.
+
+                Files: src/fs/elf.rs, src/arch/x86_64/syscall.rs, build_cpython_musl.sh
+
+                Expect: DYN_ELF:PASS:Dlopen_Ready
+
+                Steps: []

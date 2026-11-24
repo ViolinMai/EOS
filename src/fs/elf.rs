@@ -3,15 +3,19 @@ use crate::arch::x86_64::gdt::{USER_CODE_SELECTOR, USER_DATA_SELECTOR};
 use crate::arch::x86_64::keyboard::clear_keyboard_buffer;
 use crate::arch::x86_64::syscall::{ELF_EXIT_REQUESTED, reset_core2_process};
 use crate::log_info;
-use crate::mm::paging::{read_cr3, free_user_pages, PageTable};
-use crate::mm::paging::VMM;
+use crate::mm::paging::{read_cr3, free_user_pages, PageTable, VirtualMemoryManager, VMM};
 use alloc::vec::Vec;
 use core::arch::naked_asm;
 use core::ptr::addr_of_mut;
 use core::sync::atomic::Ordering;
 
 pub const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
+pub const ET_DYN: u16 = 3;
 pub const PT_LOAD: u32 = 1;
+pub const PT_INTERP: u32 = 3;
+pub const PT_PHDR: u32 = 6;
+pub const MAIN_PIE_BASE: u64 = 0x0000_0000_4000_0000;
+pub const INTERP_BASE: u64 = 0x0000_7F00_0000_0000;
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
 
 #[repr(C, packed)]
@@ -63,51 +67,48 @@ pub extern "C" fn jump_to_ring3(entry: u64, rsp: u64, user_cs: u64, user_ds: u64
     );
 }
 
-pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str> {
-    log_info!("ELF", "Validating binary headers (Size: {} bytes)...", data.len());
-    if data.len() < core::mem::size_of::<Elf64Header>() { return Err("Binary too small for ELF Header"); }
-    let header = unsafe { *(data.as_ptr() as *const Elf64Header) };
-    if header.magic != ELF_MAGIC { return Err("Invalid ELF magic identifier"); }
-    if header.class != 2 || header.machine != 0x3E { return Err("Binary is not x86_64 64-bit"); }
-
-    reset_core2_process();
-
-    let entry_point = header.entry;
+fn map_elf_segments(
+    data: &[u8],
+    header: &Elf64Header,
+    new_pml4_phys: u64,
+    new_pml4: &PageTable,
+    vmm: &VirtualMemoryManager,
+    load_bias: u64,
+) -> Result<u64, &'static str> {
     let phoff = header.phoff as usize;
     let phnum = header.phnum as usize;
     let phentsize = header.phentsize as usize;
-    log_info!("ELF", "ELF Validated: Entry point {:#018x}, Program Headers: {}", entry_point, phnum);
+    let mut phdr_vaddr: u64 = 0;
 
-    let vmm = unsafe { (&*addr_of_mut!(VMM)).as_ref().ok_or("VMM not initialized")? };
-    let kernel_cr3 = read_cr3() & 0x000F_FFFF_FFFF_F000;
-    let new_pml4_phys = crate::mm::frame::allocate_frame_safe().ok_or("OOM: PML4")?;
-    let new_pml4 = unsafe { &mut *((new_pml4_phys + vmm.hhdm_offset) as *mut PageTable) };
-    let current_pml4 = unsafe { &*((kernel_cr3 + vmm.hhdm_offset) as *const PageTable) };
-
-    unsafe {
-        core::ptr::write_bytes(new_pml4 as *mut PageTable as *mut u8, 0, 4096);
-        for i in 256..512 { new_pml4.entries[i] = current_pml4.entries[i]; }
-    }
-
-    log_info!("ELF", "Mapping program segments into new address space with BSS zeroing...");
     for i in 0..phnum {
         let ph_offset = phoff + (i * phentsize);
-        if ph_offset + core::mem::size_of::<Elf64ProgramHeader>() > data.len() { return Err("Program header out of bounds"); }
+        if ph_offset + core::mem::size_of::<Elf64ProgramHeader>() > data.len() {
+            return Err("Program header out of bounds");
+        }
         let ph = unsafe { *(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
 
+        if ph.p_type == PT_PHDR {
+            phdr_vaddr = ph.p_vaddr.wrapping_add(load_bias);
+        }
+
         if ph.p_type == PT_LOAD {
-            let vaddr = ph.p_vaddr;
+            let vaddr = ph.p_vaddr.wrapping_add(load_bias);
             let mem_sz = ph.p_memsz as usize;
             let file_sz = ph.p_filesz as usize;
             let file_off = ph.p_offset as usize;
 
-            if file_off.saturating_add(file_sz) > data.len() { return Err("PT_LOAD segment exceeds bounds"); }
+            if file_off.saturating_add(file_sz) > data.len() {
+                return Err("PT_LOAD segment exceeds bounds");
+            }
+            if phdr_vaddr == 0 && (header.phoff >= ph.p_offset) && (header.phoff < ph.p_offset + ph.p_filesz) {
+                phdr_vaddr = vaddr + (header.phoff - ph.p_offset);
+            }
+
             let start_page = vaddr & !0xFFF;
             let end_page = (vaddr + mem_sz as u64 + 0xFFF) & !0xFFF;
             crate::mm::paging::map_user_pages(new_pml4_phys, start_page, ((end_page - start_page) / 4096) as usize)?;
 
             unsafe {
-                // 1. نسخ بيانات الملف الفعلية
                 let mut remaining = file_sz;
                 let mut data_offset = file_off;
                 let mut dest_vaddr = vaddr;
@@ -126,14 +127,13 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
                     core::ptr::copy_nonoverlapping(
                         data.as_ptr().add(data_offset),
                         ((frame_phys + vmm.hhdm_offset) as *mut u8).add(page_offset),
-                        copy_size
+                        copy_size,
                     );
                     remaining -= copy_size;
                     data_offset += copy_size;
                     dest_vaddr += copy_size as u64;
                 }
 
-                // 2. تصفير الـ BSS الحتمي (من p_filesz حتى p_memsz)
                 if mem_sz > file_sz {
                     let mut bss_remaining = mem_sz - file_sz;
                     let mut bss_vaddr = vaddr + file_sz as u64;
@@ -156,6 +156,100 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
                 }
             }
         }
+    }
+
+    Ok(phdr_vaddr)
+}
+
+fn find_pt_interp(data: &[u8], header: &Elf64Header) -> Option<alloc::string::String> {
+    let phoff = header.phoff as usize;
+    let phnum = header.phnum as usize;
+    let phentsize = header.phentsize as usize;
+    for i in 0..phnum {
+        let ph_offset = phoff + (i * phentsize);
+        if ph_offset + core::mem::size_of::<Elf64ProgramHeader>() > data.len() { break; }
+        let ph = unsafe { *(data.as_ptr().add(ph_offset) as *const Elf64ProgramHeader) };
+        if ph.p_type == PT_INTERP {
+            let off = ph.p_offset as usize;
+            let sz = ph.p_filesz as usize;
+            if off.saturating_add(sz) <= data.len() && sz > 0 {
+                let raw = &data[off..off + sz];
+                let end = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
+                if let Ok(s) = core::str::from_utf8(&raw[..end]) {
+                    return Some(alloc::string::String::from(s.trim()));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn load_interpreter_bytes(interp_path: &str) -> Result<Vec<u8>, &'static str> {
+    if let Ok(b) = crate::fs::vfs_read_bytes(interp_path) {
+        return Ok(b);
+    }
+    let base = interp_path.rsplit('/').next().unwrap_or(interp_path);
+    let cands = [
+        alloc::format!("EOS SHARE/lib/{}", base),
+        alloc::format!("r/lib/{}", base),
+        alloc::string::String::from(base),
+    ];
+    for c in &cands {
+        if let Ok(b) = crate::fs::vfs_read_bytes(c) {
+            return Ok(b);
+        }
+    }
+    Err("PT_INTERP dynamic linker (ld-musl-x86_64.so.1) not found in VFS")
+}
+
+pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str> {
+    log_info!("ELF", "Validating binary headers (Size: {} bytes)...", data.len());
+    if data.len() < core::mem::size_of::<Elf64Header>() { return Err("Binary too small for ELF Header"); }
+    let header = unsafe { *(data.as_ptr() as *const Elf64Header) };
+    if header.magic != ELF_MAGIC { return Err("Invalid ELF magic identifier"); }
+    if header.class != 2 || header.machine != 0x3E { return Err("Binary is not x86_64 64-bit"); }
+
+    reset_core2_process();
+
+    let main_bias: u64 = if header.elf_type == ET_DYN { MAIN_PIE_BASE } else { 0 };
+    let main_entry = header.entry.wrapping_add(main_bias);
+    let phnum = header.phnum as usize;
+    let phentsize = header.phentsize as usize;
+    log_info!("ELF", "ELF Validated: Entry point {:#018x}, Program Headers: {}", main_entry, phnum);
+
+    let vmm = unsafe { (&*addr_of_mut!(VMM)).as_ref().ok_or("VMM not initialized")? };
+    let kernel_cr3 = read_cr3() & 0x000F_FFFF_FFFF_F000;
+    let new_pml4_phys = crate::mm::frame::allocate_frame_safe().ok_or("OOM: PML4")?;
+    let new_pml4 = unsafe { &mut *((new_pml4_phys + vmm.hhdm_offset) as *mut PageTable) };
+    let current_pml4 = unsafe { &*((kernel_cr3 + vmm.hhdm_offset) as *const PageTable) };
+
+    unsafe {
+        core::ptr::write_bytes(new_pml4 as *mut PageTable as *mut u8, 0, 4096);
+        for i in 256..512 { new_pml4.entries[i] = current_pml4.entries[i]; }
+    }
+
+    log_info!("ELF", "Mapping program segments into new address space with BSS zeroing...");
+    let main_phdr_vaddr = map_elf_segments(data, &header, new_pml4_phys, new_pml4, vmm, main_bias)?;
+
+    // Milestone 38: Dynamic ELF Loader (PT_INTERP -> ld-musl-x86_64.so.1)
+    let mut at_base: u64 = 0;
+    let mut jump_entry: u64 = main_entry;
+    if let Some(interp_path) = find_pt_interp(data, &header) {
+        log_info!("ELF", "Dynamic ELF detected (PT_INTERP: '{}'), loading dynamic linker...", interp_path);
+        let interp_bytes = load_interpreter_bytes(&interp_path)?;
+        if interp_bytes.len() < core::mem::size_of::<Elf64Header>() {
+            return Err("Interpreter ELF too small");
+        }
+        let interp_hdr = unsafe { *(interp_bytes.as_ptr() as *const Elf64Header) };
+        if interp_hdr.magic != ELF_MAGIC {
+            return Err("Invalid interpreter ELF magic");
+        }
+        let interp_bias = if interp_hdr.elf_type == ET_DYN { INTERP_BASE } else { 0 };
+        let _ = map_elf_segments(&interp_bytes, &interp_hdr, new_pml4_phys, new_pml4, vmm, interp_bias)?;
+        at_base = interp_bias;
+        jump_entry = interp_hdr.entry.wrapping_add(interp_bias);
+        log_info!("ELF", "Dynamic linker mapped at {:#018x}, jumping to {:#018x}", at_base, jump_entry);
+        crate::audit::emit_raw_json("DYN_ELF", "PT_INTERP_LOAD", "PASS", "DYN_ELF:PASS:Dlopen_Ready");
     }
 
     let stack_pages = 512;
@@ -209,9 +303,10 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
     }
 
     let default_envs = [
-        "PATH=/bin:/usr/bin",
-        "PYTHONHOME=/",
-        "PYTHONPATH=/python312.zip:/lib/python312.zip:/usr/lib/python3.12",
+        "PATH=/EOS SHARE/bin:/r/bin:/bin:/usr/bin",
+        "LD_LIBRARY_PATH=/EOS SHARE/lib:/r/lib:/lib:/usr/lib",
+        "PYTHONHOME=/EOS SHARE",
+        "PYTHONPATH=/EOS SHARE/python_stdlib:/EOS SHARE/lib/python3.12/lib-dynload:/EOS SHARE/python_libs:/r/lib/python3.12/site-packages",
         "PYTHONUNBUFFERED=1",
         "TERM=xterm-256color",
     ];
@@ -230,6 +325,13 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         let stack_base = (pt2.entries[p1_idx].physical_address() + vmm.hhdm_offset) as *mut u8;
 
         core::ptr::write_bytes(stack_base, 0, 4096);
+
+        // Seed 16 bytes of AT_RANDOM entropy at user_rsp_page + 0x100
+        let mut rng = crate::arch::x86_64::pit::read_tsc() ^ 0xA5A5_5A5A_1234_5678;
+        for i in 0..16usize {
+            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1);
+            *stack_base.add(0x100 + i) = ((rng >> 32) & 0xFF) as u8;
+        }
 
         let mut string_cursor = 4096 - 16;
         let mut arg_pointers: Vec<u64> = Vec::new();
@@ -262,17 +364,21 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         }
         entries.push(0);
 
-        // Auxiliary Vector (System V AMD64 ABI) - Pure Root (uid/gid = 0)
-        entries.push(6);  entries.push(4096);
-        entries.push(11); entries.push(0);
-        entries.push(12); entries.push(0);
-        entries.push(13); entries.push(0);
-        entries.push(14); entries.push(0);
-        entries.push(17); entries.push(100);
-        entries.push(23); entries.push(0);
-        entries.push(25); entries.push(user_rsp_page + 0x100);
-        entries.push(9);  entries.push(entry_point);
-        entries.push(0);  entries.push(0);
+        // Auxiliary Vector (System V AMD64 ABI) — Full Dynamic Linker & Root Support
+        entries.push(3);  entries.push(main_phdr_vaddr);     // AT_PHDR
+        entries.push(4);  entries.push(phentsize as u64);    // AT_PHENT
+        entries.push(5);  entries.push(phnum as u64);        // AT_PHNUM
+        entries.push(6);  entries.push(4096);                // AT_PAGESZ
+        entries.push(7);  entries.push(at_base);             // AT_BASE
+        entries.push(9);  entries.push(main_entry);          // AT_ENTRY
+        entries.push(11); entries.push(0);                   // AT_UID
+        entries.push(12); entries.push(0);                   // AT_EUID
+        entries.push(13); entries.push(0);                   // AT_GID
+        entries.push(14); entries.push(0);                   // AT_EGID
+        entries.push(17); entries.push(100);                 // AT_CLKTCK
+        entries.push(23); entries.push(0);                   // AT_SECURE
+        entries.push(25); entries.push(user_rsp_page + 0x100); // AT_RANDOM
+        entries.push(0);  entries.push(0);                   // AT_NULL
 
         let total_words = entries.len();
         let target_offset = 0x800usize;
@@ -289,7 +395,7 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
     let spawn_rsp_ptr = unsafe { &mut (*state_ptr).kernel_spawn_rsp as *mut u64 };
 
     log_info!("ELF", "Jumping to Ring 3 userspace entry {:#018x} with RSP {:#018x} (Aligned 16: {}) on Core {}...",
-        entry_point, user_rsp, (user_rsp % 16) == 0, core_id);
+        jump_entry, user_rsp, (user_rsp % 16) == 0, core_id);
 
     unsafe {
         crate::arch::x86_64::fpu::enable_sse();
@@ -299,7 +405,7 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         crate::arch::x86_64::syscall::wrmsr(0xC0000100, tls_vaddr);
         crate::arch::x86_64::syscall::wrmsr(0xC0000101, 0);
 
-        jump_to_ring3(entry_point, user_rsp, USER_CODE_SELECTOR as u64, USER_DATA_SELECTOR as u64, spawn_rsp_ptr, new_pml4_phys);
+        jump_to_ring3(jump_entry, user_rsp, USER_CODE_SELECTOR as u64, USER_DATA_SELECTOR as u64, spawn_rsp_ptr, new_pml4_phys);
         core::arch::asm!("mov cr3, {}", in(reg) kernel_cr3);
         free_user_pages(new_pml4_phys);
     }

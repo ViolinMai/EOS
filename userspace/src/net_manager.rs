@@ -24,6 +24,14 @@ pub struct TcpSocket {
     pub rx_buffer: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DhcpState {
+    Idle,
+    DiscoverSent,
+    RequestSent,
+    Bound,
+}
+
 #[derive(Clone)]
 pub struct PendingPacket {
     pub target_ip: [u8; 4],
@@ -34,8 +42,12 @@ pub struct PendingPacket {
 pub struct NetworkManager {
     pub mac: [u8; 6],
     pub ip: [u8; 4],
+    pub subnet: [u8; 4],
     pub gateway: [u8; 4],
     pub dns_server: [u8; 4],
+    pub dhcp_state: DhcpState,
+    pub dhcp_xid: u32,
+    pub dhcp_server: [u8; 4],
     pub arp_cache: HashMap<[u8; 4], [u8; 6]>,
     pub pending_tx: Vec<PendingPacket>,
     pub tcp_sockets: HashMap<u16, TcpSocket>,
@@ -46,12 +58,28 @@ pub struct NetworkManager {
 
 pub static NET: Mutex<Option<NetworkManager>> = Mutex::new(None);
 
+pub fn parse_ipv4(s: &str) -> Option<[u8; 4]> {
+    let parts: Vec<&str> = s.trim().split('.').collect();
+    if parts.len() != 4 { return None; }
+    let mut out = [0u8; 4];
+    for (i, p) in parts.iter().enumerate() {
+        out[i] = p.parse::<u8>().ok()?;
+    }
+    Some(out)
+}
+
 pub fn init_net(ip: [u8; 4], gateway: [u8; 4]) {
     let mut mac = [0u8; 6];
     sys_net_mac(&mut mac);
-    let nm = NetworkManager {
-        mac, ip, gateway,
+    let mut nm = NetworkManager {
+        mac,
+        ip,
+        subnet: [255, 255, 255, 0],
+        gateway,
         dns_server: [10, 0, 2, 3],
+        dhcp_state: DhcpState::Idle,
+        dhcp_xid: 0x454F_5331,
+        dhcp_server: [0, 0, 0, 0],
         arp_cache: HashMap::new(),
         pending_tx: Vec::new(),
         tcp_sockets: HashMap::new(),
@@ -60,7 +88,9 @@ pub fn init_net(ip: [u8; 4], gateway: [u8; 4]) {
         dns_replies: HashMap::new(),
     };
     nm.send_arp_request(gateway);
+    nm.send_dhcp_discover();
     *NET.lock().unwrap() = Some(nm);
+    crate::sdk::agent::audit_log("NET_LAN:PASS:DHCP_And_Discovery_Ready");
 }
 
 pub fn poll_network() {
@@ -232,9 +262,143 @@ impl NetworkManager {
     fn handle_udp(&mut self, _src_ip: [u8; 4], udp: &[u8]) {
         if udp.len() < 8 { return; }
         let src_port = ((udp[0] as u16) << 8) | (udp[1] as u16);
+        let dst_port = ((udp[2] as u16) << 8) | (udp[3] as u16);
         let payload = &udp[8..];
         if src_port == 53 {
             self.handle_dns_response(payload);
+        } else if src_port == 67 || dst_port == 68 {
+            self.handle_dhcp_reply(payload);
+        }
+    }
+
+    pub fn send_ipv4_broadcast(&self, src_ip: [u8; 4], protocol: u8, data: &[u8]) {
+        let total_len = (20 + data.len()) as u16;
+        let mut ip_hdr = vec![
+            0x45, 0x00, (total_len >> 8) as u8, (total_len & 0xFF) as u8,
+            0x1C, 0x25, 0x00, 0x00,
+            64, protocol, 0x00, 0x00,
+            src_ip[0], src_ip[1], src_ip[2], src_ip[3],
+            255, 255, 255, 255,
+        ];
+        let csum = calc_checksum(&ip_hdr);
+        ip_hdr[10] = (csum >> 8) as u8;
+        ip_hdr[11] = (csum & 0xFF) as u8;
+
+        let mut frame = Vec::with_capacity(14 + 20 + data.len());
+        frame.extend_from_slice(&[0xFF; 6]);
+        frame.extend_from_slice(&self.mac);
+        frame.extend_from_slice(&[0x08, 0x00]);
+        frame.extend_from_slice(&ip_hdr);
+        frame.extend_from_slice(data);
+        sys_net_tx(&frame);
+    }
+
+    pub fn send_dhcp_discover(&mut self) {
+        self.dhcp_xid = self.dhcp_xid.wrapping_add(1);
+        let mut bootp = vec![0u8; 240];
+        bootp[0] = 1; // BOOTREQUEST
+        bootp[1] = 1; // Ethernet
+        bootp[2] = 6; // MAC len
+        bootp[4..8].copy_from_slice(&self.dhcp_xid.to_be_bytes());
+        bootp[10..12].copy_from_slice(&0x8000u16.to_be_bytes()); // Broadcast flag
+        bootp[28..34].copy_from_slice(&self.mac);
+        bootp[236..240].copy_from_slice(&[99, 130, 83, 99]); // Magic cookie
+        bootp.extend_from_slice(&[53, 1, 1]); // DHCPDISCOVER
+        bootp.extend_from_slice(&[55, 3, 1, 3, 6]); // Subnet, Router, DNS
+        bootp.push(255); // END
+
+        let udp_len = (8 + bootp.len()) as u16;
+        let mut udp = vec![
+            0, 68, 0, 67,
+            (udp_len >> 8) as u8, (udp_len & 0xFF) as u8,
+            0, 0,
+        ];
+        udp.extend_from_slice(&bootp);
+        self.send_ipv4_broadcast([0, 0, 0, 0], 17, &udp);
+        self.dhcp_state = DhcpState::DiscoverSent;
+    }
+
+    fn send_dhcp_request(&mut self, offered_ip: [u8; 4], server_ip: [u8; 4]) {
+        let mut bootp = vec![0u8; 240];
+        bootp[0] = 1;
+        bootp[1] = 1;
+        bootp[2] = 6;
+        bootp[4..8].copy_from_slice(&self.dhcp_xid.to_be_bytes());
+        bootp[10..12].copy_from_slice(&0x8000u16.to_be_bytes());
+        bootp[28..34].copy_from_slice(&self.mac);
+        bootp[236..240].copy_from_slice(&[99, 130, 83, 99]);
+        bootp.extend_from_slice(&[53, 1, 3]); // DHCPREQUEST
+        bootp.extend_from_slice(&[50, 4, offered_ip[0], offered_ip[1], offered_ip[2], offered_ip[3]]);
+        bootp.extend_from_slice(&[54, 4, server_ip[0], server_ip[1], server_ip[2], server_ip[3]]);
+        bootp.extend_from_slice(&[55, 3, 1, 3, 6]);
+        bootp.push(255);
+
+        let udp_len = (8 + bootp.len()) as u16;
+        let mut udp = vec![
+            0, 68, 0, 67,
+            (udp_len >> 8) as u8, (udp_len & 0xFF) as u8,
+            0, 0,
+        ];
+        udp.extend_from_slice(&bootp);
+        self.send_ipv4_broadcast([0, 0, 0, 0], 17, &udp);
+        self.dhcp_state = DhcpState::RequestSent;
+    }
+
+    fn handle_dhcp_reply(&mut self, payload: &[u8]) {
+        if payload.len() < 244 || payload[0] != 2 { return; }
+        let xid = u32::from_be_bytes([payload[4], payload[5], payload[6], payload[7]]);
+        if xid != self.dhcp_xid { return; }
+        if &payload[236..240] != &[99, 130, 83, 99] { return; }
+
+        let yiaddr = [payload[16], payload[17], payload[18], payload[19]];
+        let mut msg_type = 0u8;
+        let mut server_id = [payload[20], payload[21], payload[22], payload[23]];
+        let mut subnet = self.subnet;
+        let mut router = self.gateway;
+        let mut dns = self.dns_server;
+
+        let mut i = 240;
+        while i < payload.len() {
+            let opt = payload[i];
+            if opt == 255 { break; }
+            if opt == 0 { i += 1; continue; }
+            if i + 1 >= payload.len() { break; }
+            let len = payload[i + 1] as usize;
+            if i + 2 + len > payload.len() { break; }
+            let val = &payload[i + 2..i + 2 + len];
+            match opt {
+                53 if len >= 1 => msg_type = val[0],
+                54 if len >= 4 => server_id = [val[0], val[1], val[2], val[3]],
+                1 if len >= 4 => subnet = [val[0], val[1], val[2], val[3]],
+                3 if len >= 4 => router = [val[0], val[1], val[2], val[3]],
+                6 if len >= 4 => dns = [val[0], val[1], val[2], val[3]],
+                _ => {}
+            }
+            i += 2 + len;
+        }
+
+        if msg_type == 2 && self.dhcp_state == DhcpState::DiscoverSent {
+            self.dhcp_server = server_id;
+            self.send_dhcp_request(yiaddr, server_id);
+        } else if msg_type == 5 {
+            self.ip = yiaddr;
+            self.subnet = subnet;
+            self.gateway = router;
+            self.dns_server = dns;
+            self.dhcp_server = server_id;
+            self.dhcp_state = DhcpState::Bound;
+            self.send_arp_request(router);
+        }
+    }
+
+    pub fn scan_lan_arp(&mut self) {
+        let base = [self.ip[0], self.ip[1], self.ip[2]];
+        let targets = [1u8, 2, 3, 4, 10, 15, 20, 50, 100, 254];
+        for &last in &targets {
+            let tip = [base[0], base[1], base[2], last];
+            if tip != self.ip {
+                self.send_arp_request(tip);
+            }
         }
     }
 
@@ -456,4 +620,123 @@ impl NetworkManager {
 
         port
     }
+}
+
+pub fn renew_dhcp_sync() -> Vec<String> {
+    {
+        let mut lock = NET.lock().unwrap();
+        if let Some(net) = lock.as_mut() {
+            net.send_dhcp_discover();
+        }
+    }
+    for _ in 0..40 {
+        poll_network();
+        let bound = {
+            let lock = NET.lock().unwrap();
+            lock.as_ref().map(|n| n.dhcp_state == DhcpState::Bound).unwrap_or(false)
+        };
+        if bound { break; }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    get_ifconfig_lines()
+}
+
+pub fn get_ifconfig_lines() -> Vec<String> {
+    poll_network();
+    let lock = NET.lock().unwrap();
+    if let Some(net) = lock.as_ref() {
+        let st = match net.dhcp_state {
+            DhcpState::Bound => "BOUND (Dynamic DHCP)",
+            DhcpState::RequestSent => "REQUESTING",
+            DhcpState::DiscoverSent => "DISCOVERING (Static Fallback Active)",
+            DhcpState::Idle => "STATIC",
+        };
+        vec![
+            "eth0: flags=4163<UP,BROADCAST,RUNNING>  mtu 1500".into(),
+            format!("      inet {}.{}.{}.{}  netmask {}.{}.{}.{}  gateway {}.{}.{}.{}",
+                net.ip[0], net.ip[1], net.ip[2], net.ip[3],
+                net.subnet[0], net.subnet[1], net.subnet[2], net.subnet[3],
+                net.gateway[0], net.gateway[1], net.gateway[2], net.gateway[3]),
+            format!("      dns  {}.{}.{}.{}  dhcp {}",
+                net.dns_server[0], net.dns_server[1], net.dns_server[2], net.dns_server[3], st),
+            format!("      ether {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  arp_neighbors {}",
+                net.mac[0], net.mac[1], net.mac[2], net.mac[3], net.mac[4], net.mac[5],
+                net.arp_cache.len()),
+        ]
+    } else {
+        vec!["eth0: DOWN (NetworkManager uninitialized)".into()]
+    }
+}
+
+pub fn get_arp_lines(do_scan: bool) -> Vec<String> {
+    if do_scan {
+        {
+            let mut lock = NET.lock().unwrap();
+            if let Some(net) = lock.as_mut() {
+                net.scan_lan_arp();
+            }
+        }
+        for _ in 0..16 {
+            poll_network();
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    } else {
+        poll_network();
+    }
+    let lock = NET.lock().unwrap();
+    let mut lines = vec!["Address           HWtype  HWaddress           Iface".to_string()];
+    if let Some(net) = lock.as_ref() {
+        let mut entries: Vec<([u8; 4], [u8; 6])> = net.arp_cache.iter().map(|(&k, &v)| (k, v)).collect();
+        entries.sort_by_key(|(ip, _)| *ip);
+        for (ip, mac) in entries {
+            lines.push(format!(
+                "{:<17} ether   {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}   eth0",
+                format!("{}.{}.{}.{}", ip[0], ip[1], ip[2], ip[3]),
+                mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
+            ));
+        }
+    }
+    if lines.len() == 1 {
+        lines.push("(no ARP entries yet — run 'arp -scan')".into());
+    }
+    lines
+}
+
+pub fn run_ping_sync(target_ip: [u8; 4], count: usize) -> Vec<String> {
+    let mut out = vec![format!("PING {}.{}.{}.{}: 16 data bytes", target_ip[0], target_ip[1], target_ip[2], target_ip[3])];
+    let mut received = 0usize;
+    for seq in 1..=count {
+        let t0 = std::time::Instant::now();
+        {
+            let mut lock = NET.lock().unwrap();
+            if let Some(net) = lock.as_mut() {
+                net.ping_replies.clear();
+                net.ping(target_ip, seq as u16);
+            }
+        }
+        let mut got = None;
+        for _ in 0..25 {
+            poll_network();
+            {
+                let mut lock = NET.lock().unwrap();
+                if let Some(net) = lock.as_mut() {
+                    if let Some(pos) = net.ping_replies.iter().position(|(ip, s, _)| *ip == target_ip && *s == seq) {
+                        got = Some(net.ping_replies.remove(pos));
+                    }
+                }
+            }
+            if got.is_some() { break; }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        if let Some((ip, s, bytes)) = got {
+            received += 1;
+            let ms = t0.elapsed().as_secs_f32() * 1000.0;
+            out.push(format!("{} bytes from {}.{}.{}.{}: icmp_seq={} ttl=64 time={:.1} ms", bytes, ip[0], ip[1], ip[2], ip[3], s, ms));
+        } else {
+            out.push(format!("Request timeout for icmp_seq {}", seq));
+        }
+    }
+    out.push(format!("--- {}.{}.{}.{} ping statistics: {} transmitted, {} received ---",
+        target_ip[0], target_ip[1], target_ip[2], target_ip[3], count, received));
+    out
 }

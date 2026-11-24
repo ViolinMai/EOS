@@ -234,6 +234,7 @@ DEFAULT_PHASE_MARKERS = [
     "SHORTCUTS_SCREENSHOT:PASS:Verified",
     "HW_PAT_WC:PASS:Framebuffer_Accelerated",
     "POWER_MGR:PASS:Clean_Shutdown_Ready",
+    "NET_LAN:PASS:DHCP_And_Discovery_Ready",
 ]
 
 CPYTHON_PHASE_MARKERS = [

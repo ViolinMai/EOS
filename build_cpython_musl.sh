@@ -41,15 +41,16 @@ cp -f libpython3.12.a "$VENDOR_DIR/lib/"
 cp -rf Include/* "$VENDOR_DIR/include/"
 cp -f pyconfig.h "$VENDOR_DIR/include/"
 
-echo "[*] Packaging stdlib into python312.zip..."
+echo "[*] Packaging uncompressed stdlib into python312.zip..."
 cd "$SRC_DIR/Lib"
-zip -q -r "$VENDOR_DIR/python312.zip" . -x "test/*" "idlelib/*" "tkinter/*" "turtledemo/*" "ensurepip/*"
+zip -0 -q -r "$VENDOR_DIR/python312.zip" . -x "test/*" "idlelib/*" "tkinter/*" "turtledemo/*" "ensurepip/*"
 
-# Copy python312.zip into EOS_SHARE if available
+# Provision python_stdlib and python_libs into EOS_SHARE if available
 if [ -d "/mnt/storage/delete/EOS_SHARE" ]; then
+    mkdir -p "/mnt/storage/delete/EOS_SHARE/python_libs" "/mnt/storage/delete/EOS_SHARE/python_stdlib"
     cp -f "$VENDOR_DIR/python312.zip" "/mnt/storage/delete/EOS_SHARE/python312.zip"
-    mkdir -p "/mnt/storage/delete/EOS_SHARE/python_libs"
-    echo "[+] Copied python312.zip to /mnt/storage/delete/EOS_SHARE/"
+    rsync -a --exclude='test' --exclude='idlelib' --exclude='tkinter' --exclude='turtledemo' --exclude='ensurepip' --exclude='__pycache__' "$SRC_DIR/Lib/" "/mnt/storage/delete/EOS_SHARE/python_stdlib/"
+    echo "[+] Provisioned python_stdlib and python312.zip to /mnt/storage/delete/EOS_SHARE/"
 fi
 
 echo "[+] CPython ${PY_VER} static build complete!"

@@ -511,7 +511,7 @@ def prepare_and_run(cli_args=None):
     if args.headless:
         extra_qemu_args += ["-vga", "none", "-device", "virtio-gpu-pci,xres=2560,yres=1440", "-audiodev", "none,id=snd0", "-device", "AC97,audiodev=snd0", "-display", "none"]
     elif os.name != "nt":
-        extra_qemu_args += ["-vga", "none", "-device", "virtio-gpu-gl-pci,xres=2560,yres=1440", "-audiodev", "sdl,id=snd0", "-device", "AC97,audiodev=snd0", "-display", "sdl,gl=on"]
+        extra_qemu_args += ["-vga", "none", "-device", "virtio-gpu-pci,xres=2560,yres=1440", "-audiodev", "sdl,id=snd0", "-device", "AC97,audiodev=snd0", "-display", "sdl"]
 
     accel_args = ["-accel", "tcg,thread=multi"]
     if os.name != "nt" and os.path.exists("/dev/kvm") and os.access("/dev/kvm", os.R_OK | os.W_OK):

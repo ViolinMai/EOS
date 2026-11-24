@@ -190,6 +190,20 @@ def ensure_test_subject():
     with open(out_seed_path, "wb") as f:
         f.write(b"{}")
 
+    # Sync CPython stdlib as plain .py files into EOS_SHARE/python_stdlib (avoids zlib/zipimport overhead)
+    py_src_lib = os.path.join("userspace", "vendor", "cpython_src", "Lib")
+    py_dst_lib = os.path.join(os.path.dirname(TEST_SUBJECT_DIR), "python_stdlib")
+    if os.path.isdir(py_src_lib) and not os.path.exists(os.path.join(py_dst_lib, "encodings", "__init__.py")):
+        import shutil
+        skip_dirs = {"test", "idlelib", "tkinter", "turtledemo", "ensurepip", "__pycache__", "lib2to3", "pydoc_data"}
+        shutil.copytree(
+            py_src_lib,
+            py_dst_lib,
+            ignore=lambda d, names: [n for n in names if n in skip_dirs or n.endswith(".pyc")],
+            dirs_exist_ok=True,
+        )
+        print(f"[+] Provisioned CPython stdlib at {py_dst_lib}")
+
     print(f"[+] TEST_SUBJECT ready at {TEST_SUBJECT_DIR} ({len(manifest['files'])} golden test assets).")
     return manifest
 
