@@ -24,7 +24,9 @@ pub struct FinderApp {
     search_query: String,
     search_focused: bool,
     scrollbar: SmoothScrollBar,
+    dragging_scrollbar: bool,
     scroll_y: i32,
+    status_msg: String,
     ctx_menu: crate::framework::menu::ContextMenu,
     pub pending_open_text: Option<String>,
     pub pending_open_image: Option<(String, String)>,
@@ -32,14 +34,15 @@ pub struct FinderApp {
 
 impl FinderApp {
     pub fn new() -> Self {
-        let mut init_dir = "EOS SHARE".to_string();
-        if let Ok(nav) = fs::read_to_string("RootFS/finder_nav.ini") {
-            let trimmed = nav.trim();
-            if !trimmed.is_empty() {
-                init_dir = trimmed.to_string();
-            }
-            let _ = fs::remove_file("RootFS/finder_nav.ini");
-        }
+        Self::with_dir("EOS SHARE")
+    }
+
+    pub fn with_dir(dir: &str) -> Self {
+        let init_dir = if dir.trim().is_empty() {
+            "EOS SHARE".to_string()
+        } else {
+            dir.trim().to_string()
+        };
         let mut app = Self {
             bounds: Rect::default(),
             current_dir: init_dir,
@@ -50,7 +53,9 @@ impl FinderApp {
             search_query: String::new(),
             search_focused: false,
             scrollbar: SmoothScrollBar::new(),
+            dragging_scrollbar: false,
             scroll_y: 0,
+            status_msg: String::from("Ready"),
             ctx_menu: crate::framework::menu::ContextMenu::new(),
             pending_open_text: None,
             pending_open_image: None,
@@ -183,16 +188,66 @@ impl FinderApp {
         }
 
         let lower = item.name.to_ascii_lowercase();
-        let _ = fs::write("RootFS/open_file.ini", full_path.as_bytes());
         if lower.ends_with(".mp4") || lower.ends_with(".mkv") || lower.ends_with(".avi") || lower.ends_with(".webm") || lower.ends_with(".mov") {
-            let _ = crate::syscall::sys_spawn_elf("user_app.elf", "eos_video.elf --app Video");
+            let args = format!("eos_video.elf --app Video --file \"{}\"", full_path);
+            let _ = crate::syscall::sys_spawn_elf("user_app.elf", &args);
         } else if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
             self.pending_open_image = Some((item.name, full_path.clone()));
-            let _ = crate::syscall::sys_spawn_elf("user_app.elf", "eos_preview.elf --app Preview");
+            let args = format!("eos_preview.elf --app Preview --file \"{}\"", full_path);
+            let _ = crate::syscall::sys_spawn_elf("user_app.elf", &args);
         } else {
             self.pending_open_text = Some(full_path.clone());
-            let _ = crate::syscall::sys_spawn_elf("user_app.elf", "eos_textedit.elf --app TextEdit");
+            let args = format!("eos_textedit.elf --app TextEdit --file \"{}\"", full_path);
+            let _ = crate::syscall::sys_spawn_elf("user_app.elf", &args);
         }
+    }
+
+    fn selected_full_path(&self) -> Option<String> {
+        let idx = self.selected_idx?;
+        let item = self.items.get(idx)?;
+        let clean = self.current_dir.trim_matches('/');
+        Some(if clean.is_empty() || clean == "." {
+            item.name.clone()
+        } else {
+            format!("{}/{}", clean, item.name)
+        })
+    }
+
+    fn copy_selected_path(&mut self) {
+        if let Some(p) = self.selected_full_path() {
+            let _ = crate::syscall::sys_clipboard_set(&p);
+            self.status_msg = format!("Copied path: /{}", p);
+        }
+    }
+
+    fn delete_selected_item(&mut self) {
+        if let Some(p) = self.selected_full_path() {
+            match fs::remove_file(&p) {
+                Ok(_) => {
+                    self.status_msg = format!("Deleted '{}'", p);
+                    self.refresh();
+                }
+                Err(_) => {
+                    self.status_msg = format!("Cannot delete '{}'", p);
+                }
+            }
+        }
+    }
+
+    fn open_in_terminal(&mut self) {
+        let _ = crate::syscall::sys_spawn_elf("user_app.elf", "eos_terminal.elf --app Terminal");
+        self.status_msg = "Opened Terminal".into();
+    }
+
+    fn max_scroll_px(&self) -> i32 {
+        let theme = get_theme();
+        let rows = if self.grid_mode {
+            ((self.filtered_indices().len() + 3) / 4) as i32
+        } else {
+            self.filtered_indices().len() as i32
+        };
+        let row_h = if self.grid_mode { theme.pt(118.0) } else { theme.pt(32.0) };
+        (rows * row_h - (self.bounds.h - theme.pt(88.0))).max(0)
     }
 }
 
@@ -222,13 +277,20 @@ impl Widget for FinderApp {
 
         let btn_y = y + theme.pt(5.0);
         let btn_h = tb_h - theme.pt(10.0);
-        let nav_btns = [("Back", theme.pt(44.0)), ("Up", theme.pt(34.0)), ("Refresh", theme.pt(56.0))];
+        let nav_btns = [
+            ("Back", theme.pt(42.0), theme.bg_panel),
+            ("Up", theme.pt(30.0), theme.bg_panel),
+            ("Refresh", theme.pt(54.0), theme.bg_panel),
+            ("CopyPath", theme.pt(62.0), theme.bg_panel),
+            ("Term", theme.pt(42.0), theme.bg_panel),
+            ("Del", theme.pt(34.0), 0xFF991B1B),
+        ];
         let mut bx = x + pad;
-        for (lbl, bw) in nav_btns {
-            canvas.draw_rect(bx, btn_y, bw, btn_h, theme.bg_panel, 5);
+        for (lbl, bw, bg) in nav_btns {
+            canvas.draw_rect(bx, btn_y, bw, btn_h, bg, 5);
             canvas.draw_rect_outline(bx, btn_y, bw, btn_h, theme.border_window, 5);
-            canvas.draw_text(bx + theme.pt(7.0), btn_y + theme.pt(5.0), lbl, theme.text_primary, theme.font_caption());
-            bx += bw + theme.pt(5.0);
+            canvas.draw_text(bx + theme.pt(6.0), btn_y + theme.pt(5.0), lbl, 0xFFFFFFFF, theme.font_caption());
+            bx += bw + theme.pt(4.0);
         }
 
         let mode_w = theme.pt(58.0);
@@ -361,11 +423,21 @@ impl Widget for FinderApp {
 
         self.scrollbar.paint(canvas, x + w - theme.pt(10.0), body_y + 4, body_h - 8);
 
-        // 4. Bottom Status Bar
+        // 4. Bottom Details Bar (Milestone 16)
         let st_y = y + h - status_h;
         canvas.draw_rect(x, st_y, w, status_h, theme.bg_sidebar, 0);
         canvas.draw_line_h(x, st_y, w, theme.border_window);
-        canvas.draw_text(x + pad, st_y + theme.pt(4.0), &format!("{} items  |  Double-click to open", visible.len()), theme.text_secondary, theme.font_caption());
+        let detail = if let Some(idx) = self.selected_idx {
+            if let Some(it) = self.items.get(idx) {
+                let kind = if it.is_dir { "Folder" } else { "File" };
+                format!("{} items  |  Selected: {} ({}, {} B)  |  {}", visible.len(), it.name, kind, it.size, self.status_msg)
+            } else {
+                format!("{} items  |  {}", visible.len(), self.status_msg)
+            }
+        } else {
+            format!("{} items  |  {}  |  Double-click to open", visible.len(), self.status_msg)
+        };
+        canvas.draw_text_clipped(x + pad, st_y + theme.pt(4.0), w - pad * 2, &detail, theme.text_secondary, theme.font_caption());
 
         self.ctx_menu.draw(canvas);
     }
@@ -385,23 +457,46 @@ impl Widget for FinderApp {
             }
             return true;
         }
-        if !pressed { return true; }
+        let body_y = self.bounds.y + tb_h + 1;
+        let status_h = theme.pt(24.0);
+        let body_h = (self.bounds.h - tb_h - status_h - 1).max(80);
+        let sb_hit_x = self.bounds.x + self.bounds.w - theme.pt(16.0);
+
+        if !pressed {
+            self.dragging_scrollbar = false;
+            self.scrollbar.hovered = mx >= sb_hit_x && my >= body_y && my <= body_y + body_h;
+            return true;
+        }
+
+        // SmoothScrollBar Direct Click & Drag (Milestone 16)
+        if mx >= sb_hit_x && my >= body_y && my <= body_y + body_h {
+            self.dragging_scrollbar = true;
+            let ratio = ((my - body_y) as f32 / body_h.max(1) as f32).clamp(0.0, 1.0);
+            let max_s = self.max_scroll_px();
+            self.scroll_y = (ratio * max_s as f32) as i32;
+            self.scrollbar.target = ratio;
+            self.scrollbar.value = ratio;
+            return true;
+        }
 
         // Toolbar clicks
         if my >= self.bounds.y && my <= self.bounds.y + tb_h {
             let mut bx = self.bounds.x + pad;
-            let widths = [theme.pt(44.0), theme.pt(34.0), theme.pt(56.0)];
+            let widths = [theme.pt(42.0), theme.pt(30.0), theme.pt(54.0), theme.pt(62.0), theme.pt(42.0), theme.pt(34.0)];
             for (i, bw) in widths.iter().enumerate() {
                 if mx >= bx && mx <= bx + *bw {
                     match i {
                         0 => if let Some(prev) = self.history.pop() { self.current_dir = prev; self.refresh(); },
                         1 => self.navigate_up(),
                         2 => self.refresh(),
+                        3 => self.copy_selected_path(),
+                        4 => self.open_in_terminal(),
+                        5 => self.delete_selected_item(),
                         _ => {}
                     }
                     return true;
                 }
-                bx += *bw + theme.pt(5.0);
+                bx += *bw + theme.pt(4.0);
             }
 
             let mode_w = theme.pt(58.0);
@@ -489,6 +584,21 @@ impl Widget for FinderApp {
         self.scrollbar.target = if max_s > 0 { self.scroll_y as f32 / max_s as f32 } else { 0.0 };
         self.scrollbar.value = self.scrollbar.target;
         true
+    }
+
+    fn handle_key(&mut self, keycode: u8, mods: u8) -> bool {
+        if self.search_focused { return false; }
+        let is_ctrl = (mods & 0x02) != 0;
+        if is_ctrl && keycode == 0x2E {
+            self.copy_selected_path();
+            return true;
+        }
+        match keycode {
+            0x53 => { self.delete_selected_item(); true } // Delete
+            0x3F => { self.refresh(); true }              // F5
+            0x1C => { if let Some(idx) = self.selected_idx { self.activate_item(idx); } true }
+            _ => false,
+        }
     }
 
     fn handle_char(&mut self, c: char) -> bool {

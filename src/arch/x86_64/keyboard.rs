@@ -77,22 +77,43 @@ pub fn handle_scancode(scancode: u8) {
         return;
     }
 
+    let mods_now = get_current_mods();
+    let ctrl_alt = (mods_now & (MOD_CTRL | MOD_ALT)) == (MOD_CTRL | MOD_ALT);
+    let ctrl_shift = (mods_now & (MOD_CTRL | MOD_SHIFT)) == (MOD_CTRL | MOD_SHIFT);
+
+    // Ctrl+Alt+F2 OR Ctrl+Shift+F2 -> Switch to Full-Screen Linux-style TTY2 Root Shell
+    if (ctrl_alt || ctrl_shift) && code == 0x3C {
+        crate::writer::request_tty_switch(2);
+        return;
+    }
+    // Ctrl+Alt+F1 OR Ctrl+Shift+F1 -> Return to Graphical Desktop (TTY1)
+    if (ctrl_alt || ctrl_shift) && code == 0x3B {
+        crate::writer::request_tty_switch(1);
+        return;
+    }
+
     match code {
         0x2A | 0x36 => { SHIFT_ACTIVE.store(true, Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; }
         0x1D => { CTRL_ACTIVE.store(true, Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; }
         0x38 => { ALT_ACTIVE.store(true, Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; }
         0x3A => { CAPS_ACTIVE.store(!CAPS_ACTIVE.load(Ordering::Relaxed), Ordering::Relaxed); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; }
-        0x01 => { push_event(InputEvent::Nav(NavAction::Back)); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; } 
-        0x1C => { 
-            push_event(InputEvent::Nav(NavAction::Select)); 
+        0x01 => { push_event(InputEvent::Nav(NavAction::Back)); push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() }); return; }
+        0x1C => {
+            if crate::writer::active_tty() == 2 {
+                crate::writer::tty_push_byte(b'\n');
+                return;
+            }
+            push_event(InputEvent::Nav(NavAction::Select));
             push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() });
-            push_event(InputEvent::Char('\n')); 
-            return; 
+            push_event(InputEvent::Char('\n'));
+            return;
         }
         _ => {}
     }
 
-    push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() });
+    if crate::writer::active_tty() != 2 {
+        push_event(InputEvent::KeyDown { keycode: code, mods: get_current_mods() });
+    }
 
     let shift = SHIFT_ACTIVE.load(Ordering::Relaxed);
     let caps = CAPS_ACTIVE.load(Ordering::Relaxed);
@@ -128,5 +149,11 @@ pub fn handle_scancode(scancode: u8) {
         0x39 => ' ',
         _ => return,
     };
+    if crate::writer::active_tty() == 2 {
+        if c.is_ascii() {
+            crate::writer::tty_push_byte(c as u8);
+        }
+        return;
+    }
     push_event(InputEvent::Char(c));
 }

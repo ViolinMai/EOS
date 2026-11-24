@@ -6,6 +6,13 @@ pub enum ThemeStyle {
     CleanModern,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LayoutDirection {
+    Auto,
+    Ltr,
+    Rtl,
+}
+
 #[derive(Clone, Debug)]
 pub struct Theme {
     pub style: ThemeStyle,
@@ -36,6 +43,10 @@ pub struct Theme {
     pub btn_close_glow: u32,
     pub btn_minimize: u32,
     pub btn_maximize: u32,
+    pub ui_font: String,
+    pub mono_font: String,
+    pub arabic_font: String,
+    pub direction: LayoutDirection,
 }
 
 impl Theme {
@@ -73,6 +84,10 @@ impl Theme {
             btn_close_glow: 0xFFF87171,
             btn_minimize: 0xFF3B82F6,
             btn_maximize: 0xFF0284C7,
+            ui_font: String::from("System Sans"),
+            mono_font: String::from("System Mono"),
+            arabic_font: String::from("System Sans"),
+            direction: LayoutDirection::Auto,
         }
     }
 
@@ -107,6 +122,10 @@ impl Theme {
                 btn_close_glow: 0xFFED5565,
                 btn_minimize: 0xFF3DAEE9,
                 btn_maximize: 0xFF3DAEE9,
+                ui_font: String::from("System Sans"),
+                mono_font: String::from("System Mono"),
+                arabic_font: String::from("System Sans"),
+                direction: LayoutDirection::Auto,
             }
         } else {
             Self {
@@ -138,6 +157,10 @@ impl Theme {
                 btn_close_glow: 0xFFED5565,
                 btn_minimize: 0xFF3DAEE9,
                 btn_maximize: 0xFF3DAEE9,
+                ui_font: String::from("System Sans"),
+                mono_font: String::from("System Mono"),
+                arabic_font: String::from("System Sans"),
+                direction: LayoutDirection::Auto,
             }
         }
     }
@@ -172,6 +195,10 @@ impl Theme {
             btn_close_glow: 0xFFF87171,
             btn_minimize: 0xFF3B82F6,
             btn_maximize: 0xFF0284C7,
+            ui_font: String::from("System Sans"),
+            mono_font: String::from("System Mono"),
+            arabic_font: String::from("System Sans"),
+            direction: LayoutDirection::Auto,
         }
     }
 
@@ -274,6 +301,12 @@ pub fn set_theme_scale(scale: f32) {
     t.scale = scale.clamp(1.0, 3.0);
 }
 
+pub fn set_layout_direction(dir: LayoutDirection) {
+    let t = get_theme_mut();
+    t.direction = dir;
+    redraw_fullscreen();
+}
+
 pub fn set_theme_corner_radius(radius: f32) {
     let t = get_theme_mut();
     t.corner_radius = radius.clamp(0.0, 24.0);
@@ -345,6 +378,9 @@ pub fn sync_theme_from_disk_if_changed() -> bool {
     let mut accent: Option<u32> = None;
     let mut wp_name: Option<String> = None;
     let mut scale_val: Option<f32> = None;
+    let mut ui_f: Option<String> = None;
+    let mut mono_f: Option<String> = None;
+    let mut ar_f: Option<String> = None;
 
     for line in content.lines() {
         let l = line.trim();
@@ -364,12 +400,33 @@ pub fn sync_theme_from_disk_if_changed() -> bool {
             if !w.is_empty() { wp_name = Some(w.to_string()); }
         } else if let Some(v) = l.strip_prefix("scale=") {
             if let Ok(s) = v.trim().parse::<f32>() { scale_val = Some(s); }
+        } else if let Some(v) = l.strip_prefix("ui_font=") {
+            if !v.trim().is_empty() { ui_f = Some(v.trim().to_string()); }
+        } else if let Some(v) = l.strip_prefix("mono_font=") {
+            if !v.trim().is_empty() { mono_f = Some(v.trim().to_string()); }
+        } else if let Some(v) = l.strip_prefix("arabic_font=") {
+            if !v.trim().is_empty() { ar_f = Some(v.trim().to_string()); }
         }
     }
 
     set_theme_style(style, dark);
     if let Some(c) = accent { set_theme_accent(c); }
     if let Some(s) = scale_val { set_theme_scale(s); }
+    if let Some(f) = ui_f {
+        if crate::framework::fonts::set_role_font(crate::framework::fonts::FontRole::Ui, &f) {
+            get_theme_mut().ui_font = f;
+        }
+    }
+    if let Some(f) = mono_f {
+        if crate::framework::fonts::set_role_font(crate::framework::fonts::FontRole::Mono, &f) {
+            get_theme_mut().mono_font = f;
+        }
+    }
+    if let Some(f) = ar_f {
+        if crate::framework::fonts::set_role_font(crate::framework::fonts::FontRole::Arabic, &f) {
+            get_theme_mut().arabic_font = f;
+        }
+    }
 
     if let Some(wp) = wp_name {
         if wp == "none" {

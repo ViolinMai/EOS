@@ -1,0 +1,427 @@
+use core::arch::asm;
+use alloc::string::String;
+use alloc::vec::Vec;
+use crate::log_info;
+use core::sync::atomic::{AtomicBool, Ordering};
+
+pub struct AtaSpinlock { locked: AtomicBool }
+impl AtaSpinlock {
+    pub const fn new() -> Self { Self { locked: AtomicBool::new(false) } }
+    pub fn lock(&self) { while self.locked.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() { core::hint::spin_loop(); } }
+    pub fn unlock(&self) { self.locked.store(false, Ordering::Release); }
+}
+pub static ATA_LOCK: AtaSpinlock = AtaSpinlock::new();
+
+const ATA_PRIMARY_IO_BASE: u16 = 0x1F0;
+const ATA_SECONDARY_IO_BASE: u16 = 0x170;
+const ATA_REG_DATA: u16 = 0; const ATA_REG_SECTOR_CNT: u16 = 2; const ATA_REG_LBA_LO: u16 = 3;
+const ATA_REG_LBA_MID: u16 = 4; const ATA_REG_LBA_HI: u16 = 5; const ATA_REG_DRIVE: u16 = 6;
+const ATA_REG_STATUS: u16 = 7; const ATA_REG_COMMAND: u16 = 7;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MediaType { Video, Image, Executable, Text, Directory, Unknown }
+
+#[derive(Clone, Debug)]
+pub struct DiskFileInfo {
+    pub name: String,
+    pub size: u32,
+    pub first_cluster: u32,
+    pub dir_entry_lba: u32,
+    pub dir_entry_offset: usize,
+    pub media_type: MediaType,
+    pub is_dir: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum FatType { Fat12, Fat16, Fat32 }
+
+#[derive(Clone)]
+pub struct FatLayout {
+    pub fat_type: FatType,
+    pub spc: u32,
+    pub fat_start_lba: u32,
+    pub data_start_lba: u32,
+    pub root_dir_lba: u32,
+    pub root_dir_sectors: u32,
+    pub root_cluster: u32,
+}
+
+#[inline(always)]
+pub fn is_fat_eof(fat_type: FatType, cluster: u32) -> bool {
+    match fat_type {
+        FatType::Fat12 => cluster >= 0x0FF8,
+        FatType::Fat16 => cluster >= 0xFFF8,
+        FatType::Fat32 => cluster >= 0x0FFF_FFF8,
+    }
+}
+
+#[inline]
+fn get_drive_io_base_and_head(drive: u8) -> (u16, u8) {
+    match drive { 
+        0 => (ATA_PRIMARY_IO_BASE, 0xE0), 
+        1 => (ATA_PRIMARY_IO_BASE, 0xF0),
+        2 => (ATA_SECONDARY_IO_BASE, 0xE0), 
+        3 => (ATA_SECONDARY_IO_BASE, 0xF0), 
+        _ => (ATA_PRIMARY_IO_BASE, 0xE0), 
+    }
+}
+
+#[inline]
+unsafe fn inb(port: u16) -> u8 { let val: u8; unsafe { asm!("in al, dx", in("dx") port, out("al") val, options(nomem, nostack, preserves_flags)); } val }
+#[inline]
+unsafe fn outb(port: u16, val: u8) { unsafe { asm!("out dx, al", in("dx") port, in("al") val, options(nomem, nostack, preserves_flags)); } }
+#[inline]
+unsafe fn insw(port: u16, buf: *mut u16, count: usize) { unsafe { asm!("rep insw", in("dx") port, inout("rdi") buf => _, inout("rcx") count => _, options(nomem, nostack)); } }
+#[inline]
+unsafe fn outsw(port: u16, buf: *const u16, count: usize) { unsafe { asm!("rep outsw", in("dx") port, inout("rsi") buf => _, inout("rcx") count => _, options(nomem, nostack)); } }
+
+#[inline]
+unsafe fn ata_io_wait(io_base: u16) {
+    unsafe {
+        let _ = inb(io_base + ATA_REG_STATUS);
+        let _ = inb(io_base + ATA_REG_STATUS);
+        let _ = inb(io_base + ATA_REG_STATUS);
+        let _ = inb(io_base + ATA_REG_STATUS);
+    }
+}
+
+fn poll_drive_ready(io_base: u16, expect_drq: bool) -> Result<(), &'static str> {
+    for _ in 0..100_000 {
+        let status = unsafe { inb(io_base + ATA_REG_STATUS) };
+        if status == 0xFF { return Err("ATA Floating Bus"); }
+        if (status & 0x80) == 0 {
+            if (status & 0x21) != 0 { return Err("ATA Drive Fault"); }
+            if expect_drq { if (status & 0x08) != 0 { return Ok(()); } }
+            else if (status & 0x40) != 0 { return Ok(()); }
+        }
+    }
+    Err("ATA Timeout")
+}
+
+pub fn read_sector_drive(drive: u8, lba: u32, buffer: &mut [u8; 512]) -> Result<(), &'static str> {
+    ATA_LOCK.lock();
+    let res = (|| -> Result<(), &'static str> {
+        let (io_base, drive_head) = get_drive_io_base_and_head(drive);
+        unsafe {
+            outb(io_base + ATA_REG_DRIVE, drive_head | (((lba >> 24) & 0x0F) as u8));
+            ata_io_wait(io_base); poll_drive_ready(io_base, false)?;
+            outb(io_base + ATA_REG_SECTOR_CNT, 1);
+            outb(io_base + ATA_REG_LBA_LO, (lba & 0xFF) as u8);
+            outb(io_base + ATA_REG_LBA_MID, ((lba >> 8) & 0xFF) as u8);
+            outb(io_base + ATA_REG_LBA_HI, ((lba >> 16) & 0xFF) as u8);
+            outb(io_base + ATA_REG_COMMAND, 0x20);
+            ata_io_wait(io_base); poll_drive_ready(io_base, true)?;
+            insw(io_base + ATA_REG_DATA, buffer.as_mut_ptr() as *mut u16, 256);
+        }
+        Ok(())
+    })();
+    ATA_LOCK.unlock();
+    res
+}
+
+pub fn write_sector_drive(drive: u8, lba: u32, buffer: &[u8; 512]) -> Result<(), &'static str> {
+    ATA_LOCK.lock();
+    let res = (|| -> Result<(), &'static str> {
+        let (io_base, drive_head) = get_drive_io_base_and_head(drive);
+        unsafe {
+            outb(io_base + ATA_REG_DRIVE, drive_head | (((lba >> 24) & 0x0F) as u8));
+            ata_io_wait(io_base); poll_drive_ready(io_base, false)?;
+            outb(io_base + ATA_REG_SECTOR_CNT, 1);
+            outb(io_base + ATA_REG_LBA_LO, (lba & 0xFF) as u8);
+            outb(io_base + ATA_REG_LBA_MID, ((lba >> 8) & 0xFF) as u8);
+            outb(io_base + ATA_REG_LBA_HI, ((lba >> 16) & 0xFF) as u8);
+            outb(io_base + ATA_REG_COMMAND, 0x30);
+            ata_io_wait(io_base); poll_drive_ready(io_base, true)?;
+            let src_ptr = buffer.as_ptr() as *const u16;
+            outsw(io_base + ATA_REG_DATA, src_ptr, 256);
+            outb(io_base + ATA_REG_COMMAND, 0xE7);
+            ata_io_wait(io_base); poll_drive_ready(io_base, false)?;
+        }
+        Ok(())
+    })();
+    ATA_LOCK.unlock();
+    res
+}
+
+pub fn get_fat_layout(drive: u8) -> Result<FatLayout, &'static str> {
+    let mut sector = [0u8; 512];
+    read_sector_drive(drive, 0, &mut sector)?;
+    let mut start_lba = 0u32;
+
+    let is_direct_vbr = (sector[0] == 0xEB || sector[0] == 0xE9) && (
+        &sector[54..59] == b"FAT12" || &sector[54..59] == b"FAT16" || &sector[82..87] == b"FAT32"
+    );
+
+    if !is_direct_vbr && sector[510] == 0x55 && sector[511] == 0xAA {
+        let part_type = sector[446 + 4];
+        if part_type != 0 && (sector[446] == 0x80 || sector[446] == 0x00) {
+            let p_lba = u32::from_le_bytes([sector[446 + 8], sector[446 + 9], sector[446 + 10], sector[446 + 11]]);
+            if p_lba > 0 && p_lba < 0x1000_0000 {
+                start_lba = p_lba;
+                read_sector_drive(drive, start_lba, &mut sector)?;
+            }
+        }
+    }
+
+    let spc = (sector[13] as u32).max(1);
+    let reserved_sectors = u16::from_le_bytes([sector[14], sector[15]]) as u32;
+    let num_fats = (sector[16] as u32).max(1);
+    let root_entries = u16::from_le_bytes([sector[17], sector[18]]) as u32;
+    let mut total_sectors = u16::from_le_bytes([sector[19], sector[20]]) as u32;
+    if total_sectors == 0 { total_sectors = u32::from_le_bytes([sector[32], sector[33], sector[34], sector[35]]); }
+    let fat_sz16 = u16::from_le_bytes([sector[22], sector[23]]) as u32;
+    let fat_sz32 = u32::from_le_bytes([sector[36], sector[37], sector[38], sector[39]]);
+    let is_fat32 = fat_sz16 == 0 || &sector[82..87] == b"FAT32";
+
+    if is_fat32 {
+        let real_fat_sz = if fat_sz32 != 0 { fat_sz32 } else { fat_sz16 };
+        let root_cluster = u32::from_le_bytes([sector[44], sector[45], sector[46], sector[47]]).max(2);
+        let fat_start_lba = start_lba + reserved_sectors;
+        let data_start_lba = fat_start_lba + (num_fats * real_fat_sz);
+        let root_lba = data_start_lba + (root_cluster - 2) * spc;
+        Ok(FatLayout {
+            fat_type: FatType::Fat32, spc, fat_start_lba,
+            data_start_lba, root_dir_lba: root_lba, root_dir_sectors: spc, root_cluster,
+        })
+    } else {
+        let root_sectors = ((root_entries * 32) + 511) / 512;
+        let fat_start_lba = start_lba + reserved_sectors;
+        let root_lba = fat_start_lba + (num_fats * fat_sz16);
+        let data_start_lba = root_lba + root_sectors;
+        let data_sectors = total_sectors.saturating_sub(reserved_sectors + (num_fats * fat_sz16) + root_sectors);
+        let t_c = data_sectors / spc;
+        let f_type = if t_c < 4085 { FatType::Fat12 } else { FatType::Fat16 };
+        Ok(FatLayout {
+            fat_type: f_type, spc, fat_start_lba,
+            data_start_lba, root_dir_lba: root_lba, root_dir_sectors: root_sectors, root_cluster: 0,
+        })
+    }
+}
+
+pub fn get_next_cluster(drive: u8, layout: &FatLayout, cluster: u32) -> Result<u32, &'static str> {
+    let fat_offset = match layout.fat_type {
+        FatType::Fat32 => cluster * 4,
+        FatType::Fat16 => cluster * 2,
+        FatType::Fat12 => return Err("FAT12 not supported"),
+    };
+    let fat_sector_lba = layout.fat_start_lba + (fat_offset / 512);
+    let mut buf = [0u8; 512];
+    read_sector_drive(drive, fat_sector_lba, &mut buf)?;
+    let entry_offset = (fat_offset % 512) as usize;
+    match layout.fat_type {
+        FatType::Fat32 => {
+            Ok(u32::from_le_bytes([buf[entry_offset], buf[entry_offset + 1], buf[entry_offset + 2], buf[entry_offset + 3]]) & 0x0FFF_FFFF)
+        }
+        FatType::Fat16 => {
+            Ok(u16::from_le_bytes([buf[entry_offset], buf[entry_offset + 1]]) as u32)
+        }
+        _ => Err("Unsupported FAT"),
+    }
+}
+
+pub fn scan_dir_cluster(drive: u8, cluster: u32) -> Result<Vec<DiskFileInfo>, &'static str> {
+    let layout = get_fat_layout(drive)?;
+    let mut files = Vec::new();
+    let mut sector = [0u8; 512];
+    let mut lfn_parts: Vec<(u8, String)> = Vec::new();
+
+    let mut read_dir_sector = |start_lba: u32, s: u32| -> Result<bool, &'static str> {
+        if read_sector_drive(drive, start_lba + s, &mut sector).is_err() { return Ok(false); }
+        for entry_idx in 0..16 {
+            let offset = entry_idx * 32;
+            let first_byte = sector[offset];
+            if first_byte == 0x00 { return Ok(false); }
+            if first_byte == 0xE5 { lfn_parts.clear(); continue; }
+
+            let attr = sector[offset + 11];
+            if attr == 0x08 { lfn_parts.clear(); continue; }
+            if attr == 0x0F {
+                let seq = first_byte & 0x1F;
+                let mut chars = Vec::new();
+                let offsets = [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30];
+                for &o in &offsets {
+                    let c = u16::from_le_bytes([sector[offset + o], sector[offset + o + 1]]);
+                    if c == 0 || c == 0xFFFF { break; }
+                    if let Some(ch) = char::from_u32(c as u32) { chars.push(ch); } else { chars.push('?'); }
+                }
+                let part_str: String = chars.into_iter().collect();
+                lfn_parts.push((seq, part_str));
+                continue;
+            }
+
+            let is_dir = (attr & 0x10) != 0;
+            let mut name = String::new();
+
+            if !lfn_parts.is_empty() {
+                lfn_parts.sort_by(|a, b| a.0.cmp(&b.0));
+                for (_, part) in &lfn_parts { name.push_str(part); }
+                lfn_parts.clear();
+            } else {
+                for &b in &sector[offset..offset + 8] { if b != b' ' { name.push(b as char); } }
+                let mut ext = String::new();
+                for &b in &sector[offset + 8..offset + 11] { if b != b' ' { ext.push(b as char); } }
+                if !ext.is_empty() { name.push('.'); name.push_str(&ext); }
+            }
+
+            if name == "." || name == ".." { continue; }
+
+            let first_cluster = if let FatType::Fat32 = layout.fat_type {
+                ((u16::from_le_bytes([sector[offset + 20], sector[offset + 21]]) as u32) << 16)
+                    | (u16::from_le_bytes([sector[offset + 26], sector[offset + 27]]) as u32)
+            } else {
+                u16::from_le_bytes([sector[offset + 26], sector[offset + 27]]) as u32
+            };
+
+            let size = u32::from_le_bytes([sector[offset + 28], sector[offset + 29], sector[offset + 30], sector[offset + 31]]);
+
+            let mtype = if is_dir { MediaType::Directory } else {
+                let l = name.to_ascii_lowercase();
+                if l.ends_with(".elf") { MediaType::Executable }
+                else if l.ends_with(".png") || l.ends_with(".jpg") || l.ends_with(".jpeg") { MediaType::Image }
+                else if l.ends_with(".mkv") || l.ends_with(".mp4") { MediaType::Video }
+                else { MediaType::Text }
+            };
+
+            files.push(DiskFileInfo {
+                name, size, first_cluster,
+                dir_entry_lba: start_lba + s, dir_entry_offset: offset, media_type: mtype, is_dir,
+            });
+        }
+        Ok(true)
+    };
+
+    if cluster == 0 {
+        let start_lba = layout.root_dir_lba;
+        for s in 0..layout.root_dir_sectors {
+            if !read_dir_sector(start_lba, s)? { break; }
+        }
+    } else {
+        let mut current_cluster = cluster;
+        while current_cluster >= 2 {
+            let start_lba = layout.data_start_lba + (current_cluster - 2) * layout.spc;
+            for s in 0..layout.spc {
+                if !read_dir_sector(start_lba, s)? { return Ok(files); }
+            }
+            let next = get_next_cluster(drive, &layout, current_cluster)?;
+            if is_fat_eof(layout.fat_type, next) {
+                break;
+            }
+            current_cluster = next;
+        }
+    }
+    Ok(files)
+}
+
+pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
+    let layout = get_fat_layout(1)?;
+    let start_cluster = if let FatType::Fat32 = layout.fat_type { layout.root_cluster } else { 0 };
+    scan_dir_cluster(1, start_cluster)
+}
+
+pub fn read_entire_file(drive: u8, file_info: &DiskFileInfo) -> Result<Vec<u8>, &'static str> {
+    let layout = get_fat_layout(drive)?;
+    let mut data = Vec::with_capacity(file_info.size as usize);
+    let mut current_cluster = file_info.first_cluster;
+    let mut remaining = file_info.size as usize;
+    let mut sector_buf = [0u8; 512];
+
+    while current_cluster >= 2 && remaining > 0 {
+        let cluster_lba = layout.data_start_lba + (current_cluster - 2) * layout.spc;
+        for s in 0..layout.spc {
+            if remaining == 0 { break; }
+            read_sector_drive(drive, cluster_lba + s, &mut sector_buf)?;
+            let to_copy = core::cmp::min(remaining, 512);
+            data.extend_from_slice(&sector_buf[..to_copy]);
+            remaining -= to_copy;
+        }
+        if remaining == 0 { break; }
+        let next = get_next_cluster(drive, &layout, current_cluster)?;
+        if is_fat_eof(layout.fat_type, next) {
+            break;
+        }
+        current_cluster = next;
+    }
+
+    if data.len() != file_info.size as usize {
+        crate::log_error!("FAT", "Short read: expected {} bytes, got {} bytes", file_info.size, data.len());
+        return Err("FAT short read");
+    }
+
+    Ok(data)
+}
+
+pub fn write_file_content(drive: u8, filename: &str, content: &[u8]) -> Result<(), &'static str> {
+    let layout = get_fat_layout(drive)?;
+    let files = scan_shared_disk()?;
+    let target = files.iter().find(|f| f.name.eq_ignore_ascii_case(filename)).ok_or("File not found")?;
+
+    let mut remaining = content.len();
+    let mut content_offset = 0;
+    let mut current_cluster = target.first_cluster;
+    let mut sector_buf = [0u8; 512];
+    let _bytes_per_cluster = (layout.spc as usize) * 512;
+
+    while current_cluster >= 2 && !is_fat_eof(layout.fat_type, current_cluster) {
+        let cluster_lba = layout.data_start_lba + (current_cluster - 2) * layout.spc;
+        for sec in 0..layout.spc {
+            sector_buf.fill(0);
+            let sec_write = core::cmp::min(remaining, 512);
+            if sec_write > 0 {
+                sector_buf[..sec_write].copy_from_slice(&content[content_offset..content_offset + sec_write]);
+                content_offset += sec_write;
+                remaining -= sec_write;
+            }
+            write_sector_drive(drive, cluster_lba + sec, &sector_buf)?;
+        }
+
+        let next = get_next_cluster(drive, &layout, current_cluster)?;
+        if remaining == 0 {
+            let eof_val = match layout.fat_type {
+                FatType::Fat32 => 0x0FFF_FFFF,
+                FatType::Fat16 => 0xFFFF,
+                FatType::Fat12 => 0x0FFF,
+            };
+            let _ = set_next_cluster(drive, &layout, current_cluster, eof_val);
+            break;
+        }
+
+        if is_fat_eof(layout.fat_type, next) {
+            break;
+        }
+        current_cluster = next;
+    }
+
+    read_sector_drive(drive, target.dir_entry_lba, &mut sector_buf)?;
+    sector_buf[target.dir_entry_offset + 28..target.dir_entry_offset + 32]
+        .copy_from_slice(&(content.len() as u32).to_le_bytes());
+    write_sector_drive(drive, target.dir_entry_lba, &sector_buf)?;
+    Ok(())
+}
+
+pub fn init() { log_info!("ATA", "IDE Channels Initialized with Dynamic Directory Traversal."); }
+
+pub fn set_next_cluster(drive: u8, layout: &FatLayout, cluster: u32, next_val: u32) -> Result<(), &'static str> {
+    let fat_offset = match layout.fat_type {
+        FatType::Fat32 => cluster * 4,
+        FatType::Fat16 => cluster * 2,
+        FatType::Fat12 => return Err("FAT12 not supported"),
+    };
+    let fat_sector_lba = layout.fat_start_lba + (fat_offset / 512);
+    let mut buf = [0u8; 512];
+    read_sector_drive(drive, fat_sector_lba, &mut buf)?;
+    let entry_offset = (fat_offset % 512) as usize;
+    match layout.fat_type {
+        FatType::Fat32 => {
+            let val_bytes = (next_val & 0x0FFF_FFFF).to_le_bytes();
+            buf[entry_offset..entry_offset + 4].copy_from_slice(&val_bytes);
+            write_sector_drive(drive, fat_sector_lba, &buf)?;
+        }
+        FatType::Fat16 => {
+            let val_bytes = (next_val as u16).to_le_bytes();
+            buf[entry_offset..entry_offset + 2].copy_from_slice(&val_bytes);
+            write_sector_drive(drive, fat_sector_lba, &buf)?;
+        }
+        _ => return Err("Unsupported FAT"),
+    }
+    Ok(())
+}

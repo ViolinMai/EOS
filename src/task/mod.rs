@@ -230,9 +230,17 @@ fn elf_runner_worker(core_id: usize) {
 pub fn force_exit_user_process() -> ! {
     unsafe {
         let core_id = crate::profiler::get_core_id();
-        let state = &crate::arch::x86_64::syscall::CORE_SYSCALL_STATES[core_id];
-        let spawn_rsp = state.kernel_spawn_rsp;
-        core::arch::asm!("swapgs", "mov rsp, {0}", "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx", "pop rbp", "ret", in(reg) spawn_rsp);
+        let state_ptr = core::ptr::addr_of_mut!(crate::arch::x86_64::syscall::CORE_SYSCALL_STATES[core_id]);
+        let spawn_rsp = (*state_ptr).kernel_spawn_rsp;
+        // Restore GS_BASE / KERNEL_GS_BASE deterministically (safe from both #PF/#GP exceptions and syscalls)
+        crate::arch::x86_64::syscall::wrmsr(0xC0000101, 0);
+        crate::arch::x86_64::syscall::wrmsr(0xC0000102, state_ptr as u64);
+        core::arch::asm!(
+            "mov rsp, {0}",
+            "pop r15", "pop r14", "pop r13", "pop r12", "pop rbx", "pop rbp",
+            "ret",
+            in(reg) spawn_rsp
+        );
         loop { core::hint::spin_loop(); }
     }
 }
@@ -469,6 +477,84 @@ pub fn snapshot_procs(out: &mut [ProcTelemetry; MAX_PROCS]) -> usize {
     count
 }
 
+// ============================================================================
+// Milestone 12: User Process Crash Inspector Record
+// ============================================================================
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct CrashReport {
+    pub valid: u32,
+    pub fault_kind: u32, // 1=#DE, 2=#UD, 3=#GP, 4=#PF
+    pub core_id: u32,
+    pub error_code: u32,
+    pub rip: u64,
+    pub cr2: u64,
+    pub app_name: [u8; 32],
+    pub spawn_args: [u8; 96],
+}
+
+impl CrashReport {
+    pub const fn empty() -> Self {
+        Self {
+            valid: 0,
+            fault_kind: 0,
+            core_id: 0,
+            error_code: 0,
+            rip: 0,
+            cr2: 0,
+            app_name: [0; 32],
+            spawn_args: [0; 96],
+        }
+    }
+}
+
+static CRASH_LOCK: AtomicBool = AtomicBool::new(false);
+static mut LAST_CRASH: CrashReport = CrashReport::empty();
+
+pub fn record_user_crash(core_id: usize, fault_kind: u32, rip: u64, cr2: u64, error_code: u64) {
+    while CRASH_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    unsafe {
+        let mut r = CrashReport::empty();
+        r.valid = 1;
+        r.fault_kind = fault_kind;
+        r.core_id = core_id as u32;
+        r.error_code = error_code as u32;
+        r.rip = rip;
+        r.cr2 = cr2;
+        if core_id < 8 {
+            let args_src = &ELF_TARGET_ARGS[core_id];
+            r.spawn_args.copy_from_slice(&args_src[..96]);
+            let alen = args_src.iter().position(|&b| b == 0).unwrap_or(96);
+            let args_str = core::str::from_utf8(&args_src[..alen]).unwrap_or("app");
+            let name = args_str.split_whitespace().next().unwrap_or("app");
+            let nb = name.as_bytes();
+            r.app_name[..nb.len().min(31)].copy_from_slice(&nb[..nb.len().min(31)]);
+        }
+        LAST_CRASH = r;
+    }
+    CRASH_LOCK.store(false, Ordering::Release);
+}
+
+pub fn take_last_crash() -> Option<CrashReport> {
+    while CRASH_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    let res = unsafe {
+        if LAST_CRASH.valid != 0 {
+            let copy = LAST_CRASH;
+            LAST_CRASH.valid = 0;
+            Some(copy)
+        } else {
+            None
+        }
+    };
+    CRASH_LOCK.store(false, Ordering::Release);
+    res
+}
+
 pub const MAX_EXT_WINDOWS: usize = 8;
 
 #[repr(C)]
@@ -614,6 +700,44 @@ pub fn destroy_ext_windows_for_core(core_id: u32) {
     lock_ew();
     unsafe { for slot in EXT_WINDOWS.iter_mut() { if slot.as_ref().map(|s| s.core_id == core_id).unwrap_or(false) { *slot = None; } } }
     unlock_ew();
+}
+
+pub fn terminate_proc_by_pid(pid: u32) -> bool {
+    if pid < 3 {
+        return false; // Protect kernel & desktop core services
+    }
+    let mut target_core: Option<u32> = None;
+    lock_tel();
+    unsafe {
+        for p in PROC_TELEMETRY.iter() {
+            if p.state == 1 && p.pid == pid {
+                target_core = Some(p.core_id);
+                break;
+            }
+        }
+    }
+    unlock_tel();
+
+    let Some(core_id) = target_core else { return false; };
+    if core_id == 2 {
+        return false; // Protect primary desktop compositor
+    }
+
+    let mut signaled = false;
+    lock_ew();
+    unsafe {
+        for slot in EXT_WINDOWS.iter_mut().flatten() {
+            if slot.core_id == core_id {
+                slot.closing = true;
+                if slot.events.len() < 64 {
+                    slot.events.push_back(ExtWindowEvent { kind: 9, a: 0, b: 0, c: 0 });
+                }
+                signaled = true;
+            }
+        }
+    }
+    unlock_ew();
+    signaled
 }
 
 pub fn list_ext_windows(out: &mut [ExtWindowDesc; MAX_EXT_WINDOWS]) -> usize {

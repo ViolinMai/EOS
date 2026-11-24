@@ -31,8 +31,8 @@ impl TerminalApp {
         let mut app = Self {
             bounds: Rect::default(),
             history: vec![
-                ("EOS Linux Shell (FHS POSIX environment)".into(), 0xFF38BDF8),
-                ("Logged in as 'march'. Use 'hero <cmd>' for root privileged operations.".into(), 0xFF94A3B8),
+                ("EOS Linux Root Shell (Single-User Root Sovereignty)".into(), 0xFF38BDF8),
+                ("Logged in as 'root' (uid=0, gid=0) — unrestricted system access.".into(), 0xFF94A3B8),
                 ("".into(), 0xFFFFFFFF),
             ],
             input: String::new(),
@@ -40,9 +40,9 @@ impl TerminalApp {
             cmd_history: Vec::new(),
             history_idx: None,
             scroll_y: 0,
-            current_dir: "/home/march".into(),
-            current_user: "march".into(),
-            is_root: false,
+            current_dir: "/".into(),
+            current_user: "root".into(),
+            is_root: true,
             is_selecting: false,
             sel_start: None,
             sel_end: None,
@@ -130,33 +130,20 @@ impl TerminalApp {
             return;
         }
 
-        let (is_hero_invoked, program, args) = if parts[0] == "hero" {
-            if parts.len() < 2 {
-                let msg = "usage: hero <command>";
-                self.history.push((msg.into(), 0xFFEF4444));
-                self.print_to_host(msg);
-                self.scroll_to_bottom();
-                return;
-            }
-            (true, parts[1].as_str(), &parts[2..])
-        } else {
-            (false, parts[0].as_str(), &parts[1..])
-        };
-
-        let has_root = self.is_root || is_hero_invoked;
+        let program = parts[0].as_str();
+        let args = &parts[1..];
 
         match program {
             "help" => {
                 let msgs = [
-                    ("Standard Linux Commands:", 0xFFFCD34D),
-                    ("  hero <cmd>     - Execute command as superuser (root)", 0xFF34D399),
-                    ("  whoami         - Print current username", 0xFFE2E8F0),
+                    ("EOS Root Shell Commands (Unrestricted Root Access):", 0xFFFCD34D),
+                    ("  whoami         - Print current username (root)", 0xFFE2E8F0),
                     ("  pwd            - Print current directory", 0xFFE2E8F0),
                     ("  history        - View command history", 0xFFE2E8F0),
                     ("  ls [path]      - List directory entries", 0xFFE2E8F0),
                     ("  cd <path>      - Change working directory", 0xFFE2E8F0),
                     ("  cat <file>     - Display file contents", 0xFFE2E8F0),
-                    ("  rm <file>      - Remove file (requires hero for system paths)", 0xFFE2E8F0),
+                    ("  rm <file>      - Remove any file directly", 0xFFE2E8F0),
                     ("  clear          - Clear terminal buffer", 0xFFE2E8F0),
                     ("  python <args>  - Run CPython 3.12 binary", 0xFF34D399),
                 ];
@@ -166,7 +153,7 @@ impl TerminalApp {
                 }
             }
             "whoami" => {
-                let u = if has_root { "root" } else { &self.current_user };
+                let u = "root";
                 self.history.push((u.to_string(), 0xFFE2E8F0));
                 self.print_to_host(u);
             }
@@ -205,25 +192,16 @@ impl TerminalApp {
                         format!("{}/{}", self.current_dir, target)
                     };
 
-                    let clean = full_path.trim_matches('/');
-                    let is_user_space = clean.starts_with("home/march") || clean.starts_with("tmp");
-
-                    if !is_user_space && !has_root {
-                        let err = format!("rm: cannot remove '{}': Permission denied (Protected system file. Use 'hero rm')", target);
-                        self.history.push((err.clone(), 0xFFEF4444));
-                        self.print_to_host(&err);
-                    } else {
-                        match fs::remove_file(&full_path) {
-                            Ok(_) => {
-                                let ok_msg = format!("Removed '{}'", target);
-                                self.history.push((ok_msg.clone(), 0xFF10B981));
-                                self.print_to_host(&ok_msg);
-                            }
-                            Err(e) => {
-                                let err = format!("rm: cannot remove '{}': {:?}", target, e);
-                                self.history.push((err.clone(), 0xFFEF4444));
-                                self.print_to_host(&err);
-                            }
+                    match fs::remove_file(&full_path) {
+                        Ok(_) => {
+                            let ok_msg = format!("Removed '{}'", target);
+                            self.history.push((ok_msg.clone(), 0xFF10B981));
+                            self.print_to_host(&ok_msg);
+                        }
+                        Err(e) => {
+                            let err = format!("rm: cannot remove '{}': {:?}", target, e);
+                            self.history.push((err.clone(), 0xFFEF4444));
+                            self.print_to_host(&err);
                         }
                     }
                 }
@@ -482,22 +460,27 @@ impl TerminalApp {
 
     fn copy_selection(&self) -> bool {
         if let Some(text) = self.get_selected_text() {
+            let _ = crate::syscall::sys_clipboard_set(&text);
             if let Ok(mut clip) = CLIPBOARD.lock() {
                 *clip = text;
-                return true;
             }
+            return true;
         }
         false
     }
 
     fn paste_clipboard(&mut self) {
-        if let Ok(clip) = CLIPBOARD.lock() {
-            if !clip.is_empty() {
-                self.input.insert_str(self.cursor_idx, &clip);
-                self.cursor_idx += clip.len();
-                self.sel_start = None;
-                self.sel_end = None;
+        let mut clip = crate::syscall::sys_clipboard_get();
+        if clip.is_empty() {
+            if let Ok(local) = CLIPBOARD.lock() {
+                clip = local.clone();
             }
+        }
+        if !clip.is_empty() {
+            self.input.insert_str(self.cursor_idx, &clip);
+            self.cursor_idx += clip.len();
+            self.sel_start = None;
+            self.sel_end = None;
         }
     }
 }
@@ -537,15 +520,15 @@ impl Widget for TerminalApp {
                         let end_col = if idx == e.line { e.col } else { line.len() };
                         let pre_text = &line[..start_col.min(line.len())];
                         let sel_text = &line[start_col.min(line.len())..end_col.min(line.len())];
-                        let (px_off, _) = canvas.measure_text(pre_text, font_size);
-                        let (sel_w, _) = canvas.measure_text(sel_text, font_size);
+                        let (px_off, _) = canvas.measure_text_mono(pre_text, font_size);
+                        let (sel_w, _) = canvas.measure_text_mono(sel_text, font_size);
                         if sel_w > 0 {
                             canvas.draw_rect(self.bounds.x + pad_x + px_off as i32, cy, sel_w as i32, line_h, 0xFF1E3A8A, 2);
                         }
                     }
                 }
 
-                canvas.draw_text_clipped(
+                canvas.draw_text_mono_clipped(
                     self.bounds.x + pad_x,
                     cy,
                     self.bounds.w - (pad_x * 2) - scrollbar_w,
@@ -558,14 +541,14 @@ impl Widget for TerminalApp {
         }
 
         let prompt = self.prompt_prefix();
-        let (pw, _) = canvas.measure_text(&prompt, font_size);
+        let (pw, _) = canvas.measure_text_mono(&prompt, font_size);
         let p_color = if self.is_root { 0xFFEF4444 } else { 0xFF38BDF8 };
-        canvas.draw_text(self.bounds.x + pad_x, cy, &prompt, p_color, font_size);
+        canvas.draw_text_mono(self.bounds.x + pad_x, cy, &prompt, p_color, font_size);
 
         let input_before_cursor = &self.input[..self.cursor_idx.min(self.input.len())];
-        let (cx_offset, _) = canvas.measure_text(input_before_cursor, font_size);
+        let (cx_offset, _) = canvas.measure_text_mono(input_before_cursor, font_size);
 
-        canvas.draw_text_clipped(
+        canvas.draw_text_mono_clipped(
             self.bounds.x + pad_x + pw as i32,
             cy,
             self.bounds.w - (pad_x * 2) - pw as i32 - scrollbar_w,

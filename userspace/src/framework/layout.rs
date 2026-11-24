@@ -128,8 +128,10 @@ impl Widget for ContainerWidget {
                 let total_min_w: i32 = self.children.iter().map(|c| c.min_size.0).sum();
                 let extra_w = (avail_w - total_min_w).max(0);
                 let total_flex: usize = self.children.iter().map(|c| c.flex_grow).sum();
+                let is_rtl = crate::framework::theme::get_theme().direction
+                    == crate::framework::theme::LayoutDirection::Rtl;
 
-                let mut current_x = inner_x;
+                let mut current_x = if is_rtl { inner_x + inner_w } else { inner_x };
                 for item in self.children.iter_mut() {
                     let mut item_w = item.min_size.0;
                     if total_flex > 0 && item.flex_grow > 0 {
@@ -149,8 +151,14 @@ impl Widget for ContainerWidget {
                         }
                     };
 
-                    item.widget.layout(current_x, child_y, item_w, child_h);
-                    current_x += item_w + self.spacing;
+                    if is_rtl {
+                        current_x -= item_w;
+                        item.widget.layout(current_x, child_y, item_w, child_h);
+                        current_x -= self.spacing;
+                    } else {
+                        item.widget.layout(current_x, child_y, item_w, child_h);
+                        current_x += item_w + self.spacing;
+                    }
                 }
             }
         }

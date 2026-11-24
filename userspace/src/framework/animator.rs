@@ -12,7 +12,8 @@ pub enum Easing {
 #[derive(Clone, Copy)]
 pub struct Tween {
     pub key: u32,
-    pub from: f32,
+    pub start_val: f32,
+    pub current: f32,
     pub to: f32,
     pub start_ms: u64,
     pub dur_ms: u16,
@@ -39,24 +40,25 @@ impl Animator {
         for t_opt in &self.tweens {
             if let Some(ref t) = t_opt {
                 if t.key == key {
-                    return t.from;
+                    return t.current;
                 }
             }
         }
         default
     }
 
-    pub fn animate(&mut self, key: u32, to: f32, dur_ms: u16, ease: Easing, dirty: Rect, now_ms: u64) {
-        let current_val = self.value(key, to);
+    pub fn animate_from(&mut self, key: u32, from: f32, to: f32, dur_ms: u16, ease: Easing, dirty: Rect, now_ms: u64) {
+        let current_val = self.value(key, from);
         let mut slot = None;
 
         for (i, t_opt) in self.tweens.iter_mut().enumerate() {
             if let Some(ref mut t) = t_opt {
                 if t.key == key {
-                    t.from = current_val;
+                    t.start_val = current_val;
+                    t.current = current_val;
                     t.to = to;
                     t.start_ms = now_ms;
-                    t.dur_ms = dur_ms;
+                    t.dur_ms = dur_ms.max(1);
                     t.ease = ease;
                     t.dirty = dirty;
                     return;
@@ -69,14 +71,19 @@ impl Animator {
         if let Some(idx) = slot {
             self.tweens[idx] = Some(Tween {
                 key,
-                from: current_val,
+                start_val: current_val,
+                current: current_val,
                 to,
                 start_ms: now_ms,
-                dur_ms,
+                dur_ms: dur_ms.max(1),
                 ease,
                 dirty,
             });
         }
+    }
+
+    pub fn animate(&mut self, key: u32, to: f32, dur_ms: u16, ease: Easing, dirty: Rect, now_ms: u64) {
+        self.animate_from(key, to, to, dur_ms, ease, dirty, now_ms);
     }
 
     pub fn tick(&mut self, now_ms: u64, damage: &mut DamageRegion) -> bool {
@@ -107,7 +114,7 @@ impl Animator {
                             1.0 + c3 * (progress - 1.0).powi(3) + c1 * (progress - 1.0).powi(2)
                         }
                     };
-                    t.from = t.from + (t.to - t.from) * factor;
+                    t.current = t.start_val + (t.to - t.start_val) * factor;
                     *t_opt = Some(t);
                     any_running = true;
                 }

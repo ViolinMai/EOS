@@ -1,13 +1,16 @@
 {
   "modified": [
-    "userspace/src/framework/features.rs",
-    "userspace/src/framework/theme.rs",
-    "userspace/src/framework/canvas.rs",
-    "userspace/src/framework/menu.rs",
-    "userspace/src/apps/settings.rs",
-    "userspace/src/apps/finder.rs",
     "userspace/src/main.rs",
-    "userspace/src/framework/app.rs"
+    "src/drivers/ata.rs",
+    "src/fs/mod.rs",
+    "src/task/mod.rs",
+    "src/arch/x86_64/syscall.rs",
+    "userspace/src/syscall.rs",
+    "userspace/src/apps/finder.rs",
+    "userspace/src/apps/video_player.rs",
+    "userspace/src/apps/activity_monitor.rs",
+    "test_eos_audit.py",
+    "milestones.md"
   ],
   "created": []
 }

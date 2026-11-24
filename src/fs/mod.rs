@@ -311,6 +311,22 @@ pub fn vfs_save_text_file(filename: &str, content: &[u8]) -> Result<(), &'static
     write_file_content(1, filename, content)
 }
 
+pub fn vfs_delete_file(path: &str) -> Result<(), &'static str> {
+    lock_vfs();
+    let p = resolve_path(path);
+    let clean = p.trim_matches('/');
+    let res = if clean.to_ascii_uppercase().starts_with("EOS SHARE/") {
+        let fat_sub = clean[10..].trim_matches('/');
+        crate::drivers::ata::delete_file_path(1, fat_sub)
+    } else if !clean.contains('/') {
+        crate::drivers::ata::delete_file_path(1, clean)
+    } else {
+        Err("Delete currently supported on EOS SHARE FAT volume")
+    };
+    unlock_vfs();
+    res
+}
+
 pub fn list_directory_contents(folder: &str, _dir_cluster: u32) -> Vec<FsItem> {
     vfs_list_dir(folder).unwrap_or_default()
 }
@@ -410,12 +426,8 @@ pub fn is_settings_file(path: &str) -> bool {
         || clean.ends_with("settings.ini")
 }
 
-pub fn is_protected_system_path(path: &str) -> bool {
-    let clean = path.trim_matches('/');
-    if clean.starts_with("home/march") || clean.starts_with("tmp") || clean.starts_with("var/log") {
-        return false;
-    }
-    true
+pub fn is_protected_system_path(_path: &str) -> bool {
+    false
 }
 
 pub fn detect_file_media_type(name: &str) -> MediaType {

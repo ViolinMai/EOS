@@ -413,3 +413,70 @@ impl Widget for WindowFrame {
         self.content.handle_char(c)
     }
 }
+
+/// Framework-native Desktop Icon Widget (Milestone 08 Shell Unification)
+pub struct DesktopIconWidget {
+    pub label: String,
+    pub icon_name: String,
+    pub bounds: Rect,
+    pub selected: bool,
+}
+
+impl DesktopIconWidget {
+    pub fn paint_icon(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        if self.selected {
+            canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0x5538BDF8, 4);
+            canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, 0xAA7DD3FC, 4);
+        }
+        let ic_sz = theme.pt(36.0);
+        let ic_x = self.bounds.x + (self.bounds.w - ic_sz) / 2;
+        let ic_y = self.bounds.y + theme.pt(6.0);
+        if !crate::framework::icons::draw_svg_icon(canvas, &self.icon_name, ic_x, ic_y, ic_sz, ic_sz) {
+            draw_vector_icon(canvas, &self.icon_name, ic_x, ic_y, ic_sz, ic_sz, None);
+        }
+        let (tw, _) = canvas.measure_text(&self.label, theme.font_caption());
+        let tx = self.bounds.x + (self.bounds.w - tw as i32) / 2;
+        let ty = ic_y + ic_sz + theme.pt(4.0);
+        canvas.draw_text_adaptive(tx.max(self.bounds.x + 2), ty, self.bounds.w - 4, &self.label, 0xFFFFFFFF, theme.font_caption());
+    }
+}
+
+/// Framework-native Taskbar Button Widget (Milestone 08 Shell Unification)
+pub struct TaskbarButtonWidget<'a> {
+    pub app_name: &'a str,
+    pub bounds: Rect,
+    pub is_running: bool,
+    pub is_hovered: bool,
+}
+
+impl<'a> TaskbarButtonWidget<'a> {
+    pub fn paint_button(&self, canvas: &mut Canvas) {
+        let theme = get_theme();
+        let bx = self.bounds.x;
+        let by = self.bounds.y;
+        let bw = self.bounds.w;
+        let bh = self.bounds.h;
+
+        if self.is_running || self.is_hovered {
+            let glass_bg = if self.is_hovered {
+                if theme.is_dark { 0x8838BDF8 } else { 0x660284C7 }
+            } else if theme.is_dark {
+                0x441E3A8A
+            } else {
+                0x330284C7
+            };
+            canvas.draw_rect(bx, by, bw, bh, glass_bg, theme.r_ctrl().min(6));
+            canvas.draw_rect_outline(bx, by, bw, bh, theme.border_frost_highlight, theme.r_ctrl().min(6));
+        }
+
+        let ic_sz = theme.pt(24.0);
+        let ix = bx + (bw - ic_sz) / 2;
+        let iy = by + (bh - ic_sz) / 2;
+        crate::framework::icons::draw_app_icon(canvas, self.app_name, ix, iy, ic_sz, ic_sz);
+
+        if self.is_running {
+            canvas.draw_rect(bx + 10, by + bh - 1, (bw - 20).max(8), 3, theme.accent_hover, 1);
+        }
+    }
+}

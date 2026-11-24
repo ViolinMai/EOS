@@ -216,6 +216,19 @@ DEFAULT_PHASE_MARKERS = [
     "WIN7_CONTEXT_MENU:PASS:Handler_Registered",
     "WIN7_ALTTAB:PASS:Switcher_Ready",
     "WIN7_TASKBAR_PREVIEW:PASS:HoverCard_Ready",
+    "ROOT_SOVEREIGNTY:PASS:Unrestricted_Root",
+    "TTY_SWITCH:PASS:F1_GUI_F2_RootShell",
+    "FRAMEWORK_SHELL:PASS:100Pct_Unified",
+    "FONT_MGR:PASS:MultiFont_Active",
+    "RTL_ENGINE:PASS:Arabic_Shaping_Ready",
+    "IPC_CLIPBOARD_ARGV:PASS:Verified",
+    "CRASH_INSPECTOR:PASS:Fault_Capture_Ready",
+    "UI_INSPECTOR:PASS:Overlay_Active",
+    "CMD_PALETTE:PASS:AltSpace_Ready",
+    "MODAL_TOAST:PASS:Portals_Wired",
+    "FINDER_OPS:PASS:Full_CRUD_Ready",
+    "VIDEO_PRO:PASS:Volume_Subs_Playlist",
+    "ACTIVITY_MON:PASS:Live_Syscall509",
 ]
 
 def run_automated_audit(timeout_sec=35, headless=True, expect=None, steps=None, verify_test_subject=True, require_test_output=False):

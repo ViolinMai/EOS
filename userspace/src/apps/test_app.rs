@@ -319,6 +319,7 @@ impl Widget for TestApp {
                     (format!("Upstream: AA Rounded Corners [{}]", if feats.aa_corners { "ON" } else { "OFF" }), feats.aa_corners),
                     (format!("Upstream: Smooth Animations [{}]", if feats.smooth_animations { "ON" } else { "OFF" }), feats.smooth_animations),
                     (format!("Debug: Damage Rects Red Overlay [{}]", if feats.debug_damage_overlay { "ON" } else { "OFF" }), feats.debug_damage_overlay),
+                    (format!("DevTools: UI Inspector F12 Overlay [{}]", if feats.ui_inspector { "ON" } else { "OFF" }), feats.ui_inspector),
                 ];
                 let row_h = theme.pt(28.0);
                 for (i, (txt, on)) in toggles.iter().enumerate() {
@@ -400,7 +401,7 @@ impl Widget for TestApp {
             }
             TestTab::DebugBeta => {
                 let row_h = theme.pt(28.0);
-                for i in 0..5 {
+                for i in 0..6 {
                     let ry = cy + theme.pt(38.0) + (i as i32 * (row_h + theme.pt(6.0)));
                     if my >= ry && my <= ry + row_h {
                         match i {
@@ -409,6 +410,7 @@ impl Widget for TestApp {
                             2 => { toggle_aa_corners(); }
                             3 => { toggle_smooth_animations(); }
                             4 => { toggle_debug_damage_overlay(); }
+                            5 => { toggle_ui_inspector(); }
                             _ => {}
                         }
                         return true;

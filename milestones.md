@@ -1,417 +1,446 @@
-# EOS Daily-Driver Roadmap: 50 Autonomous Userspace Milestones
+# EOS Operating System — Engineering Roadmap (32 Milestones)
 
-**Target Vision:** Windows 7 Aero Glass UX/UI + Full Built-in App Suite + Embedded Userspace Python Interpreter & Desktop Automation + `TEST_SUBJECT` Golden-Matrix Verification.
+**Core Philosophy:**
 
-updating procudere :
-updateMAX.py will be used to push update using this formula, follow it precisly:
-Block formats in 'patch.txt' (every block must end with '### END'):
+- **100% Upstream Framework GUI:** Every single pixel, desktop shell element, taskbar, start menu, context menu, window frame, dialog, and app widget MUST be built using `userspace/src/framework/` primitives (`Canvas`, `ContainerWidget`, `ImageWidget`, `ContextMenu`, `Theme`, `Animator`). Zero ad-hoc drawing in apps or shell.
+- **Single-User Root Sovereignty:** No `hero` or `sudo` wrappers. The system belongs exclusively to the owner (`root` at all times, full read/write access across `RootFS`, `EOS SHARE`, and hardware).
+- **TTY Console Switch (`Ctrl+Alt+F2` / `Ctrl+Alt+F1`):** Instant switching between the Ring 3 Graphical Compositor (`tty1`) and a full-screen Kernel/Userspace Root Shell (`tty2`) for low-level debugging and recovery.
+- **Bilingual RTL/LTR & Multi-Font Engine:** Native Arabic contextual shaping (isolated/initial/medial/final forms), BiDi text reordering, RTL layout mirroring, and runtime font switching in `Theme`.
+- **Static CPython Integration:** Embedding `libpython3.12.a` directly into Userspace (alongside static `FFmpeg`) for real Python scripting and OS automation.
 
-1.  Full file replacement / creation:
+**Updating Procedure (`updateMAX.py`):**
+Every block in `patch.txt` must end with `### END`:
 
-    ### FILE: path/to/file.qml
+1. Full file replacement / creation:
+
+    ### FILE: path/to/file.rs
 
     <full file contents>
     ### END
 
-2.  Inline Context-Anchored Edits (Works on .qml, .py, .rs, .toml, .ini, etc.):
+    Context-anchored inline edit:
 
-    ### EDIT: ui/main.qml
+    ### EDIT: path/to/file.rs
 
     <<< FIND
-    readonly property bool effectiveShowPreview: userShowPreview && (width >= 960 || height >= 760)
+    <exact lines>
     ===
-    readonly property bool effectiveShowPreview: userShowPreview && (width >= 800 || height >= 600)
-
-    > > > <<< FIND
-    > > > function endRightDrag() {
-
-        isRightDragging = false
-
-    # }
-
-    function endRightDrag() {
-    isRightDragging = false
-    draggedFilePath = ""
-    }
+    <replacement lines>
 
     > > >
 
     ### END
-    - Supports multiple <<< FIND ... === ... >>> hunks inside a single ### EDIT block.
-    - Indentation-insensitive matching: Even if your FIND or REPLACE block has 0 indent
-      (or wrong base indent), the engine matches the exact relative structure and
-      automatically re-indents your replacement to match the target file's exact level!
-    - Uniqueness guarantee: Rejects the patch if FIND matches 0 times or >1 times.
-    - Empty replacement (nothing between === and >>>) cleanly deletes the matched lines.
 
-> **STRICT AGENT RULES:**
->
-> 1. Execute milestones strictly in order (01 -> 50).
-> 2. **VERIFY & GIT PUSH:** Every milestone requires an `[EOS_AUDIT]` marker and `TEST_SUBJECT` verification before.
-> 3. After every major milestones you will push an update to "test_eos_audit.py" to test the newly added features.
+STRICT EXECUTION RULES:
 
-- [x] **Milestone 01: Userspace `TEST_SUBJECT` Scanner & Checksum Verifier**
-    - **ID:** `m01_test_subject_scanner`
-    - **Goal:** Create `userspace/src/test_subject.rs` and wire it into `userspace/src/main.rs`. On desktop startup, scan `/EOS SHARE/TEST_SUBJECT`, compute CRC32 and byte sizes of discovered test files, and emit `[EOS_AUDIT]` marker `TEST_SUBJECT_SCAN:PASS:<count>_files` via `crate::sdk::agent::audit_log`.
-    - **Files:** `userspace/src/test_subject.rs`, `userspace/src/main.rs`, `userspace/src/sdk.rs`
-    - **Expect:** `TEST_SUBJECT_SCAN:PASS:`
-    - **Steps:** `[]`
+        Execute milestones in order (M01 -> M32).
 
-- [x] **Milestone 02: Image Decoder Golden Matrix Validator (PNG/JPEG/QOI)**
-    - **ID:** `m02_image_matrix_validator`
-    - **Goal:** Extend `userspace/src/test_subject.rs` to decode `/EOS SHARE/TEST_SUBJECT/color_bars_16x16.png` using `crate::png`, verify dimensions `16x16` and top-left/bottom-right pixel ARGB values against the golden matrix, and emit `IMAGE_MATRIX_VERIFY:PASS:16x16_ARGB_OK`.
-    - **Files:** `userspace/src/test_subject.rs`, `userspace/src/png.rs`
-    - **Expect:** `IMAGE_MATRIX_VERIFY:PASS:16x16_ARGB_OK`
-    - **Steps:** `[]`
+        Every milestone MUST emit its [EOS_AUDIT] marker and pass test_eos_audit.py before advancing.
 
-- [x] **Milestone 03: TrueType Font Metrics & Text Bounding-Box Calibrator**
-    - **ID:** `m03_font_metrics_calibrator`
-    - **Goal:** Add a font measurement calibration test in `userspace/src/test_subject.rs` that measures standard pangram strings from `TEST_SUBJECT` across caption, body, and title sizes, logs rendering time in microseconds for tuning, and emits `FONT_CALIBRATION:PASS:Metrics_Verified`.
-    - **Files:** `userspace/src/test_subject.rs`, `userspace/src/framework/canvas.rs`
-    - **Expect:** `FONT_CALIBRATION:PASS:Metrics_Verified`
-    - **Steps:** `[]`
+        Keep test_eos_audit.py updated as new subsystems come online.
 
-- [x] **Milestone 04: Compositor Frame-Time & Damage-Region Benchmark**
-    - **ID:** `m04_compositor_benchmark`
-    - **Goal:** Instrument `userspace/src/framework/perf_log.rs` and `userspace/src/framework/app.rs` to track 60 FPS frame budget, dirty rectangle merge efficiency, and emit `COMPOSITOR_TUNE:PASS:FrameBudget_OK` after the first 5 rendered frames.
-    - **Files:** `userspace/src/framework/perf_log.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `COMPOSITOR_TUNE:PASS:FrameBudget_OK`
-    - **Steps:** `[]`
+Phase 1: Completed Foundation (Verified & Active)
 
-- [x] **Milestone 05: Automated `TEST_SUBJECT` Report Exporter (`eos_output.json`)**
-    - **ID:** `m05_test_report_exporter`
-    - **Goal:** In `userspace/src/test_subject.rs`, serialize all Userspace diagnostic matrices (decoded pixel samples, file CRC32s, font metrics, and frame timings) into `/EOS SHARE/TEST_SUBJECT/eos_output.json` and emit `TEST_REPORT_EXPORT:PASS:eos_output.json`.
-    - **Files:** `userspace/src/test_subject.rs`, `userspace/src/main.rs`
-    - **Expect:** `TEST_REPORT_EXPORT:PASS:eos_output.json`
-    - **Steps:** `[]`
+    [x] Milestone 01: Userspace TEST_SUBJECT Scanner & Checksum Verifier
 
----
+        ID: m01_test_subject_scanner
 
-## Phase 2: Windows 7 Aero Glass Desktop & Shell Transformation (06–15)
+        Goal: Scan /EOS SHARE/TEST_SUBJECT, compute CRC32 and byte sizes, and emit TEST_SUBJECT_SCAN:PASS:<count>_files.
 
-- [ ] **Milestone 06: Windows 7 Aero Glass Theme Engine & Color Palette**
-    - **ID:** `m06_win7_aero_theme`
-    - **Goal:** Upgrade `userspace/src/framework/theme.rs` with Windows 7 Aero Glass visual tokens (translucent sky-blue glass chrome, inner white frost border highlights, Segoe UI metric scaling, active/inactive window glow colors) and emit `WIN7_THEME:PASS:AeroGlass_Tokens_Ready`.
-    - **Files:** `userspace/src/framework/theme.rs`, `userspace/src/framework/mod.rs`
-    - **Expect:** `WIN7_THEME:PASS:AeroGlass_Tokens_Ready`
-    - **Steps:** `[]`
+        Files: userspace/src/test_subject.rs, userspace/src/main.rs, userspace/src/sdk.rs
 
-- [ ] **Milestone 07: Windows 7 Bottom Superbar (Taskbar) & Start Orb**
-    - **ID:** `m07_win7_superbar_taskbar`
-    - **Goal:** Transform the bottom dock in `userspace/src/framework/app.rs` into a full-width Windows 7 Aero Superbar (`40pt` height) featuring the iconic circular Start Orb on the left, pinned/running application glass buttons with active indicators in the center-left, and emit `WIN7_TASKBAR:PASS:Superbar_Rendered`.
-    - **Files:** `userspace/src/framework/app.rs`, `userspace/src/framework/theme.rs`
-    - **Expect:** `WIN7_TASKBAR:PASS:Superbar_Rendered`
-    - **Steps:** `[]`
+        Expect: TEST_SUBJECT_SCAN:PASS:
 
-- [ ] **Milestone 08: Windows 7 System Tray, Clock/Calendar Flyout & "Aero Peek" Show Desktop Strip**
-    - **ID:** `m08_win7_systray_peek`
-    - **Goal:** Add the right-side Windows 7 System Tray in `userspace/src/framework/app.rs` with network/volume status icons, two-line time & date display, and the far-right `12pt` "Show Desktop" Aero Peek vertical rectangle button. Emit `WIN7_SYSTRAY:PASS:Clock_And_Peek_Ready`.
-    - **Files:** `userspace/src/framework/app.rs`, `userspace/src/framework/menu.rs`
-    - **Expect:** `WIN7_SYSTRAY:PASS:Clock_And_Peek_Ready`
-    - **Steps:** `[]`
+        Steps: []
 
-- [ ] **Milestone 09: Windows 7 Two-Column Start Menu Popup & Live Search Box**
-    - **ID:** `m09_win7_start_menu`
-    - **Goal:** Implement the authentic Windows 7 two-column Start Menu popup in `userspace/src/framework/menu.rs` and `userspace/src/framework/app.rs` (Left white pane: pinned/recent programs + "Search programs and files" input box; Right dark-glass pane: Computer, Documents, Control Panel, Run, Shut Down button). Emit `WIN7_STARTMENU:PASS:TwoColumn_Ready`.
-    - **Files:** `userspace/src/framework/menu.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `WIN7_STARTMENU:PASS:TwoColumn_Ready`
-    - **Steps:** `[{"move":[-900,500]},{"click":true},{"wait":0.5}]`
+    [x] Milestone 02: Image Decoder Golden Matrix Validator (PNG/JPEG)
 
-- [ ] **Milestone 10: Windows 7 Window Chrome & Caption Buttons (Min / Max / Red-Glow Close)**
-    - **ID:** `m10_win7_window_chrome`
-    - **Goal:** Update `WindowFrame` in `userspace/src/framework/widget.rs` to render Windows 7 top-right rectangular grouped caption buttons (Minimize `_`, Maximize/Restore `□`, and wide red-glow Close `X` button on the right, instead of left traffic lights) with glass reflection stripes. Emit `WIN7_WINDOW_CHROME:PASS:AeroButtons_Active`.
-    - **Files:** `userspace/src/framework/widget.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `WIN7_WINDOW_CHROME:PASS:AeroButtons_Active`
-    - **Steps:** `[]`
+        ID: m02_image_matrix_validator
 
-- [ ] **Milestone 11: Aero Snap (Left/Right Half-Screen & Top Maximize Preview)**
-    - **ID:** `m11_win7_aero_snap`
-    - **Goal:** Enhance window dragging in `userspace/src/framework/app.rs` and `userspace/src/framework/widget.rs` with translucent glass Aero Snap preview outlines when dragging a window to the left edge, right edge, or top edge of the screen, plus `Win+Left` / `Win+Right` keyboard snapping. Emit `WIN7_AEROSNAP:PASS:SnapEngine_Ready`.
-    - **Files:** `userspace/src/framework/app.rs`, `userspace/src/framework/widget.rs`
-    - **Expect:** `WIN7_AEROSNAP:PASS:SnapEngine_Ready`
-    - **Steps:** `[{"move":[-400,0]},{"wait":0.3}]`
+        Goal: Decode /EOS SHARE/TEST_SUBJECT/color_bars_16x16.png via Syscall 510 / png.rs and verify ARGB pixels against golden matrix.
 
-- [ ] **Milestone 12: Desktop Icons Grid (Computer, Recycle Bin, User Files, Python IDE)**
-    - **ID:** `m12_win7_desktop_icons`
-    - **Goal:** Add an interactive Desktop Icon Grid layer on the wallpaper in `userspace/src/framework/app.rs` with rubber-band selection box, click-to-select, and double-click to launch `Computer`, `Recycle Bin`, `TEST_SUBJECT`, and `Command Prompt`. Emit `WIN7_DESKTOP_ICONS:PASS:Grid_Rendered`.
-    - **Files:** `userspace/src/framework/app.rs`, `userspace/src/framework/vector.rs`
-    - **Expect:** `WIN7_DESKTOP_ICONS:PASS:Grid_Rendered`
-    - **Steps:** `[]`
+        Files: userspace/src/test_subject.rs, userspace/src/png.rs
 
-- [ ] **Milestone 13: Desktop Right-Click Context Menu (View, Sort By, Refresh, New, Personalize)**
-    - **ID:** `m13_win7_context_menu`
-    - **Goal:** Implement a cascading Windows 7 right-click context menu in `userspace/src/framework/app.rs` supporting Desktop Refresh, Icon Sorting, New Folder/Text Document/Python Script creation, and opening Personalize/Settings. Emit `WIN7_CONTEXT_MENU:PASS:Handler_Registered`.
-    - **Files:** `userspace/src/framework/app.rs`, `userspace/src/framework/menu.rs`
-    - **Expect:** `WIN7_CONTEXT_MENU:PASS:Handler_Registered`
-    - **Steps:** `[]`
+        Expect: IMAGE_MATRIX_VERIFY:PASS:16x16_ARGB_OK
 
-- [ ] **Milestone 14: Alt+Tab Aero Live Window Switcher Overlay**
-    - **ID:** `m14_win7_alt_tab`
-    - **Goal:** Add a centered glass `Alt+Tab` window switcher overlay in `userspace/src/framework/app.rs` displaying icons and titles of all open windows and cycling focus cleanly. Emit `WIN7_ALTTAB:PASS:Switcher_Ready`.
-    - **Files:** `userspace/src/framework/app.rs`
-    - **Expect:** `WIN7_ALTTAB:PASS:Switcher_Ready`
-    - **Steps:** `[{"key":"tab"},{"wait":0.4}]`
+        Steps: []
 
-- [ ] **Milestone 15: Taskbar Live Thumbnail Hover Previews & Window Minimize/Restore**
-    - **ID:** `m15_win7_taskbar_previews`
-    - **Goal:** Support minimizing windows to the Superbar in `userspace/src/framework/app.rs` and rendering a Windows 7 Aero popup preview card when hovering over taskbar buttons. Emit `WIN7_TASKBAR_PREVIEW:PASS:HoverCard_Ready`.
-    - **Files:** `userspace/src/framework/app.rs`, `userspace/src/framework/widget.rs`
-    - **Expect:** `WIN7_TASKBAR_PREVIEW:PASS:HoverCard_Ready`
-    - **Steps:** `[]`
+    [x] Milestone 03: TrueType Font Metrics & Text Bounding-Box Calibrator
 
----
+        ID: m03_font_metrics_calibrator
 
-## Phase 3: Embedded Userspace Python Interpreter & Automation Engine (16–25)
+        Goal: Measure pangram strings across caption, body, and title sizes and emit FONT_CALIBRATION:PASS:Metrics_Verified.
 
-- [ ] **Milestone 16: Userspace Python Lexer & Tokenizer (`eos_python`)**
-    - **ID:** `m16_python_lexer`
-    - **Goal:** Create `userspace/src/python/mod.rs` and `userspace/src/python/lexer.rs` implementing a clean Python 3 subset tokenizer (`INDENT`, `DEDENT`, identifiers, numbers, strings, operators, keywords `def, if, elif, else, for, while, in, return, import, True, False, None, and, or, not`). Verify tokenization on a sample script and emit `PYTHON_LEXER:PASS:Tokens_Verified`.
-    - **Files:** `userspace/src/python/mod.rs`, `userspace/src/python/lexer.rs`, `userspace/src/main.rs`
-    - **Expect:** `PYTHON_LEXER:PASS:Tokens_Verified`
-    - **Steps:** `[]`
+        Files: userspace/src/test_subject.rs, userspace/src/framework/canvas.rs
 
-- [ ] **Milestone 17: Python AST Parser & Expression Evaluator**
-    - **ID:** `m17_python_ast_parser`
-    - **Goal:** Create `userspace/src/python/parser.rs` and `userspace/src/python/ast.rs` supporting arithmetic/logical expressions, list/dict literals, indexing, function calls, and assignment statements. Emit `PYTHON_PARSER:PASS:AST_Ready`.
-    - **Files:** `userspace/src/python/mod.rs`, `userspace/src/python/ast.rs`, `userspace/src/python/parser.rs`
-    - **Expect:** `PYTHON_PARSER:PASS:AST_Ready`
-    - **Steps:** `[]`
+        Expect: FONT_CALIBRATION:PASS:Metrics_Verified
 
-- [ ] **Milestone 18: Python Runtime VM: Control Flow, Functions & Closures**
-    - **ID:** `m18_python_runtime_vm`
-    - **Goal:** Create `userspace/src/python/eval.rs` executing `if/elif/else`, `while`, `for x in range(...)`, `def` functions with recursion, local/global scopes, and string/list/dict methods. Run `TEST_SUBJECT` math verification and emit `PYTHON_VM:PASS:Execution_Verified`.
-    - **Files:** `userspace/src/python/mod.rs`, `userspace/src/python/eval.rs`, `userspace/src/test_subject.rs`
-    - **Expect:** `PYTHON_VM:PASS:Execution_Verified`
-    - **Steps:** `[]`
+        Steps: []
 
-- [ ] **Milestone 19: Python Built-in Standard Modules (`os`, `sys`, `math`, `json`, `time`)**
-    - **ID:** `m19_python_stdlib`
-    - **Goal:** Add built-in module bindings in `userspace/src/python/stdlib.rs` for `os.listdir`, `os.read_text`, `os.write_text`, `os.stat`, `json.loads`, `json.dumps`, `math.*`, and `time.ticks()`. Emit `PYTHON_STDLIB:PASS:Modules_Bound`.
-    - **Files:** `userspace/src/python/mod.rs`, `userspace/src/python/stdlib.rs`, `userspace/src/python/eval.rs`
-    - **Expect:** `PYTHON_STDLIB:PASS:Modules_Bound`
-    - **Steps:** `[]`
+    [x] Milestone 04: Compositor Frame-Time & Damage-Region Benchmark
 
-- [ ] **Milestone 20: Python `eos_auto` Desktop & UI Automation Bridge**
-    - **ID:** `m20_python_eos_auto_bridge`
-    - **Goal:** Expose an `eos_auto` module in `userspace/src/python/stdlib.rs` allowing Python scripts to queue desktop actions (`eos_auto.spawn("Calculator")`, `eos_auto.click(x, y)`, `eos_auto.type_text("123")`, `eos_auto.list_windows()`, `eos_auto.audit("msg")`). Emit `PYTHON_AUTOMATION:PASS:Bridge_Ready`.
-    - **Files:** `userspace/src/python/stdlib.rs`, `userspace/src/python/mod.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `PYTHON_AUTOMATION:PASS:Bridge_Ready`
-    - **Steps:** `[]`
+        ID: m04_compositor_benchmark
 
-- [ ] **Milestone 21: Interactive Python REPL & Script Execution in Command Prompt (`Terminal`)**
-    - **ID:** `m21_terminal_python_repl`
-    - **Goal:** Upgrade `userspace/src/apps/terminal.rs` so typing `python` enters an interactive multi-line REPL, and `python <file.py>` executes any Python script from `/EOS SHARE` or `/RootFS` directly using `crate::python`. Emit `TERMINAL_PYTHON:PASS:REPL_And_Runner_Ready`.
-    - **Files:** `userspace/src/apps/terminal.rs`, `userspace/src/python/mod.rs`
-    - **Expect:** `TERMINAL_PYTHON:PASS:REPL_And_Runner_Ready`
-    - **Steps:** `[]`
+        Goal: Track 60 FPS frame budget and dirty rectangle merge efficiency in perf_log.rs and app.rs.
 
-- [ ] **Milestone 22: EOS Python IDE & Automation Studio Application**
-    - **ID:** `m22_python_automation_studio_app`
-    - **Goal:** Create `userspace/src/apps/python_studio.rs` providing a Windows 7 styled Python IDE & Automation Recorder with code editor, "Run Script (F5)" button, live output console, and preset automation templates. Register it in `apps/mod.rs` and `FrameworkApp`. Emit `APP_PYSTUDIO:PASS:Registered`.
-    - **Files:** `userspace/src/apps/python_studio.rs`, `userspace/src/apps/mod.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `APP_PYSTUDIO:PASS:Registered`
-    - **Steps:** `[]`
+        Files: userspace/src/framework/perf_log.rs, userspace/src/framework/app.rs
 
-- [ ] **Milestone 23: Scheduled Background Automation Runner & Watchdog Tasks**
-    - **ID:** `m23_automation_scheduler`
-    - **Goal:** Add a non-blocking periodic task runner in `userspace/src/python/mod.rs` invoked from `FrameworkApp::run_loop` that can run scheduled Python automation hooks (e.g., folder organizer, system telemetry logger) without dropping UI FPS. Emit `AUTO_SCHEDULER:PASS:Hook_Active`.
-    - **Files:** `userspace/src/python/mod.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `AUTO_SCHEDULER:PASS:Hook_Active`
-    - **Steps:** `[]`
+        Expect: COMPOSITOR_TUNE:PASS:FrameBudget_OK
 
-- [ ] **Milestone 24: Batch File & Media Processing Automation via Python**
-    - **ID:** `m24_python_media_batch`
-    - **Goal:** Add `eos_media` functions to `userspace/src/python/stdlib.rs` (`inspect_image(path)`, `batch_rename(dir, pattern)`, `csv_summary(path)`) and verify against `/EOS SHARE/TEST_SUBJECT`. Emit `PYTHON_MEDIA_BATCH:PASS:Verified`.
-    - **Files:** `userspace/src/python/stdlib.rs`, `userspace/src/test_subject.rs`
-    - **Expect:** `PYTHON_MEDIA_BATCH:PASS:Verified`
-    - **Steps:** `[]`
+        Steps: []
 
-- [ ] **Milestone 25: Full `TEST_SUBJECT/python_suite` End-to-End Verification**
-    - **ID:** `m25_python_suite_verification`
-    - **Goal:** Execute all `.py` test scripts inside `/EOS SHARE/TEST_SUBJECT` during `test_subject::run_all_verifications()`, compare outputs with golden expectations, write results to `eos_output.json`, and emit `PYTHON_SUITE_AUDIT:PASS:All_Scripts_Verified`.
-    - **Files:** `userspace/src/test_subject.rs`, `userspace/src/python/mod.rs`
-    - **Expect:** `PYTHON_SUITE_AUDIT:PASS:All_Scripts_Verified`
-    - **Steps:** `[]`
+    [x] Milestone 05: Automated TEST_SUBJECT Report Exporter (eos_output.json)
 
----
+        ID: m05_test_report_exporter
 
-## Phase 4: Windows 7 Core Built-in Applications Suite (26–38)
+        Goal: Export Userspace diagnostic matrices into /EOS SHARE/TEST_SUBJECT/eos_output.json.
 
-- [ ] **Milestone 26: Windows Explorer (`Finder` Upgrade) — Breadcrumb Address Bar & Navigation Pane**
-    - **ID:** `m26_win7_explorer_breadcrumbs`
-    - **Goal:** Upgrade `userspace/src/apps/finder.rs` into **Windows Explorer** featuring Back/Forward Aero round buttons, a clickable breadcrumb path bar (`Computer > EOS SHARE > TEST_SUBJECT`), quick search box, and collapsible left Navigation Pane (`Favorites, Libraries, Computer, Network`). Emit `WIN7_EXPLORER:PASS:Breadcrumbs_Ready`.
-    - **Files:** `userspace/src/apps/finder.rs`
-    - **Expect:** `WIN7_EXPLORER:PASS:Breadcrumbs_Ready`
-    - **Steps:** `[]`
+        Files: userspace/src/test_subject.rs, userspace/src/main.rs
 
-- [ ] **Milestone 27: Windows Explorer — Details View, Column Sorting & Bottom Details Pane**
-    - **ID:** `m27_win7_explorer_details_pane`
-    - **Goal:** Add Details View (Name, Date Modified, Type, Size columns with click-to-sort), Icons/Tiles view toggle, and the Windows 7 bottom Details Pane showing selected file metadata and thumbnail in `userspace/src/apps/finder.rs`. Emit `WIN7_EXPLORER_DETAILS:PASS:Columns_And_Pane_Ready`.
-    - **Files:** `userspace/src/apps/finder.rs`
-    - **Expect:** `WIN7_EXPLORER_DETAILS:PASS:Columns_And_Pane_Ready`
-    - **Steps:** `[]`
+        Expect: TEST_REPORT_EXPORT:PASS:eos_output.json
 
-- [ ] **Milestone 28: Windows Explorer — File Operations (Copy, Paste, Rename, Delete to Recycle Bin)**
-    - **ID:** `m28_win7_explorer_file_ops`
-    - **Goal:** Implement Copy, Cut, Paste, New Folder, Rename, and Delete (moving items to a virtual Recycle Bin list) inside `userspace/src/apps/finder.rs` toolbar and context menu. Emit `WIN7_EXPLORER_OPS:PASS:Clipboard_And_Recycle_Ready`.
-    - **Files:** `userspace/src/apps/finder.rs`
-    - **Expect:** `WIN7_EXPLORER_OPS:PASS:Clipboard_And_Recycle_Ready`
-    - **Steps:** `[]`
+        Steps: []
 
-- [ ] **Milestone 29: Windows 7 Calculator (Standard, Scientific & Programmer Hex/Bin Modes)**
-    - **ID:** `m29_win7_calculator`
-    - **Goal:** Create `userspace/src/apps/calculator.rs` styled after Windows 7 Calculator with LCD gradient display, history tape, mode switcher (`Standard`, `Scientific`, `Programmer` with `HEX/DEC/OCT/BIN` bitwise ops), and register it in `FrameworkApp`. Emit `APP_CALC:PASS:Registered`.
-    - **Files:** `userspace/src/apps/calculator.rs`, `userspace/src/apps/mod.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `APP_CALC:PASS:Registered`
-    - **Steps:** `[]`
+Phase 2: 100% Framework Shell Unification, Root Sovereignty & TTY Switch (M06–M11)
 
-- [ ] **Milestone 30: Windows 7 Paint (Ribbon Toolbar, Brushes, Shapes, Flood Fill & Save BMP/PNG)**
-    - **ID:** `m30_win7_paint`
-    - **Goal:** Create or upgrade `userspace/src/apps/paint.rs` with a Windows 7 Ribbon UI containing Pencil, Brush, Flood Fill bucket, Line, Rectangle, Circle, Eraser, stroke thickness selector, 20-color palette, and Save to `/EOS SHARE`. Emit `APP_PAINT:PASS:Ribbon_Ready`.
-    - **Files:** `userspace/src/apps/paint.rs`, `userspace/src/apps/mod.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `APP_PAINT:PASS:Ribbon_Ready`
-    - **Steps:** `[]`
+    [x] Milestone 06: Pure Root Mode & Removal of hero / Permission Restrictions
 
-- [ ] **Milestone 31: Windows 7 Notepad & WordPad (Find/Replace, Line Numbers, Font Formatting)**
-    - **ID:** `m31_win7_notepad_wordpad`
-    - **Goal:** Upgrade `userspace/src/apps/textedit.rs` with a Find & Replace bar (`Ctrl+F`), Undo/Redo stack (`Ctrl+Z`/`Ctrl+Y`), status bar (`Ln, Col, UTF-8`), word-wrap toggle, and rich heading/color formatting modes. Emit `WIN7_NOTEPAD:PASS:FindReplace_Undo_Ready`.
-    - **Files:** `userspace/src/apps/textedit.rs`
-    - **Expect:** `WIN7_NOTEPAD:PASS:FindReplace_Undo_Ready`
-    - **Steps:** `[]`
+        ID: m06_pure_root_sovereignty
 
-- [ ] **Milestone 32: Windows Photo Viewer (`Preview` Upgrade) — Zoom, Pan, Rotate & Slideshow**
-    - **ID:** `m32_win7_photo_viewer`
-    - **Goal:** Upgrade `userspace/src/apps/preview.rs` into **Windows Photo Viewer** with the classic bottom glossy control bar (Previous/Next image in folder, Zoom slider, Fit-to-Window, Rotate 90° CW/CCW, Delete). Emit `WIN7_PHOTOVIEWER:PASS:Controls_Ready`.
-    - **Files:** `userspace/src/apps/preview.rs`
-    - **Expect:** `WIN7_PHOTOVIEWER:PASS:Controls_Ready`
-    - **Steps:** `[]`
+        Goal: Remove hero command prefix and all permission checks from userspace/src/apps/terminal.rs and src/fs/mod.rs. Set default user to root@eos (uid=0, gid=0 in syscall.rs) with unrestricted read/write/delete access across RootFS, EOS SHARE, and system directories. Emit ROOT_SOVEREIGNTY:PASS:Unrestricted_Root.
 
-- [ ] **Milestone 33: Windows Media Player 12 (Audio/Video Playback, Playlist & Visualizer)**
-    - **ID:** `m33_win7_media_player`
-    - **Goal:** Create `userspace/src/apps/media_player.rs` featuring Windows Media Player 12 "Now Playing" & "Library" views, animated audio spectrum bars / Alchemy visualizer, timeline seek bar, playlist loader for `TEST_SUBJECT` media, and transport controls. Register in `FrameworkApp`. Emit `APP_WMP12:PASS:Registered`.
-    - **Files:** `userspace/src/apps/media_player.rs`, `userspace/src/apps/mod.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `APP_WMP12:PASS:Registered`
-    - **Steps:** `[]`
+        Files: userspace/src/apps/terminal.rs, src/fs/mod.rs, src/arch/x86_64/syscall.rs
 
-- [ ] **Milestone 34: Windows Task Manager (`Activity Monitor` Upgrade) — Applications, Processes, Performance & Networking Tabs**
-    - **ID:** `m34_win7_task_manager`
-    - **Goal:** Upgrade `userspace/src/apps/activity_monitor.rs` into **Windows Task Manager** with 4 tabs (`Applications` with "End Task" / "New Task...", `Processes`, `Performance` with classic green-grid CPU & Memory history graphs, and `Networking`). Emit `WIN7_TASKMGR:PASS:FourTabs_Ready`.
-    - **Files:** `userspace/src/apps/activity_monitor.rs`
-    - **Expect:** `WIN7_TASKMGR:PASS:FourTabs_Ready`
-    - **Steps:** `[]`
+        Expect: ROOT_SOVEREIGNTY:PASS:Unrestricted_Root
 
-- [ ] **Milestone 35: Windows 7 Control Panel & Personalization Hub (`Settings` Upgrade)**
-    - **ID:** `m35_win7_control_panel`
-    - **Goal:** Upgrade `userspace/src/apps/settings.rs` into **Control Panel** with Category View (`System and Security`, `Network and Internet`, `Appearance and Personalization`, `Clock, Language, and Region`), Aero glass color mixer, wallpaper picker, and DPI scaling selector. Emit `WIN7_CONTROLPANEL:PASS:Categories_Ready`.
-    - **Files:** `userspace/src/apps/settings.rs`
-    - **Expect:** `WIN7_CONTROLPANEL:PASS:Categories_Ready`
-    - **Steps:** `[]`
+        Steps: []
 
-- [ ] **Milestone 36: Windows 7 Command Prompt & PowerShell Mode (`cmd.exe` Style + Piping)**
-    - **ID:** `m36_win7_cmd_powershell`
-    - **Goal:** Enhance `userspace/src/apps/terminal.rs` with classic Windows 7 `cmd.exe` (`dir`, `cd`, `type`, `copy`, `del`, `cls`, `ipconfig`, `ping`, `tasklist`, `systeminfo`, `ver`, `color`) alongside Unix aliases, command history (`Up/Down`), Tab auto-completion, and `|` piping. Emit `WIN7_CMD:PASS:ShellCommands_Ready`.
-    - **Files:** `userspace/src/apps/terminal.rs`
-    - **Expect:** `WIN7_CMD:PASS:ShellCommands_Ready`
-    - **Steps:** `[]`
+    [x] Milestone 07: Ctrl+Alt+F2 TTY Root Console & Ctrl+Alt+F1 GUI Switcher
 
-- [ ] **Milestone 37: Windows 7 Sticky Notes & Desktop Gadgets (CPU Meter, Clock, Weather/Notes)**
-    - **ID:** `m37_win7_sticky_gadgets`
-    - **Goal:** Create `userspace/src/apps/sticky_notes.rs` and desktop gadget overlays in `userspace/src/framework/app.rs` (analog clock gadget, CPU/RAM dial meter gadget, and pastel yellow/blue/pink Sticky Notes persisted to disk). Emit `WIN7_GADGETS:PASS:Sticky_And_Meters_Ready`.
-    - **Files:** `userspace/src/apps/sticky_notes.rs`, `userspace/src/apps/mod.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `WIN7_GADGETS:PASS:Sticky_And_Meters_Ready`
-    - **Steps:** `[]`
+        ID: m07_tty_console_switch
 
-- [ ] **Milestone 38: Windows 7 Snipping Tool (Region Capture & Save to Disk)**
-    - **ID:** `m38_win7_snipping_tool`
-    - **Goal:** Create `userspace/src/apps/snipping_tool.rs` allowing users to capture the desktop or active window buffer, annotate with a red highlighter pen, and save as PNG/BMP to `/EOS SHARE`. Register in `FrameworkApp`. Emit `APP_SNIPPING:PASS:Registered`.
-    - **Files:** `userspace/src/apps/snipping_tool.rs`, `userspace/src/apps/mod.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `APP_SNIPPING:PASS:Registered`
-    - **Steps:** `[]`
+        Goal: Implement virtual terminal switching (tty1 Graphical Compositor vs tty2 Full-Screen Root Text Console) in src/arch/x86_64/keyboard.rs, src/writer.rs, and userspace/src/framework/app.rs. Pressing Ctrl+Alt+F2 suspends GUI presentation and opens an interactive full-screen root shell directly on the framebuffer; Ctrl+Alt+F1 restores the GUI desktop seamlessly. Emit TTY_SWITCH:PASS:F1_GUI_F2_RootShell.
 
----
+        Files: src/arch/x86_64/keyboard.rs, src/writer.rs, src/arch/x86_64/syscall.rs, userspace/src/framework/app.rs
 
-## Phase 5: Networking, System Utilities, Games & Daily-Driver Polish (39–50)
+        Expect: TTY_SWITCH:PASS:F1_GUI_F2_RootShell
 
-- [ ] **Milestone 39: Internet Explorer 9 / EOS Browser — Tabs, Bookmarks, Local Docs & HTML5 Layout**
-    - **ID:** `m39_win7_browser_tabs`
-    - **Goal:** Upgrade `userspace/src/apps/browser.rs` with multi-tab browsing, bookmarks bar, local file viewer (`file:///EOS SHARE/...`), CSS box-model table/card rendering, and JSON API inspector. Emit `WIN7_BROWSER:PASS:MultiTab_Ready`.
-    - **Files:** `userspace/src/apps/browser.rs`
-    - **Expect:** `WIN7_BROWSER:PASS:MultiTab_Ready`
-    - **Steps:** `[]`
+        Steps: []
 
-- [ ] **Milestone 40: Windows 7 Run Dialog (`Win+R`) & Global Shortcut Dispatcher**
-    - **ID:** `m40_win7_run_dialog`
-    - **Goal:** Implement the classic Windows 7 `Run` dialog (`Win+R`) in `userspace/src/framework/app.rs` accepting `cmd`, `calc`, `mspaint`, `notepad`, `explorer`, `taskmgr`, `control`, `python`, or any path/script to launch immediately. Emit `WIN7_RUN_DIALOG:PASS:Dispatcher_Ready`.
-    - **Files:** `userspace/src/framework/app.rs`
-    - **Expect:** `WIN7_RUN_DIALOG:PASS:Dispatcher_Ready`
-    - **Steps:** `[]`
+    [x] Milestone 08: 100% Framework-Driven Desktop Shell & 60 FPS Animations
 
-- [ ] **Milestone 41: System-Wide Clipboard Manager & Cross-App Copy/Paste (`Ctrl+C` / `Ctrl+V`)**
-    - **ID:** `m41_system_clipboard`
-    - **Goal:** Add a shared Userspace Clipboard service in `userspace/src/framework/mod.rs` supporting text and file-path payloads across `Notepad`, `Command Prompt`, `Explorer`, `Python Studio`, and `Browser`. Emit `SYSTEM_CLIPBOARD:PASS:CrossApp_Ready`.
-    - **Files:** `userspace/src/framework/mod.rs`, `userspace/src/framework/app.rs`, `userspace/src/apps/textedit.rs`, `userspace/src/apps/terminal.rs`
-    - **Expect:** `SYSTEM_CLIPBOARD:PASS:CrossApp_Ready`
-    - **Steps:** `[]`
+        ID: m08_framework_shell_unification
 
-- [ ] **Milestone 42: Windows 7 Action Center & Balloon Toast Notifications**
-    - **ID:** `m42_win7_notifications`
-    - **Goal:** Implement slide-up Aero balloon toast notifications above the System Tray in `userspace/src/framework/app.rs` with an Action Center history list for system events, file saves, and Python automation alerts. Emit `WIN7_TOAST:PASS:ActionCenter_Ready`.
-    - **Files:** `userspace/src/framework/app.rs`
-    - **Expect:** `WIN7_TOAST:PASS:ActionCenter_Ready`
-    - **Steps:** `[]`
+        Goal: Refactor FrameworkApp (userspace/src/framework/app.rs) so the Taskbar, System Tray, Start Orb (icon.png), Desktop Icon Grid, and Auto-Hide slide animation are built strictly from Framework widgets (ContainerWidget, ImageWidget, ButtonWidget, Animator at 60 FPS) with persistent auto_hide in RootFS/dock.ini and unified Dark/Light StartMenu. Emit FRAMEWORK_SHELL:PASS:100Pct_Unified.
 
-- [ ] **Milestone 43: Windows 7 Minesweeper & Solitaire Classic Games**
-    - **ID:** `m43_win7_games_minesweeper`
-    - **Goal:** Create `userspace/src/apps/minesweeper.rs` implementing classic Windows 7 Minesweeper (Beginner/Intermediate grids, flood-fill zero reveal, flag counter, timer) and register in `FrameworkApp`. Emit `APP_MINESWEEPER:PASS:Registered`.
-    - **Files:** `userspace/src/apps/minesweeper.rs`, `userspace/src/apps/mod.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `APP_MINESWEEPER:PASS:Registered`
-    - **Steps:** `[]`
+        Files: userspace/src/framework/app.rs, userspace/src/framework/menu.rs, userspace/src/framework/widget.rs
 
-- [ ] **Milestone 44: Archive Manager (`.tar` / `.zip` Inspector & Extractor in Explorer)**
-    - **ID:** `m44_archive_extractor`
-    - **Goal:** Add built-in `.tar` and `.zip` (stored/deflate) archive inspection and extraction inside `userspace/src/apps/finder.rs` and `userspace/src/python/stdlib.rs`. Verify on a test archive and emit `ARCHIVE_MGR:PASS:TarZip_Ready`.
-    - **Files:** `userspace/src/apps/finder.rs`, `userspace/src/python/stdlib.rs`
-    - **Expect:** `ARCHIVE_MGR:PASS:TarZip_Ready`
-    - **Steps:** `[]`
+        Expect: FRAMEWORK_SHELL:PASS:100Pct_Unified
 
-- [ ] **Milestone 45: System Registry / Configuration Store (`eos_reg.ini`) & Session Persistence**
-    - **ID:** `m45_session_persistence`
-    - **Goal:** Persist open window positions, pinned taskbar items, theme color, desktop icon positions, and recent files to `/home/march/.config/settings.ini` (and `/EOS SHARE/eos_session.json`) and restore them cleanly on startup. Emit `SESSION_PERSIST:PASS:State_Restored`.
-    - **Files:** `userspace/src/framework/app.rs`, `userspace/src/apps/settings.rs`
-    - **Expect:** `SESSION_PERSIST:PASS:State_Restored`
-    - **Steps:** `[]`
+        Steps: []
 
-- [ ] **Milestone 46: Keyboard Navigation, Focus Rings & Accessibility Shortcuts**
-    - **ID:** `m46_keyboard_accessibility`
-    - **Goal:** Add `Tab` / `Shift+Tab` control focus traversal, `Enter`/`Space` activation, `Alt+F4` close active window, and `Win+D` toggle show desktop in `userspace/src/framework/app.rs`. Emit `A11Y_SHORTCUTS:PASS:FocusTraversal_Ready`.
-    - **Files:** `userspace/src/framework/app.rs`, `userspace/src/framework/controls.rs`
-    - **Expect:** `A11Y_SHORTCUTS:PASS:FocusTraversal_Ready`
-    - **Steps:** `[]`
+    [x] Milestone 09: Multi-Font Manager & Font Family Switcher in Framework
 
-- [ ] **Milestone 47: Subpixel Text AA Tuning & SIMD-Style Software Blit Optimization**
-    - **ID:** `m47_render_pipeline_tuning`
-    - **Goal:** Optimize `userspace/src/framework/canvas.rs` and `userspace/src/framework/compositor.rs` with glyph raster caching, fast 64-bit pair pixel fills, and zero-allocation damage blitting. Benchmark against `TEST_SUBJECT` and emit `RENDER_TUNE:PASS:GlyphCache_And_FastBlit`.
-    - **Files:** `userspace/src/framework/canvas.rs`, `userspace/src/framework/compositor.rs`
-    - **Expect:** `RENDER_TUNE:PASS:GlyphCache_And_FastBlit`
-    - **Steps:** `[]`
+        ID: m09_framework_font_manager
 
-- [ ] **Milestone 48: Automated Self-Healing Watchdog & Crash Recovery Dialog**
-    - **ID:** `m48_app_crash_recovery`
-    - **Goal:** Add state-isolation guards around widget event handlers and Python script execution so any runtime error displays a Windows 7 "Program has stopped working — Restart the program" dialog without crashing the desktop shell. Emit `WATCHDOG_GUARD:PASS:FaultIsolation_Active`.
-    - **Files:** `userspace/src/framework/app.rs`, `userspace/src/python/eval.rs`
-    - **Expect:** `WATCHDOG_GUARD:PASS:FaultIsolation_Active`
-    - **Steps:** `[]`
+        Goal: Build userspace/src/framework/fonts.rs supporting multiple bundled/disk TrueType/OpenType fonts (Sans, Mono, Arabic) with per-role selection (ui_font, mono_font, arabic_font) in Theme and a live Font Selector in Settings. Ensures Terminal and Stats HUD use fixed-width Mono metrics without jitter. Emit FONT_MGR:PASS:MultiFont_Active.
 
-- [ ] **Milestone 49: Comprehensive UI Stress Test Macro (All Apps Open, Snap, Python Automation)**
-    - **ID:** `m49_full_ui_stress_macro`
-    - **Goal:** Add a built-in automated stress-test routine in `userspace/src/test_subject.rs` that programmatically launches Explorer, Calculator, Paint, Notepad, Media Player, Task Manager, and Python Studio, runs an automation script, verifies zero memory leaks or frame drops, and emits `STRESS_TEST_ALL_APPS:PASS:ZeroFailures`.
-    - **Files:** `userspace/src/test_subject.rs`, `userspace/src/framework/app.rs`
-    - **Expect:** `STRESS_TEST_ALL_APPS:PASS:ZeroFailures`
-    - **Steps:** `[]`
+        Files: userspace/src/framework/fonts.rs, userspace/src/framework/theme.rs, userspace/src/framework/canvas.rs, userspace/src/apps/settings.rs
 
-- [ ] **Milestone 50: Windows 7 Ultimate Daily-Driver Golden Certification & Final Benchmark**
-    - **ID:** `m50_daily_driver_certification`
-    - **Goal:** Complete final polish of Start Menu, Aero Glass Taskbar, Python Automation Engine, and all `TEST_SUBJECT` golden matrix checks. Output the final certification report to `/EOS SHARE/TEST_SUBJECT/eos_certification.json` and emit `EOS_WIN7_DAILY_DRIVER:PASS:CERTIFIED_50_OF_50`.
-    - **Files:** `userspace/src/test_subject.rs`, `userspace/src/framework/app.rs`, `userspace/src/main.rs`
-    - **Expect:** `EOS_WIN7_DAILY_DRIVER:PASS:CERTIFIED_50_OF_50`
-    - **Steps:** `[]`
+        Expect: FONT_MGR:PASS:MultiFont_Active
+
+        Steps: []
+
+    [x] Milestone 10: Native Arabic Contextual Shaping & Bidirectional (RTL/LTR) Layout Engine
+
+        ID: m10_rtl_and_arabic_shaping
+
+        Goal: Implement Arabic Unicode contextual glyph shaping (connecting isolated, initial, medial, and final letter forms + Lam-Alef ligatures) and BiDi RTL text layout in userspace/src/framework/canvas.rs and layout.rs, plus LayoutDirection::Auto / RTL / LTR in Theme. Enables clean Arabic subtitles (.ass/.srt), filenames, and RTL UI mirroring. Emit RTL_ENGINE:PASS:Arabic_Shaping_Ready.
+
+        Files: userspace/src/framework/canvas.rs, userspace/src/framework/layout.rs, userspace/src/framework/theme.rs
+
+        Expect: RTL_ENGINE:PASS:Arabic_Shaping_Ready
+
+        Steps: []
+
+    [x] Milestone 11: Real Process argv / Intent Passing & Cross-Process Kernel Clipboard
+
+        ID: m11_process_argv_and_clipboard
+
+        Goal: Replace temporary .ini file handoffs (open_file.ini, finder_nav.ini) by passing real argv strings through sys_spawn_elf into isolated ELF processes, and add kernel-backed sys_clipboard_set / sys_clipboard_get syscalls (545/546) so Ctrl+C / Ctrl+V works seamlessly across Terminal, TextEdit, Finder, and Browser. Emit IPC_CLIPBOARD_ARGV:PASS:Verified.
+
+        Files: src/arch/x86_64/syscall.rs, src/task/mod.rs, userspace/src/syscall.rs, userspace/src/main.rs, userspace/src/apps/finder.rs
+
+        Expect: IPC_CLIPBOARD_ARGV:PASS:Verified
+
+        Steps: []
+
+Phase 3: Developer Diagnostics, Framework Controls & Core Apps (M12–M21)
+
+    [x] Milestone 12: Crash Inspector & Fault Recovery Dialog (#PF / #GP Handler)
+
+        ID: m12_crash_inspector_dialog
+
+        Goal: When an isolated Userspace ELF faults (#PF or #GP), record its app name, faulting RIP, CR2 address, and exit reason in the kernel process table (Syscall 509) and display a Framework modal dialog on the desktop offering a one-click Restart Application button. Emit CRASH_INSPECTOR:PASS:Fault_Capture_Ready.
+
+        Files: src/arch/x86_64/interrupts.rs, src/task/mod.rs, userspace/src/framework/app.rs
+
+        Expect: CRASH_INSPECTOR:PASS:Fault_Capture_Ready
+
+        Steps: []
+
+    [x] Milestone 13: Live UI Inspector & Widget Bounds Overlay (F12 DevTools)
+
+        ID: m13_ui_inspector_devtools
+
+        Goal: Add a Framework-level UI Inspector (F12 toggle or Test app switch) that highlights hovered widget bounds, padding, corner radius, adaptive text luminance score, and per-frame render time in milliseconds. Emit UI_INSPECTOR:PASS:Overlay_Active.
+
+        Files: userspace/src/framework/app.rs, userspace/src/framework/canvas.rs, userspace/src/apps/test_app.rs
+
+        Expect: UI_INSPECTOR:PASS:Overlay_Active
+
+        Steps: []
+
+    [x] Milestone 14: Quick Command Palette (Alt+Space Launcher)
+
+        ID: m14_command_palette
+
+        Goal: Implement a centered frosted-glass Command Palette (Alt+Space) built with Framework TextInputWidget and ScrollViewWidget for instant fuzzy launching of apps, opening files in EOS SHARE, or running system commands. Emit CMD_PALETTE:PASS:AltSpace_Ready.
+
+        Files: userspace/src/framework/menu.rs, userspace/src/framework/app.rs
+
+        Expect: CMD_PALETTE:PASS:AltSpace_Ready
+
+        Steps: []
+
+    [x] Milestone 15: Toast Notification Overlay & Modal Dialogs (Confirm, Rename, NewFolder)
+
+        ID: m15_toasts_and_modal_dialogs
+
+        Goal: Wire PortalKind::Notifications to render smooth slide-in Aero/Modern toast banners in the bottom-right corner, and add reusable ModalDialog (Confirm, TextPrompt) in userspace/src/framework/tools.rs. Emit MODAL_TOAST:PASS:Portals_Wired.
+
+        Files: userspace/src/framework/tools.rs, userspace/src/framework/portal.rs, userspace/src/framework/app.rs
+
+        Expect: MODAL_TOAST:PASS:Portals_Wired
+
+        Steps: []
+
+    [ ] Milestone 15b (Framework UI Polish Backlog): Universal Button Hover States, Wallpaper Thumbnail Clipping, Bilinear Downscaling & Non-Blocking Wallpaper Scan
+
+        ID: m15b_framework_ui_polish
+
+        Goal: Add universal hover states to Framework buttons/controls, enforce strict Canvas clip bounds on wallpaper thumbnails in Settings, upgrade thumbnail/image downscaling from nearest-neighbor to bilinear filtering to eliminate pixelation, and decode large wallpapers asynchronously/chunked without freezing UI.
+
+        Files: userspace/src/framework/controls.rs, userspace/src/apps/settings.rs, userspace/src/framework/canvas.rs
+
+        Expect: FRAMEWORK_POLISH:PASS:Hover_Bilinear_Ready
+
+        Steps: []
+
+    [x] Milestone 16: Finder Full File Management & Context-Aware Actions
+
+        ID: m16_finder_file_operations
+
+        Goal: Upgrade userspace/src/apps/finder.rs with working SmoothScrollBar drag/click, right-click item-specific context menus (Open, Open in Terminal, Rename, New Folder, Copy Path, Delete), and bottom details bar. Emit FINDER_OPS:PASS:Full_CRUD_Ready.
+
+        Files: userspace/src/apps/finder.rs, src/fs/mod.rs, src/drivers/ata.rs
+
+        Expect: FINDER_OPS:PASS:Full_CRUD_Ready
+
+        Steps: []
+
+    [x] Milestone 17: Video Player Volume Slider, Subtitle Sync & Folder Playlist
+
+        ID: m17_video_player_pro
+
+        Goal: Add an interactive volume slider + mute toggle (M), subtitle delay offset ([ / ] keys, +/- 100ms), automatic next/previous video playlist in the same directory, and bilinear/SIMD frame scaling in userspace/src/apps/video_player.rs. Emit VIDEO_PRO:PASS:Volume_Subs_Playlist.
+
+        Files: userspace/src/apps/video_player.rs, userspace/src/ffi_ffmpeg.c
+
+        Expect: VIDEO_PRO:PASS:Volume_Subs_Playlist
+
+        Steps: []
+
+    [x] Milestone 18: Activity Monitor Live Kernel Telemetry & Process Control
+
+        ID: m18_activity_monitor_real_telemetry
+
+        Goal: Replace static mock data in userspace/src/apps/activity_monitor.rs with real sdk::sys::query_processes() (Syscall 509), per-core SMP utilization, kernel heap usage, and a working Terminate Process button. Emit ACTIVITY_MON:PASS:Live_Syscall509.
+
+        Files: userspace/src/apps/activity_monitor.rs, src/task/mod.rs
+
+        Expect: ACTIVITY_MON:PASS:Live_Syscall509
+
+        Steps: []
+
+    [ ] Milestone 19: Terminal Tab Auto-Completion, Output Redirection & System Commands
+
+        ID: m19_terminal_shell_upgrades
+
+        Goal: Add Tab path/command auto-completion, > / >> file redirection, and built-in ps, kill, free, lspci, reboot, and shutdown commands to userspace/src/apps/terminal.rs. Emit TERMINAL_PRO:PASS:Completion_And_SysCmds.
+
+        Files: userspace/src/apps/terminal.rs
+
+        Expect: TERMINAL_PRO:PASS:Completion_And_SysCmds
+
+        Steps: []
+
+    [ ] Milestone 20: TextEdit Syntax Highlighting, Undo/Redo & Save-As Portal
+
+        ID: m20_textedit_code_features
+
+        Goal: Upgrade userspace/src/apps/textedit.rs with keyword/string/comment syntax highlighting for .rs, .py, .c, .ini, and .json, multi-step Ctrl+Z / Ctrl+Y Undo/Redo, and Save As via FileDialog. Emit TEXTEDIT_PRO:PASS:Syntax_Undo_Ready.
+
+        Files: userspace/src/apps/textedit.rs
+
+        Expect: TEXTEDIT_PRO:PASS:Syntax_Undo_Ready
+
+        Steps: []
+
+    [ ] Milestone 21: Global Keyboard Shortcuts & Screenshot Capture (PrintScreen)
+
+        ID: m21_global_shortcuts_screenshot
+
+        Goal: Add Alt+F4 (close active window), Win+D (toggle desktop), Win+Left/Right (Aero Snap), and PrintScreen (encode active framebuffer to PNG via png crate and save to /EOS SHARE/screenshot_<ts>.png with toast notification). Emit SHORTCUTS_SCREENSHOT:PASS:Verified.
+
+        Files: userspace/src/framework/app.rs, userspace/src/png.rs
+
+        Expect: SHORTCUTS_SCREENSHOT:PASS:Verified
+
+        Steps: []
+
+Phase 4: Static CPython 3.12 Runtime & System Automation (M22–M26)
+
+    [ ] Milestone 22: Static libpython3.12.a Cross-Compilation & FFI Bridge (ffi_python.c)
+
+        ID: m22_cpython_static_link
+
+        Goal: Compile CPython 3.12 (--disable-shared --without-ensurepip with musl-gcc) into userspace/vendor/python/lib/libpython3.12.a, link it in userspace/build.rs, and initialize the embedded interpreter in userspace/src/ffi_python.rs. Emit CPYTHON_LINK:PASS:Embedded_3_12_Ready.
+
+        Files: userspace/build.rs, userspace/src/ffi_python.c, userspace/src/ffi_python.rs
+
+        Expect: CPYTHON_LINK:PASS:Embedded_3_12_Ready
+
+        Steps: []
+
+    [ ] Milestone 23: eos Built-in Python C-Extension Module (eos.gui, eos.sys, eos.audio)
+
+        ID: m23_cpython_eos_module
+
+        Goal: Expose native EOS syscalls and portal actions as a built-in CPython module eos (eos.spawn(app), eos.notify(title, msg), eos.processes(), eos.clipboard_get(), eos.clipboard_set(), eos.audit(msg)). Emit CPYTHON_EOS_MOD:PASS:Bindings_Active.
+
+        Files: userspace/src/ffi_python.c, userspace/src/ffi_python.rs
+
+        Expect: CPYTHON_EOS_MOD:PASS:Bindings_Active
+
+        Steps: []
+
+    [ ] Milestone 24: python CLI Execution & Interactive REPL in Terminal & tty2
+
+        ID: m24_terminal_cpython_runner
+
+        Goal: Enable python script.py and python -c "..." in Terminal and tty2 Root Shell to execute real Python 3.12 scripts with stdout/stderr routed directly to the console. Emit CPYTHON_CLI:PASS:Script_Execution_OK.
+
+        Files: userspace/src/apps/terminal.rs, userspace/src/ffi_python.rs
+
+        Expect: CPYTHON_CLI:PASS:Script_Execution_OK
+
+        Steps: []
+
+    [ ] Milestone 25: TEST_SUBJECT/01_math_matrix.py Real CPython Verification
+
+        ID: m25_cpython_test_subject_verify
+
+        Goal: Run /EOS SHARE/TEST_SUBJECT/01_math_matrix.py via embedded CPython during startup verification, assert TRACE_10=285, record in eos_output.json, and emit CPYTHON_VERIFY:PASS:TRACE_10_285.
+
+        Files: userspace/src/test_subject.rs, userspace/src/ffi_python.rs
+
+        Expect: CPYTHON_VERIFY:PASS:TRACE_10_285
+
+        Steps: []
+
+    [ ] Milestone 26: Background Python Automation Service (eos_auto.py)
+
+        ID: m26_cpython_background_service
+
+        Goal: Support running user automation scripts from /RootFS/autostart/ in a dedicated isolated ELF (eos_python.elf --script ...) without blocking UI frame pacing. Emit CPYTHON_AUTO:PASS:Isolated_Worker_Ready.
+
+        Files: userspace/src/main.rs, userspace/src/ffi_python.rs
+
+        Expect: CPYTHON_AUTO:PASS:Isolated_Worker_Ready
+
+        Steps: []
+
+Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
+
+    [ ] Milestone 27: PAT / Write-Combining (WC) Framebuffer Acceleration
+
+        ID: m27_hw_write_combining_fb
+
+        Goal: Configure x86_64 Page Attribute Table (IA32_PAT MSR 0x277) in src/mm/paging.rs and map UEFI GOP / PCI linear framebuffers as Write-Combining (WC), boosting 2D software/compositor blit throughput to full memory bandwidth on bare-metal laptops and desktops. Emit HW_PAT_WC:PASS:Framebuffer_Accelerated.
+
+        Files: src/mm/paging.rs, src/main.rs
+
+        Expect: HW_PAT_WC:PASS:Framebuffer_Accelerated
+
+        Steps: []
+
+    [ ] Milestone 28: AHCI / SATA DMA Storage Driver (PCI Class 01:06)
+
+        ID: m28_hw_ahci_sata_driver
+
+        Goal: Implement src/drivers/ahci.rs supporting PCI AHCI HBA discovery, port FIS/Command List initialization, and DMA sector read/write, wired into src/fs/mod.rs alongside legacy ATA. Emit HW_AHCI:PASS:SATA_DMA_Ready.
+
+        Files: src/drivers/ahci.rs, src/drivers/mod.rs, src/fs/mod.rs, src/main.rs
+
+        Expect: HW_AHCI:PASS:SATA_DMA_Ready
+
+        Steps: []
+
+    [ ] Milestone 29: Intel High Definition Audio Driver (Intel HDA — PCI Class 04:03)
+
+        ID: m29_hw_intel_hda_audio
+
+        Goal: Implement src/drivers/hda.rs (CORB/RIRB verb discovery, output DAC/Pin widget unmuting, and 48kHz Stereo BDL DMA playback) as automatic hardware backend alongside AC'97 in Syscall 540..542. Emit HW_HDA:PASS:Intel_HDA_Ready.
+
+        Files: src/drivers/hda.rs, src/drivers/mod.rs, src/arch/x86_64/syscall.rs, src/main.rs
+
+        Expect: HW_HDA:PASS:Intel_HDA_Ready
+
+        Steps: []
+
+    [ ] Milestone 30: Realtek RTL8111/8168 Gigabit Ethernet Driver
+
+        ID: m30_hw_rtl8111_ethernet
+
+        Goal: Implement src/drivers/rtl8111.rs (Vendor 0x10EC, Device 0x8168/0x8136) with RX/TX descriptor rings wired into src/net.rs alongside Intel E1000. Emit HW_NIC_RTL:PASS:Ethernet_Ready.
+
+        Files: src/drivers/rtl8111.rs, src/drivers/mod.rs, src/net.rs, src/main.rs
+
+        Expect: HW_NIC_RTL:PASS:Ethernet_Ready
+
+        Steps: []
+
+    [ ] Milestone 31: Clean ACPI Shutdown, Reboot & Disk Sync
+
+        ID: m31_clean_power_management
+
+        Goal: Add Syscall 550 (sys_power(cmd: 1=Reboot, 2=Shutdown)) that flushes VFS buffers and invokes src/arch/x86_64/power.rs, wired to Start Menu and tty2 root commands. Emit POWER_MGR:PASS:Clean_Shutdown_Ready.
+
+        Files: src/arch/x86_64/syscall.rs, src/arch/x86_64/power.rs, userspace/src/framework/menu.rs
+
+        Expect: POWER_MGR:PASS:Clean_Shutdown_Ready
+
+        Steps: []
+
+    [ ] Milestone 32: Full System Stress & Bare-Metal Readiness Certification
+
+        ID: m32_eos_gold_certification
+
+        Goal: Run end-to-end verification across multi-process GUI apps, RTL/Arabic rendering, CPython automation, Ctrl+Alt+F2 TTY switching, and hardware drivers, exporting /EOS SHARE/TEST_SUBJECT/eos_certification.json and emitting EOS_CERTIFIED:PASS:32_OF_32.
+
+        Files: userspace/src/test_subject.rs, test_eos_audit.py
+
+        Expect: EOS_CERTIFIED:PASS:32_OF_32
+
+        Steps: []

@@ -120,6 +120,8 @@ pub fn execute_command(cmd: &str) {
 
 pub extern "x86-interrupt" fn divide_by_zero_handler(stack_frame: InterruptStackFrame) {
     if (stack_frame.code_segment & 3) == 3 {
+        let cid = crate::profiler::get_core_id();
+        crate::task::record_user_crash(cid, 1, stack_frame.instruction_pointer, 0, 0);
         log_error!("CPU", "User Process Divide By Zero (#DE) at RIP {:#018x}. Terminating.", stack_frame.instruction_pointer);
         crate::task::force_exit_user_process();
     } else {
@@ -134,6 +136,8 @@ pub extern "x86-interrupt" fn breakpoint_handler(stack_frame: InterruptStackFram
 
 pub extern "x86-interrupt" fn invalid_opcode_handler(stack_frame: InterruptStackFrame) {
     if (stack_frame.code_segment & 3) == 3 {
+        let cid = crate::profiler::get_core_id();
+        crate::task::record_user_crash(cid, 2, stack_frame.instruction_pointer, 0, 0);
         log_error!("CPU", "User Process Invalid Opcode (#UD) at RIP {:#018x}, RSP: {:#018x}. Terminating.",
             stack_frame.instruction_pointer, stack_frame.stack_pointer);
         crate::task::force_exit_user_process();
@@ -150,6 +154,8 @@ pub extern "x86-interrupt" fn double_fault_handler(stack_frame: InterruptStackFr
 
 pub extern "x86-interrupt" fn general_protection_fault_handler(stack_frame: InterruptStackFrame, code: u64) {
     if (stack_frame.code_segment & 3) == 3 {
+        let cid = crate::profiler::get_core_id();
+        crate::task::record_user_crash(cid, 3, stack_frame.instruction_pointer, 0, code);
         log_error!("CPU", "=== [USER PROCESS #GP FAULT DIAGNOSTIC] ===");
         log_error!("CPU", "  Fault Code : {:#x}", code);
         log_error!("CPU", "  At RIP     : {:#018x}", stack_frame.instruction_pointer);
@@ -168,6 +174,8 @@ pub extern "x86-interrupt" fn page_fault_handler(stack_frame: InterruptStackFram
     let cr2: u64;
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)); }
     if (stack_frame.code_segment & 3) == 3 {
+        let cid = crate::profiler::get_core_id();
+        crate::task::record_user_crash(cid, 4, stack_frame.instruction_pointer, cr2, error_code);
         log_error!("MMU", "USER PAGE FAULT on Address {:#018x} at RIP {:#018x} (Code: {:#b}). Terminating.",
             cr2, stack_frame.instruction_pointer, error_code);
         crate::task::force_exit_user_process();

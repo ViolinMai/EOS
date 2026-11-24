@@ -15,6 +15,7 @@ static FEAT_AA_CORNERS: AtomicBool = AtomicBool::new(true);
 static FEAT_SMOOTH_ANIM: AtomicBool = AtomicBool::new(true);
 static FEAT_ADAPTIVE_TEXT: AtomicBool = AtomicBool::new(true);
 static FEAT_DEBUG_DAMAGE_OVERLAY: AtomicBool = AtomicBool::new(false);
+static FEAT_UI_INSPECTOR: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug)]
 pub struct FrameworkFeatures {
@@ -24,6 +25,7 @@ pub struct FrameworkFeatures {
     pub smooth_animations: bool,
     pub adaptive_text: bool,
     pub debug_damage_overlay: bool,
+    pub ui_inspector: bool,
 }
 
 pub fn get_features() -> FrameworkFeatures {
@@ -39,6 +41,7 @@ pub fn get_features() -> FrameworkFeatures {
         smooth_animations: FEAT_SMOOTH_ANIM.load(Ordering::Relaxed),
         adaptive_text: FEAT_ADAPTIVE_TEXT.load(Ordering::Relaxed),
         debug_damage_overlay: FEAT_DEBUG_DAMAGE_OVERLAY.load(Ordering::Relaxed),
+        ui_inspector: FEAT_UI_INSPECTOR.load(Ordering::Relaxed),
     }
 }
 
@@ -90,6 +93,13 @@ pub fn toggle_smooth_animations() -> bool {
 pub fn toggle_debug_damage_overlay() -> bool {
     let next = !FEAT_DEBUG_DAMAGE_OVERLAY.load(Ordering::Relaxed);
     FEAT_DEBUG_DAMAGE_OVERLAY.store(next, Ordering::Relaxed);
+    crate::framework::theme::redraw_fullscreen();
+    next
+}
+
+pub fn toggle_ui_inspector() -> bool {
+    let next = !FEAT_UI_INSPECTOR.load(Ordering::Relaxed);
+    FEAT_UI_INSPECTOR.store(next, Ordering::Relaxed);
     crate::framework::theme::redraw_fullscreen();
     next
 }

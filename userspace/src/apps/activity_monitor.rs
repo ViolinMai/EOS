@@ -1,81 +1,85 @@
+use std::time::{Duration, Instant};
 use crate::framework::*;
-
-#[derive(Clone, Debug)]
-pub struct ProcessItem {
-    pub pid: usize,
-    pub name: String,
-    pub cpu_percent: usize,
-    pub mem_mb: usize,
-    pub status: &'static str,
-}
+use crate::sdk;
 
 pub struct ActivityMonitorApp {
     bounds: Rect,
     selected_tab: usize,
-    last_update_tick: u64,
-    processes: Vec<ProcessItem>,
+    last_refresh: Instant,
+    processes: Vec<sdk::sys::ProcessInfo>,
+    selected_pid: Option<u32>,
+    kernel_heap_kb: usize,
+    total_syscalls_prev: u64,
     cpu_history: Vec<usize>,
-    mem_used_mb: usize,
-    disk_read_kb: usize,
-    disk_write_kb: usize,
-    net_rx_packets: usize,
-    net_tx_packets: usize,
+    status_msg: String,
 }
 
 impl ActivityMonitorApp {
     pub fn new() -> Self {
-        Self {
+        let mut app = Self {
             bounds: Rect::default(),
             selected_tab: 0,
-            last_update_tick: 0,
-            processes: vec![
-                ProcessItem { pid: 1, name: "eos_kernel".into(), cpu_percent: 1, mem_mb: 256, status: "System" },
-                ProcessItem { pid: 2, name: "user_app (GUI)".into(), cpu_percent: 3, mem_mb: 42, status: "Active" },
-                ProcessItem { pid: 3, name: "e1000_net".into(), cpu_percent: 0, mem_mb: 8, status: "Bridge" },
-                ProcessItem { pid: 4, name: "ext2_vfs".into(), cpu_percent: 1, mem_mb: 16, status: "Mounted" },
-            ],
-            cpu_history: vec![3, 4, 3, 5, 4, 3, 4, 3, 4, 3, 4, 4],
-            mem_used_mb: 322,
-            disk_read_kb: 4912,
-            disk_write_kb: 1420,
-            net_rx_packets: 142,
-            net_tx_packets: 110,
+            last_refresh: Instant::now() - Duration::from_secs(2),
+            processes: Vec::new(),
+            selected_pid: None,
+            kernel_heap_kb: 0,
+            total_syscalls_prev: 0,
+            cpu_history: vec![4; 24],
+            status_msg: "Live Kernel Telemetry via Syscall 509".into(),
+        };
+        app.refresh_live_telemetry();
+        app
+    }
+
+    fn refresh_live_telemetry(&mut self) {
+        let now = Instant::now();
+        if now.saturating_duration_since(self.last_refresh) < Duration::from_millis(500) {
+            return;
         }
+        self.last_refresh = now;
+        self.processes = sdk::sys::query_processes();
+        self.kernel_heap_kb = sdk::agent::query_kernel_heap_used() / 1024;
+
+        let total_sc: u64 = self.processes.iter().map(|p| p.syscalls).sum();
+        let delta_sc = total_sc.saturating_sub(self.total_syscalls_prev);
+        self.total_syscalls_prev = total_sc;
+
+        let load_pct = ((delta_sc / 25).min(95) as usize).max(2);
+        if self.cpu_history.len() >= 24 {
+            self.cpu_history.remove(0);
+        }
+        self.cpu_history.push(load_pct);
     }
 
-    fn update_stats(&mut self) {
-        let t = crate::framework::perf_log::SmartLogger::read_tsc();
-        if t.saturating_sub(self.last_update_tick) < 2_000_000_000 { return; }
-        self.last_update_tick = t;
-
-        let load = 3 + ((t % 5) as usize);
-        if self.cpu_history.len() >= 24 { self.cpu_history.remove(0); }
-        self.cpu_history.push(load);
-
-        self.disk_read_kb += 32;
-        self.net_rx_packets += 1;
-    }
-
-    pub fn paint_process_list(&self, canvas: &mut Canvas, x: i32, y: i32, w: i32) {
+    fn paint_process_table(&self, canvas: &mut Canvas, x: i32, y: i32, w: i32, max_h: i32) {
         let theme = get_theme();
-        let row_h = theme.pt(28.0);
         let header_h = theme.pt(26.0);
+        let row_h = theme.pt(26.0);
 
-        canvas.draw_rect(x, y, w, header_h, 0xFF1E293B, 4);
-        canvas.draw_text(x + theme.pt(12.0), y + theme.pt(5.0), "PID", theme.text_muted, theme.font_caption());
-        canvas.draw_text(x + theme.pt(60.0), y + theme.pt(5.0), "Process Name", theme.text_muted, theme.font_caption());
-        canvas.draw_text(x + theme.pt(240.0), y + theme.pt(5.0), "CPU %", theme.text_muted, theme.font_caption());
-        canvas.draw_text(x + theme.pt(320.0), y + theme.pt(5.0), "Memory", theme.text_muted, theme.font_caption());
-        canvas.draw_text(x + theme.pt(400.0), y + theme.pt(5.0), "Status", theme.text_muted, theme.font_caption());
+        canvas.draw_rect(x, y, w, header_h, theme.bg_sidebar, 4);
+        canvas.draw_text(x + theme.pt(10.0), y + theme.pt(5.0), "PID", theme.text_muted, theme.font_caption());
+        canvas.draw_text(x + theme.pt(54.0), y + theme.pt(5.0), "Core", theme.text_muted, theme.font_caption());
+        canvas.draw_text(x + theme.pt(104.0), y + theme.pt(5.0), "Process Name", theme.text_muted, theme.font_caption());
+        canvas.draw_text(x + theme.pt(280.0), y + theme.pt(5.0), "Memory", theme.text_muted, theme.font_caption());
+        canvas.draw_text(x + theme.pt(370.0), y + theme.pt(5.0), "Syscalls", theme.text_muted, theme.font_caption());
 
         let mut cy = y + header_h + 2;
         for p in &self.processes {
-            canvas.draw_rect(x, cy, w, row_h, 0xFF141E2E, 2);
-            canvas.draw_text(x + theme.pt(12.0), cy + theme.pt(6.0), &p.pid.to_string(), theme.text_primary, theme.font_caption());
-            canvas.draw_text(x + theme.pt(60.0), cy + theme.pt(6.0), &p.name, 0xFFFFFFFF, theme.font_body());
-            canvas.draw_text(x + theme.pt(240.0), cy + theme.pt(6.0), &format!("{}%", p.cpu_percent), theme.accent_hover, theme.font_caption());
-            canvas.draw_text(x + theme.pt(320.0), cy + theme.pt(6.0), &format!("{} MB", p.mem_mb), theme.text_secondary, theme.font_caption());
-            canvas.draw_text(x + theme.pt(400.0), cy + theme.pt(6.0), p.status, 0xFF10B981, theme.font_caption());
+            if cy + row_h > y + max_h { break; }
+            let is_sel = self.selected_pid == Some(p.pid);
+            let bg = if is_sel { theme.accent } else { theme.bg_panel };
+            canvas.draw_rect(x, cy, w, row_h, bg, 3);
+            let txt = if is_sel { 0xFFFFFFFF } else { theme.text_primary };
+            canvas.draw_text(x + theme.pt(10.0), cy + theme.pt(5.0), &p.pid.to_string(), txt, theme.font_caption());
+            canvas.draw_text(x + theme.pt(54.0), cy + theme.pt(5.0), &format!("C{}", p.core_id), txt, theme.font_caption());
+            canvas.draw_text_clipped(x + theme.pt(104.0), cy + theme.pt(5.0), theme.pt(170.0), &p.name, txt, theme.font_caption());
+            let mem_str = if p.mem_kb >= 1024 {
+                format!("{:.1} MB", p.mem_kb as f32 / 1024.0)
+            } else {
+                format!("{} KB", p.mem_kb)
+            };
+            canvas.draw_text(x + theme.pt(280.0), cy + theme.pt(5.0), &mem_str, txt, theme.font_caption());
+            canvas.draw_text(x + theme.pt(370.0), cy + theme.pt(5.0), &p.syscalls.to_string(), txt, theme.font_caption());
             cy += row_h + 2;
         }
     }
@@ -93,112 +97,141 @@ impl Widget for ActivityMonitorApp {
     fn paint(&self, canvas: &mut Canvas) {
         unsafe {
             let app_mut = self as *const Self as *mut Self;
-            (*app_mut).update_stats();
+            (*app_mut).refresh_live_telemetry();
         }
 
         let theme = get_theme();
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, 0);
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_app, 0);
 
-        let tb_h = theme.pt(44.0);
-        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_titlebar, 0);
+        let tb_h = theme.pt(42.0);
+        canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, tb_h, theme.bg_sidebar, 0);
         canvas.draw_line_h(self.bounds.x, self.bounds.y + tb_h, self.bounds.w, theme.border_window);
 
-        let tabs = ["CPU", "Memory", "Disk", "Network"];
-        let seg_w = theme.pt(90.0);
-        let start_x = self.bounds.x + (self.bounds.w - (tabs.len() as i32 * seg_w)) / 2;
-
+        let tabs = ["Processes & CPU", "Memory", "SMP Cores"];
+        let seg_w = theme.pt(116.0);
+        let pad = theme.pt(12.0);
         for (i, &t) in tabs.iter().enumerate() {
-            let bx = start_x + (i as i32 * seg_w);
-            let by = self.bounds.y + theme.pt(8.0);
-            if self.selected_tab == i {
-                canvas.draw_rect(bx, by, seg_w, theme.pt(28.0), theme.accent, theme.pt(6.0) as usize);
-                let (tw, _) = canvas.measure_text(t, theme.font_body());
-                canvas.draw_text(bx + (seg_w - tw as i32) / 2, by + theme.pt(5.0), t, 0xFFFFFFFF, theme.font_body());
-            } else {
-                canvas.draw_rect_outline(bx, by, seg_w, theme.pt(28.0), theme.border_window, theme.pt(6.0) as usize);
-                let (tw, _) = canvas.measure_text(t, theme.font_body());
-                canvas.draw_text(bx + (seg_w - tw as i32) / 2, by + theme.pt(5.0), t, theme.text_secondary, theme.font_body());
-            }
+            let bx = self.bounds.x + pad + (i as i32 * (seg_w + theme.pt(6.0)));
+            let by = self.bounds.y + theme.pt(7.0);
+            let bg = if self.selected_tab == i { theme.accent } else { theme.bg_panel };
+            canvas.draw_rect(bx, by, seg_w, theme.pt(28.0), bg, 5);
+            canvas.draw_text(bx + theme.pt(10.0), by + theme.pt(6.0), t, 0xFFFFFFFF, theme.font_caption());
         }
 
-        let content_y = self.bounds.y + tb_h + theme.pt(16.0);
-        let pad_x = self.bounds.x + theme.pt(24.0);
-        let card_w = self.bounds.w - theme.pt(48.0);
+        // Terminate Process button on top-right
+        let term_w = theme.pt(124.0);
+        let term_x = self.bounds.x + self.bounds.w - pad - term_w;
+        let can_kill = self.selected_pid.map(|p| p >= 3).unwrap_or(false);
+        canvas.draw_rect(term_x, self.bounds.y + theme.pt(7.0), term_w, theme.pt(28.0), if can_kill { 0xFFDC2626 } else { 0xFF334155 }, 5);
+        canvas.draw_text(term_x + theme.pt(10.0), self.bounds.y + theme.pt(13.0), "Terminate Proc", 0xFFFFFFFF, theme.font_caption());
+
+        let cy = self.bounds.y + tb_h + pad;
+        let cw = self.bounds.w - pad * 2;
+        let footer_h = theme.pt(24.0);
+        let avail_h = (self.bounds.h - tb_h - footer_h - pad * 2).max(100);
 
         match self.selected_tab {
             0 => {
-                let card_h = theme.pt(120.0);
-                canvas.draw_rect(pad_x, content_y, card_w, card_h, theme.bg_titlebar, theme.pt(8.0) as usize);
-                canvas.draw_rect_outline(pad_x, content_y, card_w, card_h, theme.border_window, theme.pt(8.0) as usize);
+                let card_h = theme.pt(94.0);
+                canvas.draw_rect(self.bounds.x + pad, cy, cw, card_h, theme.bg_panel, 8);
+                canvas.draw_rect_outline(self.bounds.x + pad, cy, cw, card_h, theme.border_window, 8);
+                let cur_load = self.cpu_history.last().copied().unwrap_or(2);
+                canvas.draw_text(self.bounds.x + pad + theme.pt(12.0), cy + theme.pt(10.0), &format!("Live Activity: {}%  |  Active Processes: {}  |  Kernel Heap: {:.1} MB", cur_load, self.processes.len(), self.kernel_heap_kb as f32 / 1024.0), theme.text_primary, theme.font_body());
 
-                let cur_cpu = self.cpu_history.last().copied().unwrap_or(4);
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(14.0), &format!("CPU Usage: {}% (8 Hardware SMP Cores Online)", cur_cpu), theme.text_primary, theme.font_title());
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(40.0), "Scheduler: Preemptive Round-Robin | Core 2 GUI Dedicated", theme.text_secondary, theme.font_caption());
-
-                let graph_y = content_y + theme.pt(65.0);
-                let bar_w = (card_w - theme.pt(40.0)) / self.cpu_history.len().max(1) as i32;
-                for (idx, &load) in self.cpu_history.iter().enumerate() {
-                    let gx = pad_x + theme.pt(16.0) + (idx as i32 * bar_w);
-                    let bar_h = (load as i32 * theme.pt(35.0)) / 100;
-                    canvas.draw_rect(gx, graph_y + theme.pt(35.0) - bar_h, bar_w - 3, bar_h.max(2), theme.accent, 2);
+                let graph_y = cy + theme.pt(40.0);
+                let graph_h = theme.pt(42.0);
+                let bar_w = ((cw - theme.pt(24.0)) / self.cpu_history.len().max(1) as i32).max(4);
+                for (i, &v) in self.cpu_history.iter().enumerate() {
+                    let gx = self.bounds.x + pad + theme.pt(12.0) + (i as i32 * bar_w);
+                    let bh = ((v as i32 * graph_h) / 100).max(2);
+                    canvas.draw_rect(gx, graph_y + graph_h - bh, (bar_w - 3).max(2), bh, theme.accent_hover, 2);
                 }
 
-                let list_y = content_y + card_h + theme.pt(16.0);
-                self.paint_process_list(canvas, pad_x, list_y, card_w);
+                let tbl_y = cy + card_h + theme.pt(10.0);
+                self.paint_process_table(canvas, self.bounds.x + pad, tbl_y, cw, avail_h - card_h - theme.pt(10.0));
             }
             1 => {
-                let card_h = theme.pt(100.0);
-                canvas.draw_rect(pad_x, content_y, card_w, card_h, theme.bg_titlebar, theme.pt(8.0) as usize);
-                canvas.draw_rect_outline(pad_x, content_y, card_w, card_h, theme.border_window, theme.pt(8.0) as usize);
+                let card_h = theme.pt(110.0);
+                canvas.draw_rect(self.bounds.x + pad, cy, cw, card_h, theme.bg_panel, 8);
+                canvas.draw_rect_outline(self.bounds.x + pad, cy, cw, card_h, theme.border_window, 8);
+                let total_proc_mb: f32 = self.processes.iter().map(|p| p.mem_kb as f32 / 1024.0).sum();
+                canvas.draw_text(self.bounds.x + pad + theme.pt(14.0), cy + theme.pt(12.0), &format!("Kernel Heap: {:.1} MB / 256.0 MB", self.kernel_heap_kb as f32 / 1024.0), theme.text_primary, theme.font_title());
+                canvas.draw_text(self.bounds.x + pad + theme.pt(14.0), cy + theme.pt(40.0), &format!("Accounted Process Memory: {:.1} MB across {} tasks", total_proc_mb, self.processes.len()), theme.text_secondary, theme.font_caption());
+                let bar_w = cw - theme.pt(28.0);
+                let fill = (((self.kernel_heap_kb as f32) / (256.0 * 1024.0)) * bar_w as f32).clamp(16.0, bar_w as f32) as i32;
+                canvas.draw_rect(self.bounds.x + pad + theme.pt(14.0), cy + theme.pt(70.0), bar_w, theme.pt(16.0), 0xFF0F172A, 4);
+                canvas.draw_rect(self.bounds.x + pad + theme.pt(14.0), cy + theme.pt(70.0), fill, theme.pt(16.0), theme.accent, 4);
 
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(14.0), &format!("Physical RAM: {} MB / 8165 MB", self.mem_used_mb), theme.text_primary, theme.font_title());
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(38.0), "Kernel Heap: 256 MB Static | 4-Level Virtual Paging (PML4)", theme.text_secondary, theme.font_caption());
-
-                let bar_total_w = card_w - theme.pt(32.0);
-                let fill_w = (self.mem_used_mb as i32 * bar_total_w) / 8165;
-                canvas.draw_rect(pad_x + theme.pt(16.0), content_y + theme.pt(65.0), bar_total_w, theme.pt(14.0), 0xFF1E293B, 4);
-                canvas.draw_rect(pad_x + theme.pt(16.0), content_y + theme.pt(65.0), fill_w.max(24), theme.pt(14.0), theme.accent, 4);
-
-                let list_y = content_y + card_h + theme.pt(16.0);
-                self.paint_process_list(canvas, pad_x, list_y, card_w);
+                let tbl_y = cy + card_h + theme.pt(10.0);
+                self.paint_process_table(canvas, self.bounds.x + pad, tbl_y, cw, avail_h - card_h - theme.pt(10.0));
             }
-            2 => {
-                let card_h = theme.pt(140.0);
-                canvas.draw_rect(pad_x, content_y, card_w, card_h, theme.bg_titlebar, theme.pt(8.0) as usize);
-                canvas.draw_rect_outline(pad_x, content_y, card_w, card_h, theme.border_window, theme.pt(8.0) as usize);
-
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(14.0), "Storage Subsystem & VFS Disks", theme.text_primary, theme.font_title());
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(42.0), &format!("Read: {} KB | Written: {} KB", self.disk_read_kb, self.disk_write_kb), theme.accent_hover, theme.font_body());
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(72.0), "Drive 0: UEFI FAT32 Boot Partition (128 MB)", theme.text_secondary, theme.font_caption());
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(92.0), "Drive 1: Shared FAT32 Host Bridge (EOS SHARE)", theme.text_secondary, theme.font_caption());
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(112.0), "Drive 2: EXT2 Native Persistent RootFS (Active)", 0xFF10B981, theme.font_caption());
+            _ => {
+                canvas.draw_rect(self.bounds.x + pad, cy, cw, avail_h, theme.bg_panel, 8);
+                canvas.draw_rect_outline(self.bounds.x + pad, cy, cw, avail_h, theme.border_window, 8);
+                canvas.draw_text(self.bounds.x + pad + theme.pt(14.0), cy + theme.pt(12.0), "8-Core SMP Hardware Utilization (Real Task Assignment)", theme.text_primary, theme.font_title());
+                for core_id in 0..8u32 {
+                    let ry = cy + theme.pt(44.0) + (core_id as i32 * theme.pt(28.0));
+                    let owner = self.processes.iter().find(|p| p.core_id == core_id).map(|p| p.name.as_str()).unwrap_or("Idle");
+                    let active = owner != "Idle";
+                    canvas.draw_text(self.bounds.x + pad + theme.pt(14.0), ry + theme.pt(4.0), &format!("Core {} :", core_id), theme.text_secondary, theme.font_caption());
+                    let bx = self.bounds.x + pad + theme.pt(84.0);
+                    let bw = cw - theme.pt(104.0);
+                    canvas.draw_rect(bx, ry, bw, theme.pt(20.0), 0xFF0F172A, 4);
+                    canvas.draw_rect(bx, ry, if active { bw / 2 } else { theme.pt(12.0) }, theme.pt(20.0), if active { theme.accent } else { 0xFF334155 }, 4);
+                    canvas.draw_text(bx + theme.pt(8.0), ry + theme.pt(3.0), owner, 0xFFFFFFFF, theme.font_caption());
+                }
             }
-            3 => {
-                let card_h = theme.pt(140.0);
-                canvas.draw_rect(pad_x, content_y, card_w, card_h, theme.bg_titlebar, theme.pt(8.0) as usize);
-                canvas.draw_rect_outline(pad_x, content_y, card_w, card_h, theme.border_window, theme.pt(8.0) as usize);
-
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(14.0), "Network Interface: eth0 (Intel E1000 PCI)", theme.text_primary, theme.font_title());
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(42.0), &format!("Packets: RX {} | TX {}", self.net_rx_packets, self.net_tx_packets), theme.accent_hover, theme.font_body());
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(72.0), "IPv4: 10.0.2.15 | Subnet: 255.255.255.0", theme.text_secondary, theme.font_caption());
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(92.0), "Gateway: 10.0.2.2 | DNS: 10.0.2.3", theme.text_secondary, theme.font_caption());
-                canvas.draw_text(pad_x + theme.pt(16.0), content_y + theme.pt(112.0), "State: UP (Zero-Copy Ring Buffer)", 0xFF10B981, theme.font_caption());
-            }
-            _ => {}
         }
+
+        let fy = self.bounds.y + self.bounds.h - footer_h;
+        canvas.draw_rect(self.bounds.x, fy, self.bounds.w, footer_h, theme.bg_sidebar, 0);
+        canvas.draw_text(self.bounds.x + pad, fy + theme.pt(4.0), &self.status_msg, theme.text_secondary, theme.font_caption());
     }
 
     fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
-        if !self.bounds.contains(mx, my) { return false; }
+        if !self.bounds.contains(mx, my) || !pressed { return false; }
         let theme = get_theme();
-        let tb_h = theme.pt(44.0);
+        let tb_h = theme.pt(42.0);
+        let pad = theme.pt(12.0);
 
-        if pressed && my <= self.bounds.y + tb_h {
-            let seg_w = theme.pt(90.0);
-            let start_x = self.bounds.x + (self.bounds.w - (4 * seg_w)) / 2;
-            if mx >= start_x && mx <= start_x + (4 * seg_w) {
-                self.selected_tab = ((mx - start_x) / seg_w) as usize;
+        if my <= self.bounds.y + tb_h {
+            let seg_w = theme.pt(116.0);
+            for i in 0..3 {
+                let bx = self.bounds.x + pad + (i as i32 * (seg_w + theme.pt(6.0)));
+                if mx >= bx && mx <= bx + seg_w {
+                    self.selected_tab = i;
+                    return true;
+                }
+            }
+            let term_w = theme.pt(124.0);
+            let term_x = self.bounds.x + self.bounds.w - pad - term_w;
+            if mx >= term_x && mx <= term_x + term_w {
+                if let Some(pid) = self.selected_pid {
+                    if crate::syscall::sys_kill_proc(pid) {
+                        self.status_msg = format!("Terminated PID {}", pid);
+                        self.selected_pid = None;
+                        self.last_refresh = Instant::now() - Duration::from_secs(2);
+                        self.refresh_live_telemetry();
+                    } else {
+                        self.status_msg = format!("Cannot terminate protected PID {}", pid);
+                    }
+                }
                 return true;
+            }
+            return true;
+        }
+
+        // Select row in process table
+        if self.selected_tab == 0 || self.selected_tab == 1 {
+            let card_h = if self.selected_tab == 0 { theme.pt(94.0) } else { theme.pt(110.0) };
+            let tbl_y = self.bounds.y + tb_h + pad + card_h + theme.pt(10.0) + theme.pt(28.0);
+            let row_h = theme.pt(28.0);
+            if my >= tbl_y {
+                let idx = ((my - tbl_y) / row_h) as usize;
+                if let Some(p) = self.processes.get(idx) {
+                    self.selected_pid = Some(p.pid);
+                    self.status_msg = format!("Selected PID {} ({}) on Core {}", p.pid, p.name, p.core_id);
+                }
             }
         }
         true

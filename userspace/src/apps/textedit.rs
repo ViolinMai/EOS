@@ -263,23 +263,28 @@ impl Widget for TextEditApp {
                 0x1F => { self.save(); return true; } // Ctrl+S
                 0x2E => { // Ctrl+C (Copy)
                     if let Some(text) = self.get_selected_text() {
+                        let _ = crate::syscall::sys_clipboard_set(&text);
                         self.clipboard = text;
-                        self.status_text = "Copied to clipboard".into();
+                        self.status_text = "Copied to kernel clipboard".into();
                     }
                     return true;
                 }
                 0x2D => { // Ctrl+X (Cut)
                     if let Some(text) = self.get_selected_text() {
+                        let _ = crate::syscall::sys_clipboard_set(&text);
                         self.clipboard = text;
                         self.delete_selection();
-                        self.status_text = "Cut to clipboard".into();
+                        self.status_text = "Cut to kernel clipboard".into();
                     }
                     return true;
                 }
                 0x2F => { // Ctrl+V (Paste)
-                    if !self.clipboard.is_empty() {
+                    let mut clip = crate::syscall::sys_clipboard_get();
+                    if clip.is_empty() {
+                        clip = self.clipboard.clone();
+                    }
+                    if !clip.is_empty() {
                         self.delete_selection();
-                        let clip = self.clipboard.clone();
                         for c in clip.chars() {
                             if c == '\n' {
                                 let remainder = self.lines[self.cursor_row][self.cursor_col..].to_string();

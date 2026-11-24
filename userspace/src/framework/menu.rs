@@ -85,9 +85,9 @@ impl Win7StartMenu {
         let left_w = (w * 58) / 100;
         let left_h = h - pad * 2;
 
-        // Left White Pane (Pinned/Recent Programs + Search Box)
+        // Left Pane (Unified Dark/Light Theme Aware)
         canvas.draw_rect(x + pad, y + pad, left_w, left_h, theme.start_menu_left_bg, theme.pt(5.0) as usize);
-        canvas.draw_rect_outline(x + pad, y + pad, left_w, left_h, 0xFFCBD5E1, theme.pt(5.0) as usize);
+        canvas.draw_rect_outline(x + pad, y + pad, left_w, left_h, theme.border_window, theme.pt(5.0) as usize);
 
         let items = self.filtered_left();
         let row_h = theme.pt(36.0);
@@ -96,8 +96,9 @@ impl Win7StartMenu {
             if iy + row_h > y + h - theme.pt(56.0) { break; }
             let is_hov = self.hovered_left == Some(idx);
             if is_hov {
-                canvas.draw_rect(x + pad + 4, iy, left_w - 8, row_h, 0xFFD8EAFD, 4);
-                canvas.draw_rect_outline(x + pad + 4, iy, left_w - 8, row_h, 0xFF7DA2CE, 4);
+                let hov_bg = if theme.is_dark { 0x5538BDF8 } else { 0xFFD8EAFD };
+                canvas.draw_rect(x + pad + 4, iy, left_w - 8, row_h, hov_bg, 4);
+                canvas.draw_rect_outline(x + pad + 4, iy, left_w - 8, row_h, theme.accent_hover, 4);
             }
             let ic_sz = theme.pt(20.0);
             crate::framework::icons::draw_app_icon(canvas, &item.app_target, x + pad + theme.pt(12.0), iy + theme.pt(8.0), ic_sz, ic_sz);
@@ -138,11 +139,12 @@ impl Win7StartMenu {
         let rw = w - (left_w + pad * 2 + theme.pt(8.0));
 
         let hdr_h = theme.pt(44.0);
-        canvas.draw_rect(rx, y + pad, rw, hdr_h, 0x440F172A, theme.r_ctrl());
+        let hdr_bg = if theme.is_dark { 0x440F172A } else { 0x220F172A };
+        canvas.draw_rect(rx, y + pad, rw, hdr_h, hdr_bg, theme.r_ctrl());
         let logo_sz = theme.pt(28.0);
         crate::framework::icons::draw_eos_logo(canvas, rx + theme.pt(8.0), y + pad + (hdr_h - logo_sz) / 2, logo_sz, logo_sz);
-        canvas.draw_text(rx + theme.pt(44.0), y + pad + theme.pt(7.0), "EOS Desktop", 0xFFFFFFFF, theme.font_body());
-        canvas.draw_text(rx + theme.pt(44.0), y + pad + theme.pt(24.0), "Isolated SMP", 0xFF38BDF8, theme.font_caption());
+        canvas.draw_text(rx + theme.pt(44.0), y + pad + theme.pt(7.0), "EOS Desktop", theme.text_primary, theme.font_body());
+        canvas.draw_text(rx + theme.pt(44.0), y + pad + theme.pt(24.0), "Root Sovereign", theme.accent_hover, theme.font_caption());
 
         let mut ry = y + pad + hdr_h + theme.pt(10.0);
         let r_row_h = theme.pt(32.0);
@@ -151,11 +153,12 @@ impl Win7StartMenu {
         for (idx, (label, _, _, ic)) in self.right_items.iter().enumerate() {
             let is_hov = self.hovered_right == Some(idx);
             if is_hov {
-                canvas.draw_rect(rx, ry, rw, r_row_h, 0x6638BDF8, theme.r_ctrl());
-                canvas.draw_rect_outline(rx, ry, rw, r_row_h, 0x99E0F2FE, theme.r_ctrl());
+                let r_hov = if theme.is_dark { 0x6638BDF8 } else { 0x440284C7 };
+                canvas.draw_rect(rx, ry, rw, r_row_h, r_hov, theme.r_ctrl());
+                canvas.draw_rect_outline(rx, ry, rw, r_row_h, theme.accent_hover, theme.r_ctrl());
             }
             crate::framework::icons::draw_svg_icon(canvas, ic, rx + theme.pt(8.0), ry + (r_row_h - r_ic) / 2, r_ic, r_ic);
-            canvas.draw_text_clipped(rx + theme.pt(30.0), ry + theme.pt(7.0), rw - theme.pt(36.0), label, 0xFFF8FAFC, theme.font_caption());
+            canvas.draw_text_clipped(rx + theme.pt(30.0), ry + theme.pt(7.0), rw - theme.pt(36.0), label, theme.text_primary, theme.font_caption());
             ry += r_row_h + 4;
             if idx == 4 {
                 canvas.draw_line_h(rx + 6, ry, rw - 12, 0x4494A3B8);
@@ -445,5 +448,216 @@ impl ContextMenu {
             }
         }
         None
+    }
+}
+
+// ============================================================================
+// Milestone 14: Quick Command Palette (Alt+Space Launcher)
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct PaletteEntry {
+    pub label: String,
+    pub subtitle: String,
+    pub icon: &'static str,
+    pub action: String, // "app:<Name>", "file:<Path>", "cmd:<Id>"
+}
+
+pub struct CommandPalette {
+    pub bounds: Rect,
+    pub is_open: bool,
+    pub query: String,
+    pub selected_idx: usize,
+    pub entries: Vec<PaletteEntry>,
+}
+
+impl CommandPalette {
+    pub fn new() -> Self {
+        Self {
+            bounds: Rect::new(0, 0, 520, 340),
+            is_open: false,
+            query: String::new(),
+            selected_idx: 0,
+            entries: Vec::new(),
+        }
+    }
+
+    pub fn toggle(&mut self, screen_w: i32, screen_h: i32) {
+        if self.is_open {
+            self.is_open = false;
+        } else {
+            self.open(screen_w, screen_h);
+        }
+    }
+
+    pub fn open(&mut self, screen_w: i32, screen_h: i32) {
+        let theme = get_theme();
+        let w = theme.pt(520.0).min(screen_w - 80);
+        let h = theme.pt(330.0).min(screen_h - 140);
+        self.bounds = Rect::new((screen_w - w) / 2, (screen_h - h) / 3, w, h);
+        self.query.clear();
+        self.selected_idx = 0;
+        self.rebuild_index();
+        self.is_open = true;
+    }
+
+    fn rebuild_index(&mut self) {
+        self.entries = vec![
+            PaletteEntry { label: "Finder".into(), subtitle: "File Manager & Media Hub".into(), icon: "lib", action: "app:Finder".into() },
+            PaletteEntry { label: "Video Player".into(), subtitle: "FFmpeg Hardware Media Player".into(), icon: "video", action: "app:Video".into() },
+            PaletteEntry { label: "Terminal".into(), subtitle: "EOS Root Shell".into(), icon: "console", action: "app:Terminal".into() },
+            PaletteEntry { label: "TextEdit".into(), subtitle: "Code & Text Editor".into(), icon: "document", action: "app:TextEdit".into() },
+            PaletteEntry { label: "Settings".into(), subtitle: "Theme, Fonts, Wallpapers & Hardware".into(), icon: "settings", action: "app:Settings".into() },
+            PaletteEntry { label: "Activity Monitor".into(), subtitle: "Live Kernel Processes & CPU".into(), icon: "lighthouse", action: "app:Activity Monitor".into() },
+            PaletteEntry { label: "Browser".into(), subtitle: "Lightweight Network Browser".into(), icon: "chrome", action: "app:Browser".into() },
+            PaletteEntry { label: "Framework Test".into(), subtitle: "GPU, Animations & Feature Gates".into(), icon: "tune", action: "app:Test".into() },
+            PaletteEntry { label: "Toggle Dark / Light Mode".into(), subtitle: "System Command".into(), icon: "settings", action: "cmd:toggle_theme".into() },
+            PaletteEntry { label: "Toggle UI Inspector (F12)".into(), subtitle: "Framework DevTools Overlay".into(), icon: "tune", action: "cmd:toggle_inspector".into() },
+            PaletteEntry { label: "Send Test Toast Notification".into(), subtitle: "PortalKind::Notifications".into(), icon: "tune", action: "cmd:test_toast".into() },
+        ];
+
+        if let Ok(rd) = std::fs::read_dir("EOS SHARE") {
+            for e in rd.flatten().take(24) {
+                let name = e.file_name().to_string_lossy().to_string();
+                if name == "." || name == ".." || name.eq_ignore_ascii_case("QEMUVFAT") { continue; }
+                let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
+                if !is_dir {
+                    self.entries.push(PaletteEntry {
+                        label: name.clone(),
+                        subtitle: "EOS SHARE File".into(),
+                        icon: crate::framework::icons::icon_for_filename(&name, false),
+                        action: format!("file:EOS SHARE/{}", name),
+                    });
+                }
+            }
+        }
+    }
+
+    pub fn filtered(&self) -> Vec<&PaletteEntry> {
+        let q = self.query.trim().to_ascii_lowercase();
+        if q.is_empty() {
+            return self.entries.iter().collect();
+        }
+        self.entries
+            .iter()
+            .filter(|e| {
+                let hay = format!("{} {}", e.label, e.subtitle).to_ascii_lowercase();
+                if hay.contains(&q) {
+                    return true;
+                }
+                // Subsequence fuzzy match
+                let mut qi = q.chars();
+                let mut cur = qi.next();
+                for hc in hay.chars() {
+                    if Some(hc) == cur {
+                        cur = qi.next();
+                        if cur.is_none() { return true; }
+                    }
+                }
+                cur.is_none()
+            })
+            .collect()
+    }
+
+    pub fn paint(&self, canvas: &mut Canvas) {
+        if !self.is_open { return; }
+        let theme = get_theme();
+        let x = self.bounds.x;
+        let y = self.bounds.y;
+        let w = self.bounds.w;
+        let h = self.bounds.h;
+        let pad = theme.pt(12.0);
+
+        canvas.draw_rect(x + 6, y + 6, w, h, 0x88000000, 10);
+        canvas.draw_frosted_glass_rect(x, y, w, h, 0xF0111827, 10);
+        canvas.draw_rect_outline(x, y, w, h, theme.accent_hover, 10);
+
+        let in_h = theme.pt(36.0);
+        canvas.draw_rect(x + pad, y + pad, w - pad * 2, in_h, theme.bg_app, 6);
+        canvas.draw_rect_outline(x + pad, y + pad, w - pad * 2, in_h, theme.accent, 6);
+        let disp = if self.query.is_empty() {
+            "Type to search apps, files in EOS SHARE, or commands..."
+        } else {
+            &self.query
+        };
+        let col = if self.query.is_empty() { theme.text_muted } else { theme.text_primary };
+        canvas.draw_text_clipped(x + pad + theme.pt(12.0), y + pad + theme.pt(9.0), w - pad * 2 - theme.pt(24.0), disp, col, theme.font_body());
+
+        let list_y = y + pad + in_h + theme.pt(8.0);
+        let row_h = theme.pt(36.0);
+        let filtered = self.filtered();
+        let max_rows = ((h - (list_y - y) - pad) / (row_h + 2)).max(1) as usize;
+
+        for (i, item) in filtered.iter().take(max_rows).enumerate() {
+            let ry = list_y + (i as i32 * (row_h + 2));
+            let is_sel = i == self.selected_idx;
+            if is_sel {
+                canvas.draw_rect(x + pad, ry, w - pad * 2, row_h, theme.accent, 6);
+            } else {
+                canvas.draw_rect(x + pad, ry, w - pad * 2, row_h, 0x331E293B, 6);
+            }
+            let ic_sz = theme.pt(20.0);
+            crate::framework::icons::draw_svg_icon(canvas, item.icon, x + pad + theme.pt(10.0), ry + (row_h - ic_sz) / 2, ic_sz, ic_sz);
+            canvas.draw_text_clipped(x + pad + theme.pt(38.0), ry + theme.pt(5.0), w - pad * 2 - theme.pt(50.0), &item.label, 0xFFFFFFFF, theme.font_body());
+            canvas.draw_text_clipped(x + pad + theme.pt(38.0), ry + theme.pt(20.0), w - pad * 2 - theme.pt(50.0), &item.subtitle, if is_sel { 0xFFE0F2FE } else { 0xFF94A3B8 }, theme.font_caption());
+        }
+    }
+
+    pub fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> Option<String> {
+        if !self.is_open { return None; }
+        if !self.bounds.contains(mx, my) {
+            if pressed { self.is_open = false; }
+            return None;
+        }
+        let theme = get_theme();
+        let pad = theme.pt(12.0);
+        let in_h = theme.pt(36.0);
+        let list_y = self.bounds.y + pad + in_h + theme.pt(8.0);
+        let row_h = theme.pt(36.0);
+
+        if my >= list_y {
+            let idx = ((my - list_y) / (row_h + 2)) as usize;
+            let picked_action = self.filtered().get(idx).map(|e| e.action.clone());
+            if let Some(act) = picked_action {
+                self.selected_idx = idx;
+                if pressed {
+                    self.is_open = false;
+                    return Some(act);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn handle_key(&mut self, keycode: u8) -> Option<String> {
+        if !self.is_open { return None; }
+        let count = self.filtered().len();
+        match keycode {
+            0x01 => { self.is_open = false; None } // Esc
+            0x48 => { if self.selected_idx > 0 { self.selected_idx -= 1; } None } // Up
+            0x50 => { if count > 0 && self.selected_idx + 1 < count { self.selected_idx += 1; } None } // Down
+            0x0E => { self.query.pop(); self.selected_idx = 0; None } // Backspace
+            0x1C => { // Enter
+                let act = self.filtered().get(self.selected_idx).map(|e| e.action.clone());
+                self.is_open = false;
+                act
+            }
+            _ => None,
+        }
+    }
+
+    pub fn handle_char(&mut self, c: char) -> bool {
+        if !self.is_open { return false; }
+        if c == '\x08' {
+            self.query.pop();
+            self.selected_idx = 0;
+            return true;
+        }
+        if c >= ' ' && c <= '~' {
+            self.query.push(c);
+            self.selected_idx = 0;
+            return true;
+        }
+        false
     }
 }

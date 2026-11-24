@@ -319,19 +319,27 @@ impl<'a> Canvas<'a> {
     }
 
     pub fn measure_text(&mut self, text: &str, size: usize) -> (usize, usize) {
+        let shaped_owned;
+        let render_text = if contains_arabic(text) {
+            shaped_owned = shape_arabic_bidi(text);
+            shaped_owned.as_str()
+        } else {
+            text
+        };
+
         let font = match self.font {
             Some(f) => f,
             None => {
                 let scale = (size / 8).max(1);
                 let char_w = 8 * scale;
-                return (text.chars().count() * char_w, char_w);
+                return (render_text.chars().count() * char_w, char_w);
             }
         };
         let scale = Scale::uniform(size as f32);
         let v_metrics = font.v_metrics(scale);
         let mut width = 0;
 
-        for c in text.chars() {
+        for c in render_text.chars() {
             if c == '\n' { continue; }
             let key = (size, c);
             if !self.font_cache.contains_key(&key) {
@@ -354,7 +362,20 @@ impl<'a> Canvas<'a> {
 
     pub fn draw_text(&mut self, x: i32, y: i32, text: &str, color: u32, size: usize) {
         let clip = self.current_clip();
-        let font = match self.font {
+        let has_arabic = contains_arabic(text);
+        let shaped_owned;
+        let text = if has_arabic {
+            shaped_owned = shape_arabic_bidi(text);
+            shaped_owned.as_str()
+        } else {
+            text
+        };
+        let arabic_font = if has_arabic {
+            crate::framework::fonts::get_font_for_role(crate::framework::fonts::FontRole::Arabic)
+        } else {
+            None
+        };
+        let font = match arabic_font.or(self.font) {
             Some(f) => f,
             None => {
                 let scale = (size / 8).max(1) as i32;
@@ -440,6 +461,56 @@ impl<'a> Canvas<'a> {
         if max_w <= 0 { return; }
         self.push_clip(Rect::new(x, y - 4, max_w, size as i32 + 10));
         self.draw_text(x, y, text, color, size);
+        self.pop_clip();
+    }
+
+    /// Fixed-width Monospace metrics for Terminal & Stats HUD (zero horizontal jitter)
+    pub fn measure_text_mono(&self, text: &str, size: usize) -> (usize, usize) {
+        let cell_w = ((size as f32 * 0.60).round() as usize).max(6);
+        (text.chars().count() * cell_w, size)
+    }
+
+    pub fn draw_text_mono(&mut self, x: i32, y: i32, text: &str, color: u32, size: usize) {
+        let clip = self.current_clip();
+        let cell_w = ((size as f32 * 0.60).round() as i32).max(6);
+        let mono_font = crate::framework::fonts::get_font_for_role(crate::framework::fonts::FontRole::Mono);
+        let mut cur_x = x;
+
+        if let Some(font) = mono_font {
+            let scale = Scale::uniform(size as f32);
+            let v_metrics = font.v_metrics(scale);
+            for c in text.chars() {
+                if c == '\n' { cur_x = x; continue; }
+                let glyph = font.glyph(c).scaled(scale).positioned(point(0.0, v_metrics.ascent));
+                if let Some(bb) = glyph.pixel_bounding_box() {
+                    let gw = bb.width().max(0) as usize;
+                    let gx_off = (cell_w - (gw as i32)) / 2;
+                    let gx = cur_x + gx_off.max(0);
+                    let gy = y + bb.min.y;
+                    glyph.draw(|dx, dy, v| {
+                        let alpha = (v * 255.0) as u32;
+                        if alpha == 0 { return; }
+                        let px = gx + dx as i32;
+                        let py = gy + dy as i32;
+                        if px >= clip.x && px < clip.x + clip.w && py >= clip.y && py < clip.y + clip.h
+                            && px >= 0 && px < self.width as i32 && py >= 0 && py < self.height as i32
+                        {
+                            let idx = (py as usize) * self.width + (px as usize);
+                            self.buffer[idx] = blend(self.buffer[idx], color, alpha);
+                        }
+                    });
+                }
+                cur_x += cell_w;
+            }
+        } else {
+            self.draw_text(x, y, text, color, size);
+        }
+    }
+
+    pub fn draw_text_mono_clipped(&mut self, x: i32, y: i32, max_w: i32, text: &str, color: u32, size: usize) {
+        if max_w <= 0 { return; }
+        self.push_clip(Rect::new(x, y - 4, max_w, size as i32 + 10));
+        self.draw_text_mono(x, y, text, color, size);
         self.pop_clip();
     }
 
@@ -597,6 +668,166 @@ impl<'a> Canvas<'a> {
             }
         }
     }
+}
+
+// ============================================================================
+// Milestone 10: Native Arabic Contextual Shaping & BiDi RTL Text Reordering
+// ============================================================================
+
+#[inline]
+pub fn is_arabic_char(c: char) -> bool {
+    let u = c as u32;
+    (0x0600..=0x06FF).contains(&u) || (0xFE70..=0xFEFF).contains(&u)
+}
+
+#[inline]
+pub fn contains_arabic(s: &str) -> bool {
+    s.chars().any(is_arabic_char)
+}
+
+#[inline]
+fn is_arabic_diacritic(c: char) -> bool {
+    let u = c as u32;
+    (0x064B..=0x065F).contains(&u) || u == 0x0670
+}
+
+/// Returns (isolated, final, initial, medial) Unicode Presentation Forms-B.
+/// `initial == 0` indicates a right-joining-only letter (e.g., Alef, Dal, Reh, Waw).
+fn arabic_forms(c: char) -> Option<(u32, u32, u32, u32)> {
+    Some(match c {
+        '\u{0621}' => (0xFE80, 0xFE80, 0, 0),          // HAMZA
+        '\u{0622}' => (0xFE81, 0xFE82, 0, 0),          // ALEF WITH MADDA
+        '\u{0623}' => (0xFE83, 0xFE84, 0, 0),          // ALEF WITH HAMZA ABOVE
+        '\u{0624}' => (0xFE85, 0xFE86, 0, 0),          // WAW WITH HAMZA
+        '\u{0625}' => (0xFE87, 0xFE88, 0, 0),          // ALEF WITH HAMZA BELOW
+        '\u{0626}' => (0xFE89, 0xFE8A, 0xFE8B, 0xFE8C),// YEH WITH HAMZA
+        '\u{0627}' => (0xFE8D, 0xFE8E, 0, 0),          // ALEF
+        '\u{0628}' => (0xFE8F, 0xFE90, 0xFE91, 0xFE92),// BEH
+        '\u{0629}' => (0xFE93, 0xFE94, 0, 0),          // TEH MARBUTA
+        '\u{062A}' => (0xFE95, 0xFE96, 0xFE97, 0xFE98),// TEH
+        '\u{062B}' => (0xFE99, 0xFE9A, 0xFE9B, 0xFE9C),// THEH
+        '\u{062C}' => (0xFE9D, 0xFE9E, 0xFE9F, 0xFEA0),// JEEM
+        '\u{062D}' => (0xFEA1, 0xFEA2, 0xFEA3, 0xFEA4),// HAH
+        '\u{062E}' => (0xFEA5, 0xFEA6, 0xFEA7, 0xFEA8),// KHAH
+        '\u{062F}' => (0xFEA9, 0xFEAA, 0, 0),          // DAL
+        '\u{0630}' => (0xFEAB, 0xFEAC, 0, 0),          // THAL
+        '\u{0631}' => (0xFEAD, 0xFEAE, 0, 0),          // REH
+        '\u{0632}' => (0xFEAF, 0xFEB0, 0, 0),          // ZAIN
+        '\u{0633}' => (0xFEB1, 0xFEB2, 0xFEB3, 0xFEB4),// SEEN
+        '\u{0634}' => (0xFEB5, 0xFEB6, 0xFEB7, 0xFEB8),// SHEEN
+        '\u{0635}' => (0xFEB9, 0xFEBA, 0xFEBB, 0xFEBC),// SAD
+        '\u{0636}' => (0xFEBD, 0xFEBE, 0xFEBF, 0xFEC0),// DAD
+        '\u{0637}' => (0xFEC1, 0xFEC2, 0xFEC3, 0xFEC4),// TAH
+        '\u{0638}' => (0xFEC5, 0xFEC6, 0xFEC7, 0xFEC8),// ZAH
+        '\u{0639}' => (0xFEC9, 0xFECA, 0xFECB, 0xFECC),// AIN
+        '\u{063A}' => (0xFECD, 0xFECE, 0xFECF, 0xFED0),// GHAIN
+        '\u{0640}' => (0x0640, 0x0640, 0x0640, 0x0640),// TATWEEL
+        '\u{0641}' => (0xFED1, 0xFED2, 0xFED3, 0xFED4),// FEH
+        '\u{0642}' => (0xFED5, 0xFED6, 0xFED7, 0xFED8),// QAF
+        '\u{0643}' => (0xFED9, 0xFEDA, 0xFEDB, 0xFEDC),// KAF
+        '\u{0644}' => (0xFEDD, 0xFEDE, 0xFEDF, 0xFEE0),// LAM
+        '\u{0645}' => (0xFEE1, 0xFEE2, 0xFEE3, 0xFEE4),// MEEM
+        '\u{0646}' => (0xFEE5, 0xFEE6, 0xFEE7, 0xFEE8),// NOON
+        '\u{0647}' => (0xFEE9, 0xFEEA, 0xFEEB, 0xFEEC),// HEH
+        '\u{0648}' => (0xFEED, 0xFEEE, 0, 0),          // WAW
+        '\u{0649}' => (0xFEEF, 0xFEF0, 0, 0),          // ALEF MAKSURA
+        '\u{064A}' => (0xFEF1, 0xFEF2, 0xFEF3, 0xFEF4),// YEH
+        _ => return None,
+    })
+}
+
+fn joins_left(c: char) -> bool {
+    arabic_forms(c).map(|(_, _, init, _)| init != 0).unwrap_or(false)
+}
+
+fn joins_right(c: char) -> bool {
+    arabic_forms(c).map(|(_, fin, _, _)| fin != 0).unwrap_or(false) && c != '\u{0621}'
+}
+
+fn lam_alef_ligature(alef: char, join_prev: bool) -> Option<char> {
+    let code = match alef {
+        '\u{0622}' => if join_prev { 0xFEF6 } else { 0xFEF5 },
+        '\u{0623}' => if join_prev { 0xFEF8 } else { 0xFEF7 },
+        '\u{0625}' => if join_prev { 0xFEFA } else { 0xFEF9 },
+        '\u{0627}' => if join_prev { 0xFEFC } else { 0xFEFB },
+        _ => return None,
+    };
+    char::from_u32(code)
+}
+
+/// Shapes Arabic text into contextual glyphs (with Lam-Alef ligatures) and applies visual BiDi RTL ordering.
+pub fn shape_arabic_bidi(text: &str) -> String {
+    if !contains_arabic(text) {
+        return text.to_string();
+    }
+
+    let chars: Vec<char> = text.chars().collect();
+    let mut shaped: Vec<char> = Vec::with_capacity(chars.len());
+    let n = chars.len();
+    let mut i = 0;
+
+    while i < n {
+        let c = chars[i];
+        if is_arabic_diacritic(c) {
+            i += 1;
+            continue;
+        }
+
+        let prev_base = (0..i).rev().map(|k| chars[k]).find(|&ch| !is_arabic_diacritic(ch));
+        let next_idx = ((i + 1)..n).find(|&k| !is_arabic_diacritic(chars[k]));
+        let next_base = next_idx.map(|k| chars[k]);
+
+        let conn_prev = prev_base.map(joins_left).unwrap_or(false) && joins_right(c);
+
+        // Lam-Alef Ligature
+        if c == '\u{0644}' {
+            if let Some(nb) = next_base {
+                if let Some(lig) = lam_alef_ligature(nb, conn_prev) {
+                    shaped.push(lig);
+                    i = next_idx.unwrap() + 1;
+                    continue;
+                }
+            }
+        }
+
+        if let Some((iso, fin, init, med)) = arabic_forms(c) {
+            let conn_next = init != 0 && next_base.map(joins_right).unwrap_or(false);
+            let code = match (conn_prev, conn_next) {
+                (true, true) if med != 0 => med,
+                (true, _) => fin,
+                (false, true) if init != 0 => init,
+                _ => iso,
+            };
+            shaped.push(char::from_u32(code).unwrap_or(c));
+        } else {
+            shaped.push(c);
+        }
+        i += 1;
+    }
+
+    // Visual BiDi Reordering: reverse RTL line while preserving embedded LTR/digit sub-runs
+    shaped.reverse();
+    let mut out = String::with_capacity(shaped.len() * 2);
+    let mut ltr_buf: Vec<char> = Vec::new();
+    for ch in shaped {
+        if ch.is_ascii_alphanumeric() || ch == '.' || ch == '_' || ch == '-' || ch == ':' || ch == '/' {
+            ltr_buf.push(ch);
+        } else {
+            if !ltr_buf.is_empty() {
+                for &lc in ltr_buf.iter().rev() {
+                    out.push(lc);
+                }
+                ltr_buf.clear();
+            }
+            out.push(ch);
+        }
+    }
+    if !ltr_buf.is_empty() {
+        for &lc in ltr_buf.iter().rev() {
+            out.push(lc);
+        }
+    }
+    out
 }
 
 fn fallback_glyph_8x8(c: char) -> [u8; 8] {

@@ -398,6 +398,33 @@ pub fn write_file_content(drive: u8, filename: &str, content: &[u8]) -> Result<(
     Ok(())
 }
 
+pub fn delete_file_path(drive: u8, path: &str) -> Result<(), &'static str> {
+    let clean = path.trim_matches('/');
+    let layout = get_fat_layout(drive)?;
+    let mut curr_cluster = if let FatType::Fat32 = layout.fat_type { layout.root_cluster } else { 0 };
+    let parts: Vec<&str> = clean.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() { return Err("Invalid path"); }
+
+    for i in 0..parts.len().saturating_sub(1) {
+        let files = scan_dir_cluster(drive, curr_cluster)?;
+        if let Some(dir) = files.iter().find(|x| x.is_dir && x.name.eq_ignore_ascii_case(parts[i])) {
+            curr_cluster = dir.first_cluster;
+        } else {
+            return Err("Parent directory not found");
+        }
+    }
+
+    let target_name = *parts.last().ok_or("Invalid filename")?;
+    let files = scan_dir_cluster(drive, curr_cluster)?;
+    let target = files.iter().find(|x| x.name.eq_ignore_ascii_case(target_name)).ok_or("File not found")?;
+
+    let mut sector_buf = [0u8; 512];
+    read_sector_drive(drive, target.dir_entry_lba, &mut sector_buf)?;
+    sector_buf[target.dir_entry_offset] = 0xE5;
+    write_sector_drive(drive, target.dir_entry_lba, &sector_buf)?;
+    Ok(())
+}
+
 pub fn init() { log_info!("ATA", "IDE Channels Initialized with Dynamic Directory Traversal."); }
 
 pub fn set_next_cluster(drive: u8, layout: &FatLayout, cluster: u32, next_val: u32) -> Result<(), &'static str> {

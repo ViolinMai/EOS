@@ -99,6 +99,10 @@ pub struct VideoPlayerApp {
     pub duration_ms: i64,
     pub speed_idx: usize,
     pub volume_pct: u8,
+    pub muted: bool,
+    pub sub_offset_ms: i64,
+    pub playlist: Vec<String>,
+    pub playlist_idx: usize,
     pub show_stats: bool,
     pub status: String,
     pub hw_backend: &'static str,
@@ -143,6 +147,10 @@ impl VideoPlayerApp {
             duration_ms: 0,
             speed_idx: 1,
             volume_pct: 85,
+            muted: false,
+            sub_offset_ms: 0,
+            playlist: Vec::new(),
+            playlist_idx: 0,
             show_stats: false,
             status: "Drop or open a video file (.mp4 / .mkv)".into(),
             hw_backend: gpu.backend_name(),
@@ -187,10 +195,59 @@ impl VideoPlayerApp {
     fn try_autoload_subtitles(&mut self, video_path: &str) {
         self.subtitles.clear();
         self.sub_label = "None".into();
+        self.sub_offset_ms = 0;
         if let Some(dot) = video_path.rfind('.') {
             let base = &video_path[..dot];
             if self.load_subtitle_file(&format!("{}.ass", base)) { return; }
             if self.load_subtitle_file(&format!("{}.srt", base)) { return; }
+        }
+    }
+
+    fn scan_folder_playlist(&mut self, video_path: &str) {
+        let clean = video_path.trim_matches('/');
+        let parent = match clean.rfind('/') {
+            Some(pos) => &clean[..pos],
+            None => "EOS SHARE",
+        };
+        let mut list = Vec::new();
+        for cand in [parent.to_string(), format!("/{}", parent)] {
+            if let Ok(rd) = std::fs::read_dir(&cand) {
+                for e in rd.flatten() {
+                    let name = e.file_name().to_string_lossy().to_string();
+                    let l = name.to_ascii_lowercase();
+                    if l.ends_with(".mp4") || l.ends_with(".mkv") || l.ends_with(".avi") || l.ends_with(".webm") || l.ends_with(".mov") {
+                        list.push(format!("{}/{}", parent, name));
+                    }
+                }
+                if !list.is_empty() { break; }
+            }
+        }
+        list.sort();
+        self.playlist_idx = list.iter().position(|p| p.eq_ignore_ascii_case(clean)).unwrap_or(0);
+        self.playlist = list;
+    }
+
+    pub fn play_playlist_delta(&mut self, delta: isize) {
+        if self.playlist.len() <= 1 { return; }
+        let len = self.playlist.len() as isize;
+        let next_idx = ((self.playlist_idx as isize + delta).rem_euclid(len)) as usize;
+        self.playlist_idx = next_idx;
+        let next_path = self.playlist[next_idx].clone();
+        self.open_media_file(&next_path);
+    }
+
+    pub fn set_volume(&mut self, vol: u8) {
+        self.volume_pct = vol.min(100);
+        self.muted = self.volume_pct == 0;
+        if self.audio_ready {
+            sdk::audio::set_volume(self.volume_pct);
+        }
+    }
+
+    pub fn toggle_mute(&mut self) {
+        self.muted = !self.muted;
+        if self.audio_ready {
+            sdk::audio::set_volume(if self.muted { 0 } else { self.volume_pct });
         }
     }
 
@@ -211,6 +268,7 @@ impl VideoPlayerApp {
                 self.current_ms = 0;
                 self.frame_idx = 0;
                 self.loaded_file = Some(path.to_string());
+                self.scan_folder_playlist(path);
                 self.try_autoload_subtitles(path);
                 self.status = format!(
                     "{} [{} {}x{} @ {:.1}fps]",
@@ -318,7 +376,7 @@ impl VideoPlayerApp {
         }
 
         // Drain decoded PCM audio to AC'97 Hardware Audio
-        if self.audio_ready && self.volume_pct > 0 {
+        if self.audio_ready && !self.muted && self.volume_pct > 0 {
             let n = self.decoder.as_mut().unwrap().pop_audio(&mut self.audio_scratch);
             if n > 0 {
                 sdk::audio::write_pcm_i16(&self.audio_scratch[..n]);
@@ -332,11 +390,15 @@ impl VideoPlayerApp {
                 true
             }
             Ok(None) => {
-                if let Some(ref mut dec) = self.decoder {
-                    let _ = dec.seek_ms(0);
+                if self.playlist.len() > 1 {
+                    self.play_playlist_delta(1);
+                } else {
+                    if let Some(ref mut dec) = self.decoder {
+                        let _ = dec.seek_ms(0);
+                    }
+                    self.current_ms = 0;
+                    self.next_frame_at = Instant::now();
                 }
-                self.current_ms = 0;
-                self.next_frame_at = Instant::now();
                 true
             }
             Err(_) => {
@@ -347,8 +409,9 @@ impl VideoPlayerApp {
     }
 
     fn active_subtitle(&self) -> Option<&str> {
+        let eff_ms = self.current_ms - self.sub_offset_ms;
         for c in &self.subtitles {
-            if self.current_ms >= c.start_ms && self.current_ms <= c.end_ms {
+            if eff_ms >= c.start_ms && eff_ms <= c.end_ms {
                 return Some(&c.text);
             }
         }
@@ -486,7 +549,7 @@ impl Widget for VideoPlayerApp {
 
                 canvas.draw_text_clipped(
                     tx, ty, max_tw,
-                    &format!("VO   : {} | Subs: {}", self.hw_backend, self.sub_label),
+                    &format!("VO   : {} | Subs: {} ({:+}ms) | Playlist: {}/{}", self.hw_backend, self.sub_label, self.sub_offset_ms, self.playlist_idx + 1, self.playlist.len().max(1)),
                     0xFF94A3B8, theme.font_caption()
                 );
             } else {
@@ -519,15 +582,15 @@ impl Widget for VideoPlayerApp {
         let gap = theme.pt(5.0);
         let mut bx = seek_x;
         let btns = [
-            (if self.playing { "Pause" } else { "Play" }, theme.pt(50.0), theme.accent),
-            ("-5s", theme.pt(32.0), 0xFF334155),
-            ("+5s", theme.pt(32.0), 0xFF334155),
-            ("Open", theme.pt(48.0), 0xFF059669),
-            ("Sub", theme.pt(38.0), 0xFF334155),
-            ("Speed", theme.pt(48.0), 0xFF334155),
-            ("Full", theme.pt(40.0), if self.is_fullscreen { 0xFF0284C7 } else { 0xFF334155 }),
-            ("Pin", theme.pt(36.0), if self.always_on_top { 0xFFD97706 } else { 0xFF334155 }),
-            ("Stats", theme.pt(44.0), if self.show_stats { 0xFF0284C7 } else { 0xFF334155 }),
+            (if self.playing { "Pause" } else { "Play" }, theme.pt(46.0), theme.accent),
+            ("Prev", theme.pt(34.0), 0xFF334155),
+            ("Next", theme.pt(34.0), 0xFF334155),
+            ("Open", theme.pt(42.0), 0xFF059669),
+            ("Sub", theme.pt(32.0), 0xFF334155),
+            ("Speed", theme.pt(42.0), 0xFF334155),
+            ("Full", theme.pt(34.0), if self.is_fullscreen { 0xFF0284C7 } else { 0xFF334155 }),
+            ("Stats", theme.pt(40.0), if self.show_stats { 0xFF0284C7 } else { 0xFF334155 }),
+            (if self.muted { "Muted" } else { "Mute" }, theme.pt(40.0), if self.muted { 0xFFDC2626 } else { 0xFF334155 }),
         ];
 
         for (label, bw, col) in btns {
@@ -537,10 +600,20 @@ impl Widget for VideoPlayerApp {
             bx += bw + gap;
         }
 
+        // Interactive Volume Slider (Milestone 17)
+        let vol_w = theme.pt(76.0);
+        let vol_y = btn_y + theme.pt(10.0);
+        let vol_h = theme.pt(6.0);
+        canvas.draw_rect(bx, vol_y, vol_w, vol_h, 0xFF334155, 3);
+        let eff_vol = if self.muted { 0 } else { self.volume_pct };
+        let vfill = ((vol_w as f32) * (eff_vol as f32 / 100.0)) as i32;
+        canvas.draw_rect(bx, vol_y, vfill, vol_h, theme.accent_hover, 3);
+        bx += vol_w + theme.pt(8.0);
+
         let cur_s = (self.current_ms / 1000).max(0);
         let dur_s = (self.duration_ms / 1000).max(0);
-        let tc = format!("{:02}:{:02}/{:02}:{:02} {:.1}x Vol:{}%", cur_s / 60, cur_s % 60, dur_s / 60, dur_s % 60, SPEEDS[self.speed_idx], self.volume_pct);
-        canvas.draw_text_clipped(bx + theme.pt(6.0), btn_y + theme.pt(5.0), (x + w - bx - theme.pt(12.0)).max(20), &tc, 0xFFCBD5E1, theme.font_caption());
+        let tc = format!("{:02}:{:02}/{:02}:{:02} {:.1}x {}% [{:+}ms]", cur_s / 60, cur_s % 60, dur_s / 60, dur_s % 60, SPEEDS[self.speed_idx], eff_vol, self.sub_offset_ms);
+        canvas.draw_text_clipped(bx, btn_y + theme.pt(5.0), (x + w - bx - theme.pt(10.0)).max(20), &tc, 0xFFCBD5E1, theme.font_caption());
     }
 
     fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> bool {
@@ -587,25 +660,32 @@ impl Widget for VideoPlayerApp {
         let btn_h = theme.pt(26.0);
         let gap = theme.pt(5.0);
         if my >= btn_y && my <= btn_y + btn_h {
-            let widths = [theme.pt(50.0), theme.pt(32.0), theme.pt(32.0), theme.pt(48.0), theme.pt(38.0), theme.pt(48.0), theme.pt(40.0), theme.pt(36.0), theme.pt(44.0)];
+            let widths = [theme.pt(46.0), theme.pt(34.0), theme.pt(34.0), theme.pt(42.0), theme.pt(32.0), theme.pt(42.0), theme.pt(34.0), theme.pt(40.0), theme.pt(40.0)];
             let mut bx = seek_x;
             for (idx, bw) in widths.iter().enumerate() {
                 if mx >= bx && mx <= bx + *bw {
                     match idx {
                         0 => { self.playing = !self.playing; self.next_frame_at = Instant::now(); }
-                        1 => self.seek_relative(-5000),
-                        2 => self.seek_relative(5000),
+                        1 => self.play_playlist_delta(-1),
+                        2 => self.play_playlist_delta(1),
                         3 => { self.picking_sub = false; let _ = portal::request_portal(PortalRequest { kind: PortalKind::FilePicker, caller: "VideoPlayer".into(), payload: "mp4,mkv,webm,avi,mov".into() }); }
                         4 => { self.picking_sub = true; let _ = portal::request_portal(PortalRequest { kind: PortalKind::FilePicker, caller: "VideoPlayer".into(), payload: "ass,srt".into() }); }
                         5 => self.speed_idx = (self.speed_idx + 1) % SPEEDS.len(),
                         6 => { self.is_fullscreen = !self.is_fullscreen; portal::request_fullscreen_toggle(); }
-                        7 => { self.always_on_top = !self.always_on_top; portal::request_always_on_top_toggle(); }
-                        8 => self.show_stats = !self.show_stats,
+                        7 => self.show_stats = !self.show_stats,
+                        8 => self.toggle_mute(),
                         _ => {}
                     }
                     return true;
                 }
                 bx += *bw + gap;
+            }
+            // Interactive Volume Slider click
+            let vol_w = theme.pt(76.0);
+            if mx >= bx && mx <= bx + vol_w {
+                let pct = (((mx - bx) as f32 / vol_w.max(1) as f32) * 100.0).clamp(0.0, 100.0) as u8;
+                self.set_volume(pct);
+                return true;
             }
         }
         true
@@ -619,6 +699,11 @@ impl Widget for VideoPlayerApp {
             0x21 => { self.is_fullscreen = !self.is_fullscreen; portal::request_fullscreen_toggle(); true } // 'F'
             0x01 if self.is_fullscreen => { self.is_fullscreen = false; portal::request_fullscreen_toggle(); true } // 'Esc'
             0x17 => { self.show_stats = !self.show_stats; true }  // 'I'
+            0x32 => { self.toggle_mute(); true }                  // 'M' Mute
+            0x1A => { self.sub_offset_ms -= 100; true }           // '[' Sub -100ms
+            0x1B => { self.sub_offset_ms += 100; true }           // ']' Sub +100ms
+            0x31 => { self.play_playlist_delta(1); true }         // 'N' Next video
+            0x19 => { self.play_playlist_delta(-1); true }        // 'P' Prev video
             _ => false,
         }
     }

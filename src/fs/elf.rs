@@ -178,12 +178,33 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         *tls_base = tls_vaddr;
     }
 
-    let mut args: Vec<&str> = Vec::new();
+    let mut args: Vec<alloc::string::String> = Vec::new();
     if args_str.is_empty() {
-        args.push("python");
+        args.push(alloc::string::String::from("eos_desktop"));
     } else {
-        for part in args_str.split_whitespace() {
-            args.push(part);
+        let mut cur = alloc::string::String::new();
+        let mut in_quotes = false;
+        let mut quote_ch = '"';
+        for ch in args_str.chars() {
+            if in_quotes {
+                if ch == quote_ch {
+                    in_quotes = false;
+                } else {
+                    cur.push(ch);
+                }
+            } else if ch == '"' || ch == '\'' {
+                in_quotes = true;
+                quote_ch = ch;
+            } else if ch.is_whitespace() {
+                if !cur.is_empty() {
+                    args.push(core::mem::take(&mut cur));
+                }
+            } else {
+                cur.push(ch);
+            }
+        }
+        if !cur.is_empty() {
+            args.push(cur);
         }
     }
 
@@ -241,12 +262,12 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         }
         entries.push(0);
 
-        // Auxiliary Vector (System V AMD64 ABI)
+        // Auxiliary Vector (System V AMD64 ABI) - Pure Root (uid/gid = 0)
         entries.push(6);  entries.push(4096);
-        entries.push(11); entries.push(1000);
-        entries.push(12); entries.push(1000);
-        entries.push(13); entries.push(1000);
-        entries.push(14); entries.push(1000);
+        entries.push(11); entries.push(0);
+        entries.push(12); entries.push(0);
+        entries.push(13); entries.push(0);
+        entries.push(14); entries.push(0);
         entries.push(17); entries.push(100);
         entries.push(23); entries.push(0);
         entries.push(25); entries.push(user_rsp_page + 0x100);

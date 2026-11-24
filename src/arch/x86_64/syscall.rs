@@ -587,6 +587,23 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             let buf = frame.rdi; let size = frame.rsi as usize; let cwd = b"/\0";
             if size >= cwd.len() && copy_to_user(buf, cwd).is_ok() { frame.rax = buf; } else { frame.rax = -34i64 as u64; }
         }
+        87 => { // unlink(path_ptr)
+            let path_ptr = frame.rdi;
+            let mut buf = [0u8; 512];
+            let mut len = 0;
+            while len < 511 {
+                let mut b = [0u8; 1];
+                if copy_from_user(&mut b, path_ptr + len, 1).is_err() || b[0] == 0 { break; }
+                buf[len as usize] = b[0];
+                len += 1;
+            }
+            let path = core::str::from_utf8(&buf[..len as usize]).unwrap_or("").trim();
+            if crate::fs::vfs_delete_file(path).is_ok() {
+                frame.rax = 0;
+            } else {
+                frame.rax = -2i64 as u64;
+            }
+        }
         89 => { // readlink
             let buf = frame.rsi;
             let bufsiz = frame.rdx as usize;
@@ -610,8 +627,8 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = 0;
             } else { frame.rax = -14i64 as u64; }
         }
-        102 | 104 => { frame.rax = 1000; } // getuid, getgid (march)
-        107 | 108 => { frame.rax = 1000; } // geteuid, getegid
+        102 | 104 => { frame.rax = 0; } // getuid, getgid (root)
+        107 | 108 => { frame.rax = 0; } // geteuid, getegid (root)
         158 => { // arch_prctl
             match frame.rdi {
                 0x1002 => { unsafe { wrmsr(0xC0000100, frame.rsi); } frame.rax = 0; }
@@ -745,6 +762,10 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             }
         }
         502 => { // sys_present
+            if crate::writer::active_tty() != 1 {
+                frame.rax = 0;
+                return;
+            }
             let target_w = core::cmp::min(frame.r10 as usize, 2560);
             let target_h = core::cmp::min(frame.r8 as usize, 1440);
             let total_bytes = target_w * target_h * 4;
@@ -780,6 +801,10 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             } else { frame.rax = 0; frame.rdi = 0; frame.rsi = 0; }
         }
         504 => { // sys_present_rects
+            if crate::writer::active_tty() != 1 {
+                frame.rax = 0;
+                return;
+            }
             let target_w = core::cmp::min(frame.r10 as usize, 2560);
             let target_h = core::cmp::min(frame.r8 as usize, 1440);
             let total_bytes = target_w * target_h * 4;
@@ -1071,6 +1096,65 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         542 => { // sys_audio_info() -> 1 if active
             frame.rax = if crate::drivers::ac97::is_active() { 1 } else { 0 };
         }
+        543 => { // sys_tty_state() -> active tty (1=GUI, 2=RootShell)
+            frame.rax = crate::writer::active_tty() as u64;
+        }
+        545 => { // sys_clipboard_set(ptr, len) -> bytes_written
+            let ptr = frame.rdi;
+            let len = (frame.rsi as usize).min(65536);
+            if len == 0 {
+                clipboard_set(&[]);
+                frame.rax = 0;
+            } else if validate_user_range(ptr, len) {
+                let mut tmp = alloc::vec![0u8; len];
+                if copy_from_user(&mut tmp, ptr, len).is_ok() {
+                    clipboard_set(&tmp);
+                    frame.rax = len as u64;
+                } else {
+                    frame.rax = -14i64 as u64;
+                }
+            } else {
+                frame.rax = -14i64 as u64;
+            }
+        }
+        546 => { // sys_clipboard_get(out_ptr, max_len) -> bytes_copied
+            let ptr = frame.rdi;
+            let max_len = (frame.rsi as usize).min(65536);
+            if max_len > 0 && validate_user_range(ptr, max_len) {
+                let data = clipboard_get();
+                let n = data.len().min(max_len);
+                if n > 0 && copy_to_user(ptr, &data[..n]).is_err() {
+                    frame.rax = -14i64 as u64;
+                } else {
+                    frame.rax = n as u64;
+                }
+            } else {
+                frame.rax = 0;
+            }
+        }
+        547 => { // sys_poll_crash(out_ptr) -> 1 if crash report popped else 0
+            let out_ptr = frame.rdi;
+            let sz = core::mem::size_of::<crate::task::CrashReport>();
+            if validate_user_range(out_ptr, sz) {
+                if let Some(report) = crate::task::take_last_crash() {
+                    let bytes = unsafe {
+                        core::slice::from_raw_parts(&report as *const _ as *const u8, sz)
+                    };
+                    if copy_to_user(out_ptr, bytes).is_ok() {
+                        frame.rax = 1;
+                    } else {
+                        frame.rax = 0;
+                    }
+                } else {
+                    frame.rax = 0;
+                }
+            } else {
+                frame.rax = 0;
+            }
+        }
+        548 => { // sys_kill_proc(pid) -> 1 if terminated else 0
+            frame.rax = if crate::task::terminate_proc_by_pid(frame.rdi as u32) { 1 } else { 0 };
+        }
         520 => { // sys_agent_dispatch (Agent Sandbox & Telemetry Protocol)
             let cmd_id = frame.rdi as u32;
             let arg_ptr = frame.rsi;
@@ -1200,6 +1284,30 @@ impl ProcessTableLock {
     pub const fn new() -> Self { Self { locked: core::sync::atomic::AtomicBool::new(false) } }
     pub fn lock(&self) { while self.locked.compare_exchange_weak(false, true, core::sync::atomic::Ordering::Acquire, core::sync::atomic::Ordering::Relaxed).is_err() { core::hint::spin_loop(); } }
     pub fn unlock(&self) { self.locked.store(false, core::sync::atomic::Ordering::Release); }
+}
+
+static CLIPBOARD_LOCK: AtomicBool = AtomicBool::new(false);
+static mut KERNEL_CLIPBOARD: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+
+fn clipboard_set(data: &[u8]) {
+    while CLIPBOARD_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    unsafe {
+        let cb = &mut *addr_of_mut!(KERNEL_CLIPBOARD);
+        cb.clear();
+        cb.extend_from_slice(data);
+    }
+    CLIPBOARD_LOCK.store(false, Ordering::Release);
+}
+
+fn clipboard_get() -> alloc::vec::Vec<u8> {
+    while CLIPBOARD_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    let copy = unsafe { (*addr_of_mut!(KERNEL_CLIPBOARD)).clone() };
+    CLIPBOARD_LOCK.store(false, Ordering::Release);
+    copy
 }
 
 pub static PROCESS_LOCK: ProcessTableLock = ProcessTableLock::new();

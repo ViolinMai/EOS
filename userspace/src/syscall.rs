@@ -209,6 +209,98 @@ pub fn sys_audio_is_active() -> bool {
     ret == 1
 }
 
+pub fn sys_tty_state() -> u8 {
+    let ret: u64;
+    unsafe { asm!("syscall", inout("rax") 543u64 => ret, out("rcx") _, out("r11") _); }
+    ret as u8
+}
+
+pub fn sys_clipboard_set(text: &str) -> usize {
+    let bytes = text.as_bytes();
+    let ret: u64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") 545u64 => ret,
+            in("rdi") bytes.as_ptr() as u64,
+            in("rsi") bytes.len() as u64,
+            out("rcx") _, out("r11") _
+        );
+    }
+    ret as usize
+}
+
+pub fn sys_clipboard_get() -> String {
+    let mut buf = vec![0u8; 8192];
+    let ret: u64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") 546u64 => ret,
+            in("rdi") buf.as_mut_ptr() as u64,
+            in("rsi") buf.len() as u64,
+            out("rcx") _, out("r11") _
+        );
+    }
+    let n = (ret as usize).min(buf.len());
+    String::from_utf8_lossy(&buf[..n]).to_string()
+}
+
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct RawCrashReport {
+    pub valid: u32,
+    pub fault_kind: u32,
+    pub core_id: u32,
+    pub error_code: u32,
+    pub rip: u64,
+    pub cr2: u64,
+    pub app_name: [u8; 32],
+    pub spawn_args: [u8; 96],
+}
+
+impl Default for RawCrashReport {
+    fn default() -> Self {
+        Self {
+            valid: 0,
+            fault_kind: 0,
+            core_id: 0,
+            error_code: 0,
+            rip: 0,
+            cr2: 0,
+            app_name: [0; 32],
+            spawn_args: [0; 96],
+        }
+    }
+}
+
+pub fn sys_poll_crash() -> Option<RawCrashReport> {
+    let mut rep = RawCrashReport::default();
+    let ret: u64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") 547u64 => ret,
+            in("rdi") &mut rep as *mut _ as u64,
+            out("rcx") _, out("r11") _
+        );
+    }
+    if ret == 1 && rep.valid != 0 { Some(rep) } else { None }
+}
+
+pub fn sys_kill_proc(pid: u32) -> bool {
+    let ret: u64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") 548u64 => ret,
+            in("rdi") pid as u64,
+            out("rcx") _, out("r11") _
+        );
+    }
+    ret == 1
+}
+
 pub fn sys_wait_event(timeout_ms: u64) -> Option<[u64; 3]> {
     let type_val: u64;
     let data1: u64;

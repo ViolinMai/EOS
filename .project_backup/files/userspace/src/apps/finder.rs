@@ -32,14 +32,15 @@ pub struct FinderApp {
 
 impl FinderApp {
     pub fn new() -> Self {
-        let mut init_dir = "EOS SHARE".to_string();
-        if let Ok(nav) = fs::read_to_string("RootFS/finder_nav.ini") {
-            let trimmed = nav.trim();
-            if !trimmed.is_empty() {
-                init_dir = trimmed.to_string();
-            }
-            let _ = fs::remove_file("RootFS/finder_nav.ini");
-        }
+        Self::with_dir("EOS SHARE")
+    }
+
+    pub fn with_dir(dir: &str) -> Self {
+        let init_dir = if dir.trim().is_empty() {
+            "EOS SHARE".to_string()
+        } else {
+            dir.trim().to_string()
+        };
         let mut app = Self {
             bounds: Rect::default(),
             current_dir: init_dir,
@@ -184,11 +185,16 @@ impl FinderApp {
 
         let lower = item.name.to_ascii_lowercase();
         if lower.ends_with(".mp4") || lower.ends_with(".mkv") || lower.ends_with(".avi") || lower.ends_with(".webm") || lower.ends_with(".mov") {
-            let _ = crate::syscall::sys_spawn_elf("user_app.elf", "eos_video.elf --app Video");
+            let args = format!("eos_video.elf --app Video --file \"{}\"", full_path);
+            let _ = crate::syscall::sys_spawn_elf("user_app.elf", &args);
         } else if lower.ends_with(".png") || lower.ends_with(".jpg") || lower.ends_with(".jpeg") {
-            self.pending_open_image = Some((item.name, full_path));
+            self.pending_open_image = Some((item.name, full_path.clone()));
+            let args = format!("eos_preview.elf --app Preview --file \"{}\"", full_path);
+            let _ = crate::syscall::sys_spawn_elf("user_app.elf", &args);
         } else {
-            self.pending_open_text = Some(full_path);
+            self.pending_open_text = Some(full_path.clone());
+            let args = format!("eos_textedit.elf --app TextEdit --file \"{}\"", full_path);
+            let _ = crate::syscall::sys_spawn_elf("user_app.elf", &args);
         }
     }
 }
@@ -473,11 +479,14 @@ impl Widget for FinderApp {
     fn handle_scroll(&mut self, mx: i32, my: i32, dy: i32) -> bool {
         if !self.bounds.contains(mx, my) { return false; }
         let theme = get_theme();
-        let step = theme.pt(48.0);
-        let max_s = ((self.items.len() as i32) * theme.pt(36.0)).max(0);
-        if dy > 0 {
+        let step = theme.pt(56.0);
+        let rows = if self.grid_mode { ((self.items.len() + 3) / 4) as i32 } else { self.items.len() as i32 };
+        let row_h = if self.grid_mode { theme.pt(118.0) } else { theme.pt(32.0) };
+        let max_s = (rows * row_h - (self.bounds.h - theme.pt(80.0))).max(0);
+        // اتجاه التمرير الطبيعي: dy < 0 للأسفل، dy > 0 للأعلى
+        if dy < 0 {
             self.scroll_y = (self.scroll_y + step).min(max_s);
-        } else if dy < 0 {
+        } else if dy > 0 {
             self.scroll_y = (self.scroll_y - step).max(0);
         }
         self.scrollbar.target = if max_s > 0 { self.scroll_y as f32 / max_s as f32 } else { 0.0 };

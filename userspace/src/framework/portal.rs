@@ -46,11 +46,20 @@ pub struct PortalRequest {
     pub payload: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct ToastNotification {
+    pub title: String,
+    pub message: String,
+    pub created_at: std::time::Instant,
+    pub duration_ms: u64,
+}
+
 struct PortalRegistry {
     entries: Vec<PortalEntry>,
     last_log: String,
     pending_file_picker_caller: Option<(String, String)>, // (caller, allowed_exts)
     completed_file_pick: Option<(String, String)>, // (caller, selected_path)
+    toasts: Vec<ToastNotification>,
 }
 
 static PORTAL_REG: Mutex<Option<PortalRegistry>> = Mutex::new(None);
@@ -85,6 +94,7 @@ where
             last_log: "EOS Portal Bus Initialized".into(),
             pending_file_picker_caller: None,
             completed_file_pick: None,
+            toasts: Vec::new(),
         });
     }
     f(lock.as_mut().unwrap())
@@ -128,6 +138,20 @@ pub fn request_portal(req: PortalRequest) -> Result<String, String> {
                 } else {
                     reg.pending_file_picker_caller = Some((req.caller.clone(), req.payload.clone()));
                 }
+            } else if req.kind == PortalKind::Notifications {
+                let (title, body) = match req.payload.split_once('|') {
+                    Some((t, b)) => (t.trim().to_string(), b.trim().to_string()),
+                    None => (req.caller.clone(), req.payload.clone()),
+                };
+                if reg.toasts.len() >= 4 {
+                    reg.toasts.remove(0);
+                }
+                reg.toasts.push(ToastNotification {
+                    title,
+                    message: body,
+                    created_at: std::time::Instant::now(),
+                    duration_ms: 4000,
+                });
             }
             let msg = format!(
                 "ROUTED [{}]: '{}' -> Provider '{}' (payload: '{}')",
@@ -186,6 +210,22 @@ pub fn take_completed_file_pick(caller: &str) -> Option<String> {
             }
         }
         None
+    })
+}
+
+pub fn push_toast(title: &str, message: &str) {
+    let _ = request_portal(PortalRequest {
+        kind: PortalKind::Notifications,
+        caller: title.to_string(),
+        payload: format!("{}|{}", title, message),
+    });
+}
+
+pub fn poll_active_toasts() -> Vec<ToastNotification> {
+    with_registry(|reg| {
+        let now = std::time::Instant::now();
+        reg.toasts.retain(|t| now.saturating_duration_since(t.created_at).as_millis() < t.duration_ms as u128);
+        reg.toasts.clone()
     })
 }
 

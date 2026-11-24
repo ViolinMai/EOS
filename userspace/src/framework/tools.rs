@@ -713,6 +713,148 @@ impl ContextMenu {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModalKind {
+    Confirm,
+    TextPrompt,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ModalResult {
+    Confirmed(String),
+    Cancelled,
+}
+
+/// Reusable Framework Modal Dialog (Confirm / Rename / NewFolder) — Milestone 15
+pub struct ModalDialog {
+    pub bounds: Rect,
+    pub kind: ModalKind,
+    pub title: String,
+    pub message: String,
+    pub input_text: String,
+    pub confirm_label: String,
+    pub is_open: bool,
+}
+
+impl ModalDialog {
+    pub fn confirm(title: &str, message: &str, confirm_label: &str) -> Self {
+        Self {
+            bounds: Rect::new(0, 0, 420, 170),
+            kind: ModalKind::Confirm,
+            title: title.to_string(),
+            message: message.to_string(),
+            input_text: String::new(),
+            confirm_label: confirm_label.to_string(),
+            is_open: true,
+        }
+    }
+
+    pub fn prompt(title: &str, message: &str, initial_text: &str, confirm_label: &str) -> Self {
+        Self {
+            bounds: Rect::new(0, 0, 440, 200),
+            kind: ModalKind::TextPrompt,
+            title: title.to_string(),
+            message: message.to_string(),
+            input_text: initial_text.to_string(),
+            confirm_label: confirm_label.to_string(),
+            is_open: true,
+        }
+    }
+
+    pub fn center_in(&mut self, screen_w: i32, screen_h: i32) {
+        let theme = get_theme();
+        let w = theme.pt(if self.kind == ModalKind::TextPrompt { 440.0 } else { 400.0 });
+        let h = theme.pt(if self.kind == ModalKind::TextPrompt { 196.0 } else { 164.0 });
+        self.bounds = Rect::new((screen_w - w) / 2, (screen_h - h) / 2, w, h);
+    }
+
+    pub fn draw(&self, canvas: &mut Canvas) {
+        if !self.is_open { return; }
+        let theme = get_theme();
+        let x = self.bounds.x;
+        let y = self.bounds.y;
+        let w = self.bounds.w;
+        let h = self.bounds.h;
+        let pad = theme.pt(14.0);
+
+        canvas.draw_rect(x + 4, y + 4, w, h, 0x88000000, 8);
+        canvas.draw_frosted_glass_rect(x, y, w, h, theme.aero_glass_tint, 8);
+        canvas.draw_rect_outline(x, y, w, h, theme.border_window, 8);
+
+        let hdr_h = theme.pt(34.0);
+        canvas.draw_rect(x + 1, y + 1, w - 2, hdr_h, theme.bg_titlebar, 7);
+        canvas.draw_text(x + pad, y + theme.pt(8.0), &self.title, theme.text_primary, theme.font_body());
+
+        canvas.draw_text_clipped(x + pad, y + hdr_h + theme.pt(14.0), w - pad * 2, &self.message, theme.text_secondary, theme.font_caption());
+
+        if self.kind == ModalKind::TextPrompt {
+            let in_y = y + hdr_h + theme.pt(42.0);
+            let in_h = theme.pt(30.0);
+            canvas.draw_rect(x + pad, in_y, w - pad * 2, in_h, theme.bg_app, 5);
+            canvas.draw_rect_outline(x + pad, in_y, w - pad * 2, in_h, theme.accent, 5);
+            canvas.draw_text_clipped(x + pad + theme.pt(10.0), in_y + theme.pt(6.0), w - pad * 2 - theme.pt(16.0), &format!("{}_", self.input_text), theme.text_primary, theme.font_body());
+        }
+
+        let btn_y = y + h - theme.pt(42.0);
+        let btn_h = theme.pt(28.0);
+        let btn_w = theme.pt(100.0);
+        let cancel_x = x + w - pad - btn_w;
+        let ok_x = cancel_x - btn_w - theme.pt(8.0);
+
+        canvas.draw_rect(ok_x, btn_y, btn_w, btn_h, theme.accent, 5);
+        canvas.draw_text(ok_x + theme.pt(18.0), btn_y + theme.pt(6.0), &self.confirm_label, 0xFFFFFFFF, theme.font_caption());
+
+        canvas.draw_rect(cancel_x, btn_y, btn_w, btn_h, 0xFF334155, 5);
+        canvas.draw_text(cancel_x + theme.pt(24.0), btn_y + theme.pt(6.0), "Cancel", 0xFFFFFFFF, theme.font_caption());
+    }
+
+    pub fn handle_mouse(&mut self, mx: i32, my: i32, pressed: bool) -> Option<ModalResult> {
+        if !self.is_open || !pressed { return None; }
+        let theme = get_theme();
+        let pad = theme.pt(14.0);
+        let btn_y = self.bounds.y + self.bounds.h - theme.pt(42.0);
+        let btn_h = theme.pt(28.0);
+        let btn_w = theme.pt(100.0);
+        let cancel_x = self.bounds.x + self.bounds.w - pad - btn_w;
+        let ok_x = cancel_x - btn_w - theme.pt(8.0);
+
+        if my >= btn_y && my <= btn_y + btn_h {
+            if mx >= ok_x && mx <= ok_x + btn_w {
+                self.is_open = false;
+                return Some(ModalResult::Confirmed(self.input_text.clone()));
+            }
+            if mx >= cancel_x && mx <= cancel_x + btn_w {
+                self.is_open = false;
+                return Some(ModalResult::Cancelled);
+            }
+        }
+        None
+    }
+
+    pub fn handle_key(&mut self, keycode: u8) -> Option<ModalResult> {
+        if !self.is_open { return None; }
+        match keycode {
+            0x01 => { self.is_open = false; Some(ModalResult::Cancelled) }
+            0x1C => { self.is_open = false; Some(ModalResult::Confirmed(self.input_text.clone())) }
+            0x0E => { self.input_text.pop(); None }
+            _ => None,
+        }
+    }
+
+    pub fn handle_char(&mut self, c: char) -> bool {
+        if !self.is_open || self.kind != ModalKind::TextPrompt { return false; }
+        if c == '\x08' {
+            self.input_text.pop();
+            return true;
+        }
+        if c >= ' ' && c <= '~' {
+            self.input_text.push(c);
+            return true;
+        }
+        false
+    }
+}
+
 fn hsv_to_rgb(h: f32, s: f32, v: f32) -> u32 {
     let c = v * s;
     let x = c * (1.0 - ((h / 60.0) % 2.0 - 1.0).abs());

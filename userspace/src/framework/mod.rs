@@ -30,10 +30,12 @@ pub use animator::*;
 
 pub mod animator;
 pub mod features;
+pub mod fonts;
 pub mod portal;
 pub mod svg;
 pub mod icons;
 pub use features::*;
+pub use fonts::*;
 pub use portal::*;
 pub use svg::*;
 pub use icons::*;

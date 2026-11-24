@@ -170,6 +170,7 @@ pub extern "C" fn _start() -> ! {
 
     loop {
         net::poll();
+        writer::tty_poll();
 
         while let Some(ev) = input::poll_event() {
             arch::x86_64::syscall::push_user_event(ev);

@@ -23,6 +23,8 @@ pub struct SettingsApp {
     dark_mode: bool,
     accent: u32,
     scale: f32,
+    ui_font: String,
+    mono_font: String,
     active_wallpaper: String,
     wallpapers: Vec<WallpaperItem>,
     wallpapers_loaded: bool,
@@ -36,6 +38,8 @@ impl SettingsApp {
         let mut style = ThemeStyle::AeroGlass;
         let mut accent = 0xFF0284C7u32;
         let mut scale = 2.0f32;
+        let mut ui_font = crate::framework::fonts::active_font_name(FontRole::Ui);
+        let mut mono_font = crate::framework::fonts::active_font_name(FontRole::Mono);
         let mut active_wallpaper = "none".to_string();
 
         if let Ok(c) = fs::read_to_string("RootFS/settings.ini").or_else(|_| fs::read_to_string("settings.ini")) {
@@ -54,6 +58,10 @@ impl SettingsApp {
                     if let Ok(s) = v.trim().parse::<f32>() { scale = s; }
                 } else if let Some(v) = l.strip_prefix("wallpaper=") {
                     active_wallpaper = v.trim().to_string();
+                } else if let Some(v) = l.strip_prefix("ui_font=") {
+                    if !v.trim().is_empty() { ui_font = v.trim().to_string(); }
+                } else if let Some(v) = l.strip_prefix("mono_font=") {
+                    if !v.trim().is_empty() { mono_font = v.trim().to_string(); }
                 }
             }
         }
@@ -65,6 +73,8 @@ impl SettingsApp {
             dark_mode,
             accent,
             scale,
+            ui_font,
+            mono_font,
             active_wallpaper,
             wallpapers: Vec::new(),
             wallpapers_loaded: false,
@@ -118,13 +128,20 @@ impl SettingsApp {
         set_theme_accent(self.accent);
         set_theme_scale(self.scale);
 
+        let _ = crate::framework::fonts::set_role_font(FontRole::Ui, &self.ui_font);
+        let _ = crate::framework::fonts::set_role_font(FontRole::Mono, &self.mono_font);
+        get_theme_mut().ui_font = self.ui_font.clone();
+        get_theme_mut().mono_font = self.mono_font.clone();
+
         let style_str = if self.style == ThemeStyle::CleanModern { "modern" } else { "aero" };
         let ini = format!(
-            "style={}\ndark_mode={}\naccent={:#010x}\nscale={:.1}\nwallpaper={}\n",
+            "style={}\ndark_mode={}\naccent={:#010x}\nscale={:.1}\nui_font={}\nmono_font={}\nwallpaper={}\n",
             style_str,
             if self.dark_mode { 1 } else { 0 },
             self.accent,
             self.scale,
+            self.ui_font,
+            self.mono_font,
             self.active_wallpaper
         );
         let _ = fs::write("RootFS/settings.ini", &ini);
@@ -235,6 +252,20 @@ impl Widget for SettingsApp {
                     canvas.draw_rect(bx, by, theme.pt(86.0), theme.pt(28.0), if active { theme.accent } else { 0xFF334155 }, 5);
                     canvas.draw_text(bx + theme.pt(26.0), by + theme.pt(6.0), &format!("{:.1}x", sc), 0xFFFFFFFF, theme.font_caption());
                 }
+
+                // 4. Live Multi-Font Selector (Milestone 09)
+                let fn_y = sc_y + theme.pt(70.0);
+                canvas.draw_text(x + pad + theme.pt(14.0), fn_y, "System Font Families (Click to Cycle Available Fonts):", theme.text_primary, theme.font_body());
+                let fbtn_y = fn_y + theme.pt(26.0);
+                let fbtn_w = theme.pt(240.0);
+                let fbtn_h = theme.pt(28.0);
+                canvas.draw_rect(x + pad + theme.pt(14.0), fbtn_y, fbtn_w, fbtn_h, theme.bg_sidebar, 5);
+                canvas.draw_rect_outline(x + pad + theme.pt(14.0), fbtn_y, fbtn_w, fbtn_h, theme.accent, 5);
+                canvas.draw_text_clipped(x + pad + theme.pt(22.0), fbtn_y + theme.pt(6.0), fbtn_w - theme.pt(16.0), &format!("UI Font: {}", self.ui_font), theme.text_primary, theme.font_caption());
+
+                canvas.draw_rect(x + pad + theme.pt(266.0), fbtn_y, fbtn_w, fbtn_h, theme.bg_sidebar, 5);
+                canvas.draw_rect_outline(x + pad + theme.pt(266.0), fbtn_y, fbtn_w, fbtn_h, theme.accent, 5);
+                canvas.draw_text_clipped(x + pad + theme.pt(274.0), fbtn_y + theme.pt(6.0), fbtn_w - theme.pt(16.0), &format!("Mono Font: {}", self.mono_font), theme.text_primary, theme.font_caption());
             }
             SettingsTab::Wallpapers => {
                 canvas.draw_rect(x + pad, cy, cw, ch, theme.bg_panel, 8);
@@ -404,6 +435,30 @@ impl Widget for SettingsApp {
                             self.scale = sc;
                             self.persist_and_apply();
                             self.status_msg = format!("Updated UI Scale to {:.1}x.", sc);
+                            return true;
+                        }
+                    }
+                }
+
+                let fn_y = sc_y + theme.pt(70.0);
+                let fbtn_y = fn_y + theme.pt(26.0);
+                let fbtn_w = theme.pt(240.0);
+                let fbtn_h = theme.pt(28.0);
+                if my >= fbtn_y && my <= fbtn_y + fbtn_h {
+                    let fonts = crate::framework::fonts::list_available_fonts();
+                    if !fonts.is_empty() {
+                        if mx >= self.bounds.x + pad + theme.pt(14.0) && mx <= self.bounds.x + pad + theme.pt(14.0) + fbtn_w {
+                            let idx = fonts.iter().position(|f| f == &self.ui_font).unwrap_or(0);
+                            self.ui_font = fonts[(idx + 1) % fonts.len()].clone();
+                            self.persist_and_apply();
+                            self.status_msg = format!("Switched UI Font to '{}'.", self.ui_font);
+                            return true;
+                        }
+                        if mx >= self.bounds.x + pad + theme.pt(266.0) && mx <= self.bounds.x + pad + theme.pt(266.0) + fbtn_w {
+                            let idx = fonts.iter().position(|f| f == &self.mono_font).unwrap_or(0);
+                            self.mono_font = fonts[(idx + 1) % fonts.len()].clone();
+                            self.persist_and_apply();
+                            self.status_msg = format!("Switched Mono Font to '{}'.", self.mono_font);
                             return true;
                         }
                     }
