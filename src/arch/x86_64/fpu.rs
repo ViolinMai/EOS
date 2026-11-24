@@ -12,7 +12,20 @@ pub unsafe fn enable_sse() {
 
         asm!("mov {}, cr4", out(reg) cr4, options(nomem, nostack));
         cr4 |= (1 << 9) | (1 << 10);
-        asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
+        let cpuid1 = core::arch::x86_64::__cpuid(1);
+        if (cpuid1.ecx & (1 << 26)) != 0 {
+            cr4 |= 1 << 18;
+            asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
+            asm!(
+                "xsetbv",
+                in("ecx") 0u32,
+                in("eax") 7u32,
+                in("edx") 0u32,
+                options(nomem, nostack)
+            );
+        } else {
+            asm!("mov cr4, {}", in(reg) cr4, options(nomem, nostack));
+        }
 
         asm!("fninit", options(nomem, nostack));
     }

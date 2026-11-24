@@ -301,6 +301,17 @@ pub fn sys_kill_proc(pid: u32) -> bool {
     ret == 1
 }
 
+pub fn sys_power(cmd: u64) {
+    unsafe {
+        asm!(
+            "syscall",
+            in("rax") 550u64,
+            in("rdi") cmd,
+            out("rcx") _, out("r11") _
+        );
+    }
+}
+
 pub fn sys_wait_event(timeout_ms: u64) -> Option<[u64; 3]> {
     let type_val: u64;
     let data1: u64;

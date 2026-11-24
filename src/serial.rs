@@ -75,11 +75,18 @@ impl fmt::Write for SerialPort {
 pub static SERIAL1: SerialPort = SerialPort::new(COM1);
 pub static SERIAL2: SerialPort = SerialPort::new(COM2);
 
+static SERIAL_LOCK: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 #[doc(hidden)]
 pub fn _print(args: fmt::Arguments) {
     use core::fmt::Write;
+    use core::sync::atomic::Ordering;
+    while SERIAL_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
     let mut serial = SerialPort::new(COM1);
     serial.write_fmt(args).ok();
+    SERIAL_LOCK.store(false, Ordering::Release);
 }
 
 #[macro_export]

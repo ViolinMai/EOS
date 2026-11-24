@@ -81,6 +81,13 @@ pub enum WindowTileState {
     RightHalf,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TitlebarStyle {
+    Classic,
+    Minimal,
+    Hidden,
+}
+
 static mut WIN7_CHROME_AUDIT_EMITTED: bool = false;
 
 pub trait Widget: std::any::Any {
@@ -106,6 +113,7 @@ pub struct WindowFrame {
     pub is_maximized: bool,
     pub is_fullscreen: bool,
     pub always_on_top: bool,
+    pub titlebar_style: TitlebarStyle,
     pub tile_state: WindowTileState,
     pub is_dragging: bool,
     pub drag_offset_x: i32,
@@ -138,6 +146,7 @@ impl WindowFrame {
             is_maximized: false,
             is_fullscreen: false,
             always_on_top: false,
+            titlebar_style: TitlebarStyle::Minimal,
             tile_state: WindowTileState::None,
             is_dragging: false,
             drag_offset_x: 0,
@@ -153,11 +162,29 @@ impl WindowFrame {
     }
 
     pub fn title_bar_height(&self) -> i32 {
-        get_theme().pt(36.0)
+        match self.titlebar_style {
+            TitlebarStyle::Hidden => 0,
+            TitlebarStyle::Minimal => get_theme().pt(28.0),
+            TitlebarStyle::Classic => get_theme().pt(36.0),
+        }
+    }
+
+    pub fn set_titlebar_style(&mut self, style: TitlebarStyle) {
+        self.titlebar_style = style;
+        self.relayout_content();
+    }
+
+    pub fn cycle_titlebar_style(&mut self) {
+        self.titlebar_style = match self.titlebar_style {
+            TitlebarStyle::Minimal => TitlebarStyle::Hidden,
+            TitlebarStyle::Hidden => TitlebarStyle::Classic,
+            TitlebarStyle::Classic => TitlebarStyle::Minimal,
+        };
+        self.relayout_content();
     }
 
     fn relayout_content(&mut self) {
-        if self.is_fullscreen {
+        if self.is_fullscreen || self.titlebar_style == TitlebarStyle::Hidden {
             self.content.layout(
                 self.bounds.x,
                 self.bounds.y,
@@ -246,80 +273,84 @@ impl Widget for WindowFrame {
         let tbh = self.title_bar_height();
         let r_win = if self.is_maximized { 0 } else { theme.r_win() };
 
-        // 1. Soft Rounded Window Body Backdrop + Aero Glass Titlebar
+        // Borderless / Hidden Titlebar Mode (Kitty / Wayland CSD style — preserves app translucency)
+        if self.titlebar_style == TitlebarStyle::Hidden {
+            canvas.push_clip(self.bounds);
+            self.content.paint(canvas);
+            canvas.pop_clip();
+            let border_col = if self.is_active { 0x6638BDF8 } else { 0x33475569 };
+            canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, border_col, r_win);
+            return;
+        }
+
+        // 1. Soft Rounded Window Body Backdrop + Titlebar
         canvas.draw_rect(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, theme.bg_window, r_win);
         let tb_bg = if self.is_active { theme.bg_titlebar } else { theme.bg_titlebar_inactive };
         canvas.draw_frosted_glass_rect(self.bounds.x + 1, self.bounds.y + 1, self.bounds.w - 2, tbh - 1, tb_bg, r_win.saturating_sub(1));
-        canvas.draw_rect(self.bounds.x + 2, self.bounds.y + 2, self.bounds.w - 4, tbh / 3, 0x2AFFFFFF, r_win.saturating_sub(2));
+        if self.titlebar_style == TitlebarStyle::Classic {
+            canvas.draw_rect(self.bounds.x + 2, self.bounds.y + 2, self.bounds.w - 4, tbh / 3, 0x2AFFFFFF, r_win.saturating_sub(2));
+        }
         canvas.draw_line_h(self.bounds.x + 1, self.bounds.y + tbh - 1, self.bounds.w - 2, theme.border_frost_highlight);
 
-        // Smooth Anti-Aliased Rounded Outer Glow & Inner Frost Border
         let outer_border = if self.is_active { theme.border_window } else { 0xFF334155 };
         canvas.draw_rect_outline(self.bounds.x, self.bounds.y, self.bounds.w, self.bounds.h, outer_border, r_win);
-        canvas.draw_rect_outline(self.bounds.x + 1, self.bounds.y + 1, self.bounds.w - 2, self.bounds.h - 2, theme.border_frost_highlight, r_win.saturating_sub(1));
 
-        // 3. Window Title with subtle text glow
+        // 3. Window Title
         let txt_c = if self.is_active { theme.text_primary } else { theme.text_muted };
-        canvas.draw_text_clipped(self.bounds.x + theme.pt(14.0), self.bounds.y + theme.pt(8.0), self.bounds.w - theme.pt(150.0), &self.title, txt_c, theme.font_title());
+        let title_y = self.bounds.y + (tbh - theme.font_body() as i32) / 2;
+        canvas.draw_text_clipped(self.bounds.x + theme.pt(12.0), title_y, self.bounds.w - theme.pt(130.0), &self.title, txt_c, theme.font_body());
 
-        // 4. Windows 7 Grouped Top-Right Rectangular Caption Cluster (Min | Max | Wide Red-Glow Close)
-        let close_w = theme.pt(44.0);
-        let std_btn_w = theme.pt(28.0);
-        let grp_h = theme.pt(22.0);
-        let right_x = self.bounds.x + self.bounds.w - theme.pt(6.0);
-        let grp_y = self.bounds.y + 1;
+        // 4. Titlebar Controls (Minimal Circular Dots vs Classic Aero Cluster)
+        if self.titlebar_style == TitlebarStyle::Minimal {
+            let dot_sz = theme.pt(12.0);
+            let gap = theme.pt(8.0);
+            let cy = self.bounds.y + (tbh - dot_sz) / 2;
+            let close_x = self.bounds.x + self.bounds.w - theme.pt(12.0) - dot_sz;
+            let max_x = close_x - dot_sz - gap;
+            let min_x = max_x - dot_sz - gap;
 
-        let close_x = right_x - close_w;
-        let max_x = close_x - std_btn_w;
-        let min_x = max_x - std_btn_w;
-        let cluster_w = close_w + (std_btn_w * 2);
+            let min_c = if self.hover_btn == Some(2) { 0xFFFBBF24 } else { 0x99F59E0B };
+            let max_c = if self.hover_btn == Some(1) { 0xFF34D399 } else { 0x9910B981 };
+            let cls_c = if self.hover_btn == Some(0) { theme.btn_close_glow } else { theme.btn_close };
 
-        // Group capsule outline
-        canvas.draw_rect(min_x, grp_y, cluster_w, grp_h, 0x550F172A, 3);
-        canvas.draw_rect_outline(min_x, grp_y, cluster_w, grp_h, 0x99E0F2FE, 3);
+            canvas.draw_rect(min_x, cy, dot_sz, dot_sz, min_c, (dot_sz / 2) as usize);
+            canvas.draw_rect(max_x, cy, dot_sz, dot_sz, max_c, (dot_sz / 2) as usize);
+            canvas.draw_rect(close_x, cy, dot_sz, dot_sz, cls_c, (dot_sz / 2) as usize);
+        } else {
+            let close_w = theme.pt(44.0);
+            let std_btn_w = theme.pt(28.0);
+            let grp_h = theme.pt(22.0);
+            let right_x = self.bounds.x + self.bounds.w - theme.pt(6.0);
+            let grp_y = self.bounds.y + 1;
 
-        let sym_sz = theme.pt(9.0).max(8);
-        let stroke = theme.pt(1.5).max(2);
+            let close_x = right_x - close_w;
+            let max_x = close_x - std_btn_w;
+            let min_x = max_x - std_btn_w;
+            let cluster_w = close_w + (std_btn_w * 2);
 
-        // Minimize button `_` (موسّط ومتناسب مع 2x)
-        let min_bg = if self.hover_btn == Some(2) { 0xAA38BDF8 } else { 0x331E3A8A };
-        canvas.draw_rect(min_x + 1, grp_y + 1, std_btn_w - 1, grp_h - 2, min_bg, 2);
-        canvas.draw_rect(
-            min_x + (std_btn_w - sym_sz) / 2,
-            grp_y + (grp_h + sym_sz / 2) / 2 - stroke,
-            sym_sz,
-            stroke,
-            0xFFFFFFFF,
-            0,
-        );
+            canvas.draw_rect(min_x, grp_y, cluster_w, grp_h, 0x550F172A, 3);
+            canvas.draw_rect_outline(min_x, grp_y, cluster_w, grp_h, 0x99E0F2FE, 3);
 
-        // Divider
-        canvas.draw_line_v(max_x, grp_y + 1, grp_h - 2, 0x77E0F2FE);
+            let sym_sz = theme.pt(9.0).max(8);
+            let stroke = theme.pt(1.5).max(2);
 
-        // Maximize / Restore button `□`
-        let max_bg = if self.hover_btn == Some(1) { 0xAA38BDF8 } else { 0x331E3A8A };
-        canvas.draw_rect(max_x + 1, grp_y + 1, std_btn_w - 1, grp_h - 2, max_bg, 0);
-        let mx_bx = max_x + (std_btn_w - sym_sz) / 2;
-        let mx_by = grp_y + (grp_h - sym_sz) / 2;
-        canvas.draw_rect_outline(mx_bx, mx_by, sym_sz, sym_sz, 0xFFFFFFFF, 0);
-        canvas.draw_rect(mx_bx, mx_by, sym_sz, stroke, 0xFFFFFFFF, 0);
+            let min_bg = if self.hover_btn == Some(2) { 0xAA38BDF8 } else { 0x331E3A8A };
+            canvas.draw_rect(min_x + 1, grp_y + 1, std_btn_w - 1, grp_h - 2, min_bg, 2);
+            canvas.draw_rect(min_x + (std_btn_w - sym_sz) / 2, grp_y + (grp_h + sym_sz / 2) / 2 - stroke, sym_sz, stroke, 0xFFFFFFFF, 0);
 
-        // Divider
-        canvas.draw_line_v(close_x, grp_y + 1, grp_h - 2, 0x77E0F2FE);
+            canvas.draw_line_v(max_x, grp_y + 1, grp_h - 2, 0x77E0F2FE);
+            let max_bg = if self.hover_btn == Some(1) { 0xAA38BDF8 } else { 0x331E3A8A };
+            canvas.draw_rect(max_x + 1, grp_y + 1, std_btn_w - 1, grp_h - 2, max_bg, 0);
+            let mx_bx = max_x + (std_btn_w - sym_sz) / 2;
+            let mx_by = grp_y + (grp_h - sym_sz) / 2;
+            canvas.draw_rect_outline(mx_bx, mx_by, sym_sz, sym_sz, 0xFFFFFFFF, 0);
+            canvas.draw_rect(mx_bx, mx_by, sym_sz, stroke, 0xFFFFFFFF, 0);
 
-        // Wide Red-Glow Close button `X`
-        let close_bg = if self.hover_btn == Some(0) { theme.btn_close_glow } else { theme.btn_close };
-        canvas.draw_rect(close_x + 1, grp_y + 1, close_w - 2, grp_h - 2, close_bg, 2);
-        canvas.draw_rect(close_x + 2, grp_y + 2, close_w - 4, (grp_h - 4) / 2, 0x44FFFFFF, 1);
-        draw_vector_icon(
-            canvas,
-            "close",
-            close_x + (close_w - sym_sz) / 2,
-            grp_y + (grp_h - sym_sz) / 2,
-            sym_sz,
-            sym_sz,
-            Some(0xFFFFFFFF),
-        );
+            canvas.draw_line_v(close_x, grp_y + 1, grp_h - 2, 0x77E0F2FE);
+            let close_bg = if self.hover_btn == Some(0) { theme.btn_close_glow } else { theme.btn_close };
+            canvas.draw_rect(close_x + 1, grp_y + 1, close_w - 2, grp_h - 2, close_bg, 2);
+            draw_vector_icon(canvas, "close", close_x + (close_w - sym_sz) / 2, grp_y + (grp_h - sym_sz) / 2, sym_sz, sym_sz, Some(0xFFFFFFFF));
+        }
 
         // 5. Inner Window Content
         canvas.push_clip(Rect::new(self.bounds.x + 2, self.bounds.y + tbh, self.bounds.w - 4, self.bounds.h - tbh - 2));
@@ -334,40 +365,82 @@ impl Widget for WindowFrame {
         }
         let theme = get_theme();
         let tbh = self.title_bar_height();
-        let close_w = theme.pt(44.0);
-        let std_btn_w = theme.pt(28.0);
-        let grp_h = theme.pt(22.0);
-        let right_x = self.bounds.x + self.bounds.w - theme.pt(6.0);
-        let close_x = right_x - close_w;
-        let max_x = close_x - std_btn_w;
-        let min_x = max_x - std_btn_w;
 
-        if my >= self.bounds.y && my <= self.bounds.y + grp_h + 4 {
-            if mx >= close_x && mx <= right_x {
-                self.hover_btn = Some(0); // Close
-                if pressed { self.is_closed = true; }
-                return true;
-            } else if mx >= max_x && mx < close_x {
-                self.hover_btn = Some(1); // Maximize
-                if pressed {
-                    let work = Rect::new(0, 0, 2560, 1440 - theme.pt(40.0));
-                    self.toggle_maximize(&work);
-                }
-                return true;
-            } else if mx >= min_x && mx < max_x {
-                self.hover_btn = Some(2); // Minimize
-                if pressed { self.is_minimized = true; }
+        if self.titlebar_style == TitlebarStyle::Hidden {
+            self.hover_btn = None;
+            // Hidden titlebar: top 22px strip acts as invisible drag handle (like Kitty/Wayland)
+            let drag_strip = theme.pt(14.0);
+            if pressed && my >= self.bounds.y && my < self.bounds.y + drag_strip && mx >= self.bounds.x && mx <= self.bounds.x + self.bounds.w {
+                self.is_dragging = true;
+                self.drag_offset_x = mx - self.bounds.x;
+                self.drag_offset_y = my - self.bounds.y;
                 return true;
             }
-        }
-        self.hover_btn = None;
+        } else if self.titlebar_style == TitlebarStyle::Minimal {
+            let dot_sz = theme.pt(14.0);
+            let gap = theme.pt(6.0);
+            let close_x = self.bounds.x + self.bounds.w - theme.pt(12.0) - dot_sz;
+            let max_x = close_x - dot_sz - gap;
+            let min_x = max_x - dot_sz - gap;
+            if my >= self.bounds.y && my <= self.bounds.y + tbh {
+                if mx >= close_x && mx <= close_x + dot_sz + 4 {
+                    self.hover_btn = Some(0);
+                    if pressed { self.is_closed = true; }
+                    return true;
+                } else if mx >= max_x && mx < close_x {
+                    self.hover_btn = Some(1);
+                    if pressed {
+                        let work = Rect::new(0, 0, 2560, 1440 - theme.pt(40.0));
+                        self.toggle_maximize(&work);
+                    }
+                    return true;
+                } else if mx >= min_x && mx < max_x {
+                    self.hover_btn = Some(2);
+                    if pressed { self.is_minimized = true; }
+                    return true;
+                }
+            }
+            self.hover_btn = None;
+            if pressed && my >= self.bounds.y && my < self.bounds.y + tbh && mx >= self.bounds.x && mx <= self.bounds.x + self.bounds.w {
+                self.is_dragging = true;
+                self.drag_offset_x = mx - self.bounds.x;
+                self.drag_offset_y = my - self.bounds.y;
+                return true;
+            }
+        } else {
+            let close_w = theme.pt(44.0);
+            let std_btn_w = theme.pt(28.0);
+            let grp_h = theme.pt(22.0);
+            let right_x = self.bounds.x + self.bounds.w - theme.pt(6.0);
+            let close_x = right_x - close_w;
+            let max_x = close_x - std_btn_w;
+            let min_x = max_x - std_btn_w;
 
-        // السحب بواسطة شريط العنوان
-        if pressed && my >= self.bounds.y && my < self.bounds.y + tbh && mx >= self.bounds.x && mx <= self.bounds.x + self.bounds.w {
-            self.is_dragging = true;
-            self.drag_offset_x = mx - self.bounds.x;
-            self.drag_offset_y = my - self.bounds.y;
-            return true;
+            if my >= self.bounds.y && my <= self.bounds.y + grp_h + 4 {
+                if mx >= close_x && mx <= right_x {
+                    self.hover_btn = Some(0);
+                    if pressed { self.is_closed = true; }
+                    return true;
+                } else if mx >= max_x && mx < close_x {
+                    self.hover_btn = Some(1);
+                    if pressed {
+                        let work = Rect::new(0, 0, 2560, 1440 - theme.pt(40.0));
+                        self.toggle_maximize(&work);
+                    }
+                    return true;
+                } else if mx >= min_x && mx < max_x {
+                    self.hover_btn = Some(2);
+                    if pressed { self.is_minimized = true; }
+                    return true;
+                }
+            }
+            self.hover_btn = None;
+            if pressed && my >= self.bounds.y && my < self.bounds.y + tbh && mx >= self.bounds.x && mx <= self.bounds.x + self.bounds.w {
+                self.is_dragging = true;
+                self.drag_offset_x = mx - self.bounds.x;
+                self.drag_offset_y = my - self.bounds.y;
+                return true;
+            }
         }
 
         // تغيير الحجم (Resize Handles)

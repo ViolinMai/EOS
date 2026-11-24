@@ -7,6 +7,7 @@ pub const PAGE_SIZE: u64 = 4096;
 pub const PAGE_PRESENT: u64 = 1 << 0;
 pub const PAGE_WRITABLE: u64 = 1 << 1;
 pub const PAGE_USER: u64 = 1 << 2;
+pub const PAGE_WRITE_THROUGH: u64 = 1 << 3;
 pub const PAGE_CACHE_DISABLE: u64 = 1 << 4;
 pub const PAGE_HUGE: u64 = 1 << 7;
 #[allow(dead_code)]
@@ -49,8 +50,72 @@ pub static mut VMM: Option<VirtualMemoryManager> = None;
 impl VirtualMemoryManager {
     pub unsafe fn init(hhdm_offset: u64) {
         let cr3 = read_cr3();
-        log_info!("VMM: Active PML4 Table (from CR3): {:#018x}", cr3);
+        // Configure IA32_PAT MSR 0x277 so PAT1 = Write-Combining (0x01) globally
+        unsafe {
+            crate::arch::x86_64::syscall::wrmsr(0x277, 0x0007_0106_0007_0106);
+        }
+        log_info!("VMM: Active PML4 Table (from CR3): {:#018x} (IA32_PAT WC Active)", cr3);
         unsafe { *core::ptr::addr_of_mut!(VMM) = Some(Self { hhdm_offset }); }
+    }
+}
+
+/// Milestone 27: Configure IA32_PAT (MSR 0x277) so PAT1 (PWT=1, PCD=0, PAT=0) = Write-Combining (0x01)
+/// and mark linear framebuffer pages as Write-Combining for full bare-metal blit bandwidth.
+pub fn init_pat_wc_framebuffer(fb_virt: u64, size_bytes: usize) -> bool {
+    unsafe {
+        // PAT0=WB(06), PAT1=WC(01), PAT2=UC-(07), PAT3=UC(00), PAT4=WB(06), PAT5=WC(01), PAT6=UC-(07), PAT7=UC(00)
+        let pat_val: u64 = 0x0007_0106_0007_0106;
+        crate::arch::x86_64::syscall::wrmsr(0x277, pat_val);
+
+        let vmm = match (*addr_of!(VMM)).as_ref() {
+            Some(v) => v,
+            None => return false,
+        };
+        let pml4_phys = read_cr3() & PHYSICAL_ADDRESS_MASK;
+        let pml4 = &mut *((pml4_phys + vmm.hhdm_offset) as *mut PageTable);
+
+        let start = fb_virt & !0xFFF;
+        let end = (fb_virt.saturating_add(size_bytes as u64) + 0xFFF) & !0xFFF;
+        let mut curr = start;
+        let mut updated_pages = 0usize;
+
+        while curr < end {
+            let p4_idx = ((curr >> 39) & 0x1FF) as usize;
+            if !pml4.entries[p4_idx].is_present() { curr += 4096; continue; }
+            let pt3 = &mut *((pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable);
+
+            let p3_idx = ((curr >> 30) & 0x1FF) as usize;
+            if !pt3.entries[p3_idx].is_present() { curr += 4096; continue; }
+            if (pt3.entries[p3_idx].0 & PAGE_HUGE) != 0 {
+                pt3.entries[p3_idx].0 = (pt3.entries[p3_idx].0 & !PAGE_CACHE_DISABLE) | PAGE_WRITE_THROUGH;
+                invalidate_tlb(curr);
+                updated_pages += 1;
+                curr = (curr + 0x4000_0000) & !0x3FFF_FFFF;
+                continue;
+            }
+            let pt2 = &mut *((pt3.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable);
+
+            let p2_idx = ((curr >> 21) & 0x1FF) as usize;
+            if !pt2.entries[p2_idx].is_present() { curr += 4096; continue; }
+            if (pt2.entries[p2_idx].0 & PAGE_HUGE) != 0 {
+                pt2.entries[p2_idx].0 = (pt2.entries[p2_idx].0 & !PAGE_CACHE_DISABLE) | PAGE_WRITE_THROUGH;
+                invalidate_tlb(curr);
+                updated_pages += 1;
+                curr = (curr + 0x20_0000) & !0x1F_FFFF;
+                continue;
+            }
+            let pt1 = &mut *((pt2.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable);
+
+            let p1_idx = ((curr >> 12) & 0x1FF) as usize;
+            if pt1.entries[p1_idx].is_present() {
+                pt1.entries[p1_idx].0 = (pt1.entries[p1_idx].0 & !PAGE_CACHE_DISABLE) | PAGE_WRITE_THROUGH;
+                invalidate_tlb(curr);
+                updated_pages += 1;
+            }
+            curr += 4096;
+        }
+        log_info!("PAT-WC", "IA32_PAT configured; {} framebuffer page entries mapped as Write-Combining.", updated_pages);
+        updated_pages > 0
     }
 }
 

@@ -52,31 +52,42 @@ impl Widget for ExternalWindowWidget {
         let y2 = (self.bounds.y + self.buf_h as i32).min(self.bounds.y + self.bounds.h).min(clip.y + clip.h).min(canvas.height as i32);
         if x2 <= x1 || y2 <= y1 { return; }
         let r = get_theme().r_win() as i32;
-        let cw = (x2 - x1) as usize;
-        let sx0 = (x1 - self.bounds.x) as usize;
+        let _cw = (x2 - x1) as usize;
+        let _sx0 = (x1 - self.bounds.x) as usize;
         for py in y1..y2 {
             let sy = (py - self.bounds.y) as usize;
             if sy >= self.buf_h { break; }
+            let ly_top = py - self.bounds.y;
             let ly_bot = (self.bounds.y + self.bounds.h - 1) - py;
-            if r > 0 && ly_bot < r {
-                let dy = (r - ly_bot) as f32;
+            let edge_dist = ly_top.min(ly_bot);
+            let (row_x1, row_x2) = if r > 0 && edge_dist < r {
+                let dy = (r - edge_dist) as f32 - 0.5;
                 let cut = (r as f32 - ((r * r) as f32 - dy * dy).max(0.0).sqrt()).ceil() as i32;
-                let row_x1 = x1.max(self.bounds.x + cut);
-                let row_x2 = x2.min(self.bounds.x + self.bounds.w - cut);
-                if row_x2 > row_x1 {
-                    let rcw = (row_x2 - row_x1) as usize;
-                    let rsx0 = (row_x1 - self.bounds.x) as usize;
-                    let src = sy * self.buf_w + rsx0;
-                    let dst = (py as usize) * canvas.width + (row_x1 as usize);
-                    if src + rcw <= self.pixels.len() && dst + rcw <= canvas.buffer.len() {
-                        canvas.buffer[dst..dst + rcw].copy_from_slice(&self.pixels[src..src + rcw]);
-                    }
-                }
+                (x1.max(self.bounds.x + cut), x2.min(self.bounds.x + self.bounds.w - cut))
             } else {
-                let src = sy * self.buf_w + sx0;
-                let dst = (py as usize) * canvas.width + (x1 as usize);
-                if src + cw <= self.pixels.len() && dst + cw <= canvas.buffer.len() {
-                    canvas.buffer[dst..dst + cw].copy_from_slice(&self.pixels[src..src + cw]);
+                (x1, x2)
+            };
+            if row_x2 > row_x1 {
+                let rcw = (row_x2 - row_x1) as usize;
+                let rsx0 = (row_x1 - self.bounds.x) as usize;
+                let src_start = sy * self.buf_w + rsx0;
+                let dst_start = (py as usize) * canvas.width + (row_x1 as usize);
+                if src_start + rcw <= self.pixels.len() && dst_start + rcw <= canvas.buffer.len() {
+                    let s_slice = &self.pixels[src_start..src_start + rcw];
+                    let d_slice = &mut canvas.buffer[dst_start..dst_start + rcw];
+                    for (sp, dp) in s_slice.iter().zip(d_slice.iter_mut()) {
+                        let s = *sp;
+                        let a = (s >> 24) & 0xFF;
+                        if a == 255 {
+                            *dp = s;
+                        } else if a > 0 {
+                            let d = *dp;
+                            let inv = 255 - a;
+                            let rb = ((((s & 0x00FF00FF) * a) + ((d & 0x00FF00FF) * inv) + 0x00800080) >> 8) & 0x00FF00FF;
+                            let g = ((((s & 0x0000FF00) * a) + ((d & 0x0000FF00) * inv) + 0x00008000) >> 8) & 0x0000FF00;
+                            *dp = 0xFF000000 | rb | g;
+                        }
+                    }
                 }
             }
         }
@@ -362,7 +373,7 @@ impl<'a> FrameworkApp<'a> {
     fn load_dock_config() -> (Vec<String>, bool) {
         let mut auto_hide = false;
         let mut items = Vec::new();
-        if let Ok(txt) = fs::read_to_string("RootFS/dock.ini").or_else(|_| fs::read_to_string("dock.ini")) {
+        if let Ok(txt) = fs::read_to_string("r/dock.ini").or_else(|_| fs::read_to_string("dock.ini")) {
             for raw in txt.lines() {
                 let l = raw.trim();
                 if l.is_empty() { continue; }
@@ -392,7 +403,7 @@ impl<'a> FrameworkApp<'a> {
         let mut data = format!("auto_hide={}\n", if self.dock_auto_hide { "true" } else { "false" });
         data.push_str(&self.dock_items.join("\n"));
         data.push('\n');
-        let _ = fs::write("RootFS/dock.ini", &data);
+        let _ = fs::write("r/dock.ini", &data);
         let _ = fs::write("dock.ini", &data);
     }
 
@@ -424,7 +435,7 @@ impl<'a> FrameworkApp<'a> {
     }
 
     fn load_startup_wallpaper(&mut self) {
-        let paths = ["RootFS/settings.ini", "settings.ini"];
+        let paths = ["r/settings.ini", "settings.ini"];
         for p in &paths {
             if let Ok(content) = fs::read_to_string(p) {
                 for line in content.lines() {
@@ -521,6 +532,26 @@ impl<'a> FrameworkApp<'a> {
 
     pub fn request_full_redraw(&mut self) {
         self.damage.add(Rect::new(0, 0, self.width as i32, self.height as i32));
+    }
+
+    /// Milestone 21: Capture active framebuffer to PNG in /EOS SHARE/screenshot_<ts>.png
+    pub fn capture_screenshot(&mut self) {
+        let ts = crate::framework::perf_log::SmartLogger::read_tsc() / 1_000_000;
+        let fname = format!("screenshot_{}.png", ts);
+        let path = format!("EOS SHARE/{}", fname);
+        match crate::png::encode_png_argb(&self.buffer, self.width, self.height) {
+            Ok(png_bytes) => {
+                if fs::write(&path, &png_bytes).is_ok() {
+                    crate::framework::portal::push_toast("Screenshot Saved", &format!("/{}", path));
+                } else {
+                    crate::framework::portal::push_toast("Screenshot Error", "Failed writing PNG to /EOS SHARE");
+                }
+            }
+            Err(_) => {
+                crate::framework::portal::push_toast("Screenshot Error", "PNG encoding failed");
+            }
+        }
+        self.request_full_redraw();
     }
 
     pub fn toggle_show_desktop(&mut self) {
@@ -648,9 +679,12 @@ impl<'a> FrameworkApp<'a> {
                     self.damage.add(Rect::new(0, tb_y - theme.pt(110.0), self.width as i32, tb_h + theme.pt(110.0)));
                 }
 
+                let drag_select = self.input_mgr.pointer.primary_down && self.captured_window_idx.is_none();
+                let active_idx = self.focus_mgr.active_window_idx;
                 for (idx, w) in self.root_widgets.iter_mut().enumerate() {
                     let old_hover = if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() { f.hover_btn } else { None };
-                    w.handle_mouse(x, y, false);
+                    let pass_pressed = drag_select && active_idx == Some(idx);
+                    w.handle_mouse(x, y, pass_pressed);
                     if let Some(f) = w.as_any().downcast_ref::<WindowFrame>() {
                         if old_hover != f.hover_btn {
                             self.damage.add(Rect::new(f.bounds.x + f.bounds.w - theme.pt(140.0), f.bounds.y, theme.pt(140.0), f.title_bar_height()));
@@ -768,6 +802,7 @@ impl<'a> FrameworkApp<'a> {
                             if !f.is_closed && !f.is_minimized && f.bounds.contains(x, y) {
                                 let pin_lbl = if f.always_on_top { "Unpin Always-on-Top" } else { "Pin Always-on-Top" };
                                 let mut items = vec![
+                                    crate::framework::menu::ContextMenuItem::action("win_titlebar", "Cycle Titlebar (Minimal/Hidden/Classic)", Some("tune")),
                                     crate::framework::menu::ContextMenuItem::action("win_pin", pin_lbl, Some("tune")),
                                     crate::framework::menu::ContextMenuItem::action("win_full", "Toggle Fullscreen", Some("video")),
                                 ];
@@ -825,6 +860,15 @@ impl<'a> FrameworkApp<'a> {
                                 }
                                 "open_terminal" => self.spawn_app("Terminal"),
                                 "personalize" => self.spawn_app("Settings"),
+                                "win_titlebar" => {
+                                    if let Some(idx) = self.focus_mgr.active_window_idx {
+                                        if let Some(w) = self.root_widgets.get_mut(idx) {
+                                            if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                                                f.cycle_titlebar_style();
+                                            }
+                                        }
+                                    }
+                                }
                                 "win_pin" => {
                                     if let Some(idx) = self.focus_mgr.active_window_idx {
                                         if let Some(w) = self.root_widgets.get_mut(idx) {
@@ -940,6 +984,13 @@ impl<'a> FrameworkApp<'a> {
                     // 1. Start Menu Click
                     if self.start_menu.is_open {
                         if let Some((target_app, target_arg)) = self.start_menu.handle_mouse(x, y, true) {
+                            if target_app == "__REBOOT__" {
+                                crate::syscall::sys_power(1);
+                                return;
+                            } else if target_app == "__SHUTDOWN__" {
+                                crate::syscall::sys_power(2);
+                                return;
+                            }
                             let arg_opt = if target_arg.is_empty() { None } else { Some(target_arg.as_str()) };
                             self.spawn_app_with_arg(&target_app, arg_opt);
                             self.request_full_redraw();
@@ -1191,8 +1242,31 @@ impl<'a> FrameworkApp<'a> {
                     }
                 }
 
-                // Win+Left / Win+Right Aero Snap keyboard shortcuts
-                if (mods & 0x08) != 0 {
+                // Alt+F4 -> Close Active Window (Milestone 21)
+                if keycode == 0x3E && (mods & 0x04) != 0 {
+                    if let Some(idx) = self.focus_mgr.active_window_idx {
+                        if let Some(w) = self.root_widgets.get_mut(idx) {
+                            if let Some(f) = w.as_any_mut().downcast_mut::<WindowFrame>() {
+                                f.is_closed = true;
+                                self.request_full_redraw();
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                // PrintScreen (0xB7) or F9 (0x43) -> Capture Screenshot PNG (Milestone 21)
+                if keycode == 0xB7 || keycode == 0x43 {
+                    self.capture_screenshot();
+                    return;
+                }
+
+                // Win+D (Toggle Show Desktop) & Win+Left/Right (Aero Snap) — MOD_WIN = 0x10
+                if (mods & 0x10) != 0 {
+                    if keycode == 0x20 {
+                        self.toggle_show_desktop();
+                        return;
+                    }
                     let work = self.work_area();
                     if let Some(idx) = self.focus_mgr.active_window_idx {
                         if let Some(w) = self.root_widgets.get_mut(idx) {
@@ -1431,7 +1505,11 @@ impl<'a> FrameworkApp<'a> {
                     let mut ext = ExternalWindowWidget::new(d.id, d.width as usize, d.height as usize);
                     crate::syscall::sys_comp_read_surface(d.id, &mut ext.pixels);
                     ext.last_gen = d.generation;
-                    let frame = WindowFrame::new(title, theme.pt(120.0) + off, theme.pt(40.0) + off, d.width as i32 + 2, d.height as i32 + tbh + 1, Box::new(ext));
+                    let is_terminal = title.eq_ignore_ascii_case("Terminal");
+                    let mut frame = WindowFrame::new(title, theme.pt(120.0) + off, theme.pt(40.0) + off, d.width as i32 + 2, d.height as i32 + tbh + 1, Box::new(ext));
+                    if is_terminal {
+                        frame.set_titlebar_style(crate::framework::widget::TitlebarStyle::Hidden);
+                    }
                     self.root_widgets.push(Box::new(frame));
                     self.window_surfaces.push(crate::framework::surface::WindowSurface::new(1, 1));
                     self.focus_mgr.active_window_idx = Some(self.root_widgets.len() - 1);

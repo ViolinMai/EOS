@@ -361,6 +361,25 @@ pub fn write_file_content(drive: u8, filename: &str, content: &[u8]) -> Result<(
     let mut sector_buf = [0u8; 512];
     let _bytes_per_cluster = (layout.spc as usize) * 512;
 
+    let eof_val = match layout.fat_type {
+        FatType::Fat32 => 0x0FFF_FFFF,
+        FatType::Fat16 => 0xFFFF,
+        FatType::Fat12 => 0x0FFF,
+    };
+
+    if current_cluster < 2 {
+        if let Some(free_c) = allocate_free_cluster(drive, &layout) {
+            current_cluster = free_c;
+            let _ = set_next_cluster(drive, &layout, current_cluster, eof_val);
+            read_sector_drive(drive, target.dir_entry_lba, &mut sector_buf)?;
+            sector_buf[target.dir_entry_offset + 20..target.dir_entry_offset + 22]
+                .copy_from_slice(&((current_cluster >> 16) as u16).to_le_bytes());
+            sector_buf[target.dir_entry_offset + 26..target.dir_entry_offset + 28]
+                .copy_from_slice(&(current_cluster as u16).to_le_bytes());
+            write_sector_drive(drive, target.dir_entry_lba, &sector_buf)?;
+        }
+    }
+
     while current_cluster >= 2 && !is_fat_eof(layout.fat_type, current_cluster) {
         let cluster_lba = layout.data_start_lba + (current_cluster - 2) * layout.spc;
         for sec in 0..layout.spc {
@@ -374,26 +393,27 @@ pub fn write_file_content(drive: u8, filename: &str, content: &[u8]) -> Result<(
             write_sector_drive(drive, cluster_lba + sec, &sector_buf)?;
         }
 
-        let next = get_next_cluster(drive, &layout, current_cluster)?;
         if remaining == 0 {
-            let eof_val = match layout.fat_type {
-                FatType::Fat32 => 0x0FFF_FFFF,
-                FatType::Fat16 => 0xFFFF,
-                FatType::Fat12 => 0x0FFF,
-            };
             let _ = set_next_cluster(drive, &layout, current_cluster, eof_val);
             break;
         }
 
-        if is_fat_eof(layout.fat_type, next) {
-            break;
+        let mut next = get_next_cluster(drive, &layout, current_cluster)?;
+        if is_fat_eof(layout.fat_type, next) || next < 2 {
+            if let Some(new_c) = allocate_free_cluster(drive, &layout) {
+                let _ = set_next_cluster(drive, &layout, current_cluster, new_c);
+                let _ = set_next_cluster(drive, &layout, new_c, eof_val);
+                next = new_c;
+            } else {
+                break;
+            }
         }
         current_cluster = next;
     }
 
     read_sector_drive(drive, target.dir_entry_lba, &mut sector_buf)?;
     sector_buf[target.dir_entry_offset + 28..target.dir_entry_offset + 32]
-        .copy_from_slice(&(content.len() as u32).to_le_bytes());
+        .copy_from_slice(&(content_offset as u32).to_le_bytes());
     write_sector_drive(drive, target.dir_entry_lba, &sector_buf)?;
     Ok(())
 }
@@ -423,6 +443,33 @@ pub fn delete_file_path(drive: u8, path: &str) -> Result<(), &'static str> {
     sector_buf[target.dir_entry_offset] = 0xE5;
     write_sector_drive(drive, target.dir_entry_lba, &sector_buf)?;
     Ok(())
+}
+
+fn allocate_free_cluster(drive: u8, layout: &FatLayout) -> Option<u32> {
+    let entries_per_sec = match layout.fat_type {
+        FatType::Fat32 => 128u32,
+        FatType::Fat16 => 256u32,
+        FatType::Fat12 => return None,
+    };
+    let mut buf = [0u8; 512];
+    for sec in 0..128u32 {
+        if read_sector_drive(drive, layout.fat_start_lba + sec, &mut buf).is_err() {
+            break;
+        }
+        for idx in 0..entries_per_sec {
+            let cluster = sec * entries_per_sec + idx;
+            if cluster < 3 { continue; }
+            let off = (idx as usize) * match layout.fat_type { FatType::Fat32 => 4, _ => 2 };
+            let val = match layout.fat_type {
+                FatType::Fat32 => u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]]) & 0x0FFF_FFFF,
+                _ => u16::from_le_bytes([buf[off], buf[off + 1]]) as u32,
+            };
+            if val == 0 {
+                return Some(cluster);
+            }
+        }
+    }
+    None
 }
 
 pub fn init() { log_info!("ATA", "IDE Channels Initialized with Dynamic Directory Traversal."); }

@@ -146,7 +146,7 @@ impl FinderApp {
         }
 
         if self.items.is_empty() && (clean.is_empty() || clean == ".") {
-            for root in ["EOS SHARE", "RootFS", "Initrd"] {
+            for root in ["EOS SHARE", "r", "Initrd"] {
                 self.items.push(FinderItem { name: root.into(), is_dir: true, size: 0, thumb: None });
             }
         }
@@ -324,7 +324,7 @@ impl Widget for FinderApp {
         let places = [
             ("EOS SHARE", "EOS SHARE", "lib"),
             ("TEST_SUBJECT", "EOS SHARE/TEST_SUBJECT", "tune"),
-            ("RootFS", "RootFS", "virtual"),
+            ("r", "r", "virtual"),
             ("Home", "home/march", "lib"),
             ("Initrd", "Initrd", "disc"),
         ];
@@ -518,7 +518,7 @@ impl Widget for FinderApp {
         if mx >= self.bounds.x && mx <= self.bounds.x + side_w && my >= body_y {
             let p_row_h = theme.pt(30.0);
             let idx = ((my - (body_y + theme.pt(8.0))) / (p_row_h + 4)) as usize;
-            let targets = ["EOS SHARE", "EOS SHARE/TEST_SUBJECT", "RootFS", "home/march", "Initrd"];
+            let targets = ["EOS SHARE", "EOS SHARE/TEST_SUBJECT", "r", "home/march", "Initrd"];
             if idx < targets.len() {
                 self.navigate_to(targets[idx]);
             }

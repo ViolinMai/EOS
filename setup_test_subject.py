@@ -186,6 +186,10 @@ def ensure_test_subject():
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2)
 
+    out_seed_path = os.path.join(TEST_SUBJECT_DIR, "eos_output.json")
+    with open(out_seed_path, "wb") as f:
+        f.write(b"{}")
+
     print(f"[+] TEST_SUBJECT ready at {TEST_SUBJECT_DIR} ({len(manifest['files'])} golden test assets).")
     return manifest
 

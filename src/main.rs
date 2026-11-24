@@ -82,6 +82,10 @@ pub extern "C" fn _start() -> ! {
                     fb.height as usize,
                     fb.pitch as usize,
                 );
+                let fb_bytes = (fb.pitch as usize).saturating_mul(fb.height as usize);
+                if mm::paging::init_pat_wc_framebuffer(fb.address() as u64, fb_bytes) {
+                    audit::emit_raw_json("HW_PAT_WC", "PAT_INIT", "PASS", "HW_PAT_WC:PASS:Framebuffer_Accelerated");
+                }
                 // عرض شاشة الـ Boot Splash التفاعلية
                 w.render_boot_splash(0);
                 *core::ptr::addr_of_mut!(writer::WRITER) = Some(w);

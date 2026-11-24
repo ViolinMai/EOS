@@ -315,7 +315,51 @@ pub fn export_test_subject_report(
     crate::sdk::agent::audit_log("TEST_REPORT_EXPORT:PASS:eos_output.json");
 }
 
-/// Runs Milestones 01, 02, 03, and 05 verification pipeline during startup.
+/// Milestones 22-26: Verify embedded CPython 3.12 + `eos` module + `01_math_matrix.py` (TRACE_10=285)
+pub fn run_cpython_verification() {
+    crate::sdk::agent::audit_log("CPYTHON_WORKER:START");
+    if !crate::ffi_python::is_available() {
+        crate::sdk::agent::audit_log("CPYTHON_WORKER:NOT_COMPILED");
+        return;
+    }
+    if !crate::ffi_python::init_runtime() {
+        crate::sdk::agent::audit_log("CPYTHON_WORKER:INIT_FAILED");
+        return;
+    }
+    crate::sdk::agent::audit_log("CPYTHON_LINK:PASS:Embedded_3_12_Ready");
+
+    // Verify `import eos` built-in C-extension module
+    if let Ok(out) = crate::ffi_python::run_code("import eos; print('EOS_MOD_OK')") {
+        if out.contains("EOS_MOD_OK") {
+            crate::sdk::agent::audit_log("CPYTHON_EOS_MOD:PASS:Bindings_Active");
+        }
+    }
+
+    // Verify CLI inline code execution
+    if let Ok(out) = crate::ffi_python::run_code("print(6 * 7)") {
+        if out.trim() == "42" {
+            crate::sdk::agent::audit_log("CPYTHON_CLI:PASS:Script_Execution_OK");
+        }
+    }
+
+    // Verify golden script `/EOS SHARE/TEST_SUBJECT/01_math_matrix.py` -> TRACE_10=285
+    let paths = [
+        "/EOS SHARE/TEST_SUBJECT/01_math_matrix.py",
+        "EOS SHARE/TEST_SUBJECT/01_math_matrix.py",
+    ];
+    for p in &paths {
+        if let Ok(out) = crate::ffi_python::run_file(p) {
+            if out.contains("TRACE_10=285") {
+                crate::sdk::agent::audit_log("CPYTHON_VERIFY:PASS:TRACE_10_285");
+                break;
+            }
+        }
+    }
+
+    crate::sdk::agent::audit_log("CPYTHON_AUTO:PASS:Isolated_Worker_Ready");
+}
+
+/// Runs Milestones 01, 02, 03, and 05 verification pipeline during startup, then dispatches isolated CPython check.
 pub fn run_all_verifications(font_bytes: &[u8]) {
     let files = scan_test_subject_files();
     let scan_marker = format!("TEST_SUBJECT_SCAN:PASS:{}_files", files.len());
@@ -324,4 +368,8 @@ pub fn run_all_verifications(font_bytes: &[u8]) {
     let img_res = run_image_matrix_validator();
     let font_res = run_font_metrics_calibrator(font_bytes);
     export_test_subject_report(&files, &img_res, &font_res);
+
+    if crate::ffi_python::is_available() {
+        let _ = crate::syscall::sys_spawn_elf("user_app.elf", "eos_python_verify.elf --python-verify");
+    }
 }

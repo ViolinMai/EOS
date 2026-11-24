@@ -93,3 +93,28 @@ pub fn decode_png(data: &[u8]) -> Result<(Vec<u32>, usize, usize), String> {
 
     Ok((pixels, width, height))
 }
+
+/// Encodes an ARGB8888 pixel buffer into a valid PNG byte stream (Milestone 21 PrintScreen).
+pub fn encode_png_argb(pixels: &[u32], width: usize, height: usize) -> Result<Vec<u8>, String> {
+    if width == 0 || height == 0 || pixels.len() < width * height {
+        return Err("Invalid framebuffer dimensions".into());
+    }
+    let mut rgb = vec![0u8; width * height * 3];
+    for i in 0..(width * height) {
+        let px = pixels[i];
+        let o = i * 3;
+        rgb[o] = ((px >> 16) & 0xFF) as u8;
+        rgb[o + 1] = ((px >> 8) & 0xFF) as u8;
+        rgb[o + 2] = (px & 0xFF) as u8;
+    }
+
+    let mut out = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut out, width as u32, height as u32);
+        encoder.set_color(png::ColorType::Rgb);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().map_err(|e| format!("PNG header err: {:?}", e))?;
+        writer.write_image_data(&rgb).map_err(|e| format!("PNG write err: {:?}", e))?;
+    }
+    Ok(out)
+}

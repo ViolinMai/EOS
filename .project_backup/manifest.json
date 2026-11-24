@@ -1,16 +1,7 @@
 {
   "modified": [
-    "userspace/src/main.rs",
-    "src/drivers/ata.rs",
-    "src/fs/mod.rs",
-    "src/task/mod.rs",
-    "src/arch/x86_64/syscall.rs",
-    "userspace/src/syscall.rs",
-    "userspace/src/apps/finder.rs",
-    "userspace/src/apps/video_player.rs",
-    "userspace/src/apps/activity_monitor.rs",
-    "test_eos_audit.py",
-    "milestones.md"
+    "userspace/src/ffi_python.c",
+    "userspace/src/test_subject.rs"
   ],
   "created": []
 }

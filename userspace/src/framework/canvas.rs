@@ -464,46 +464,62 @@ impl<'a> Canvas<'a> {
         self.pop_clip();
     }
 
-    /// Fixed-width Monospace metrics for Terminal & Stats HUD (zero horizontal jitter)
-    pub fn measure_text_mono(&self, text: &str, size: usize) -> (usize, usize) {
-        let cell_w = ((size as f32 * 0.60).round() as usize).max(6);
-        (text.chars().count() * cell_w, size)
+    /// Natural font-aware metrics for Terminal & Stats HUD (works cleanly with both Mono and Proportional fonts)
+    pub fn measure_text_mono(&mut self, text: &str, size: usize) -> (usize, usize) {
+        let mono_font = crate::framework::fonts::get_font_for_role(crate::framework::fonts::FontRole::Mono);
+        let font = match mono_font.or(self.font) {
+            Some(f) => f,
+            None => {
+                let scale = (size / 8).max(1);
+                return (text.chars().count() * 8 * scale, 8 * scale);
+            }
+        };
+        let scale = Scale::uniform(size as f32);
+        let mut width = 0usize;
+        for c in text.chars() {
+            if c == '\n' { continue; }
+            let adv = font.glyph(c).scaled(scale).h_metrics().advance_width.round() as usize;
+            width += adv.max(1);
+        }
+        (width, size)
     }
 
     pub fn draw_text_mono(&mut self, x: i32, y: i32, text: &str, color: u32, size: usize) {
         let clip = self.current_clip();
-        let cell_w = ((size as f32 * 0.60).round() as i32).max(6);
         let mono_font = crate::framework::fonts::get_font_for_role(crate::framework::fonts::FontRole::Mono);
+        let font = match mono_font.or(self.font) {
+            Some(f) => f,
+            None => {
+                self.draw_text(x, y, text, color, size);
+                return;
+            }
+        };
+
+        let scale = Scale::uniform(size as f32);
+        let v_metrics = font.v_metrics(scale);
         let mut cur_x = x;
 
-        if let Some(font) = mono_font {
-            let scale = Scale::uniform(size as f32);
-            let v_metrics = font.v_metrics(scale);
-            for c in text.chars() {
-                if c == '\n' { cur_x = x; continue; }
-                let glyph = font.glyph(c).scaled(scale).positioned(point(0.0, v_metrics.ascent));
-                if let Some(bb) = glyph.pixel_bounding_box() {
-                    let gw = bb.width().max(0) as usize;
-                    let gx_off = (cell_w - (gw as i32)) / 2;
-                    let gx = cur_x + gx_off.max(0);
-                    let gy = y + bb.min.y;
-                    glyph.draw(|dx, dy, v| {
-                        let alpha = (v * 255.0) as u32;
-                        if alpha == 0 { return; }
-                        let px = gx + dx as i32;
-                        let py = gy + dy as i32;
-                        if px >= clip.x && px < clip.x + clip.w && py >= clip.y && py < clip.y + clip.h
-                            && px >= 0 && px < self.width as i32 && py >= 0 && py < self.height as i32
-                        {
-                            let idx = (py as usize) * self.width + (px as usize);
-                            self.buffer[idx] = blend(self.buffer[idx], color, alpha);
-                        }
-                    });
-                }
-                cur_x += cell_w;
+        for c in text.chars() {
+            if c == '\n' { cur_x = x; continue; }
+            let glyph = font.glyph(c).scaled(scale).positioned(point(0.0, v_metrics.ascent));
+            let adv = glyph.unpositioned().h_metrics().advance_width.round() as i32;
+            if let Some(bb) = glyph.pixel_bounding_box() {
+                let gx = cur_x + bb.min.x;
+                let gy = y + bb.min.y;
+                glyph.draw(|dx, dy, v| {
+                    let alpha = (v * 255.0) as u32;
+                    if alpha == 0 { return; }
+                    let px = gx + dx as i32;
+                    let py = gy + dy as i32;
+                    if px >= clip.x && px < clip.x + clip.w && py >= clip.y && py < clip.y + clip.h
+                        && px >= 0 && px < self.width as i32 && py >= 0 && py < self.height as i32
+                    {
+                        let idx = (py as usize) * self.width + (px as usize);
+                        self.buffer[idx] = blend(self.buffer[idx], color, alpha);
+                    }
+                });
             }
-        } else {
-            self.draw_text(x, y, text, color, size);
+            cur_x += adv.max(1);
         }
     }
 

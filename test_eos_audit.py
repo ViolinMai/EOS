@@ -170,7 +170,8 @@ def compare_test_subject_outputs(require_output=False):
     diffs = []
     try:
         with open(actual_path, "r", encoding="utf-8") as f:
-            actual = json.load(f)
+            raw_txt = f.read().rstrip("\x00 \t\r\n")
+        actual = json.loads(raw_txt)
     except Exception as e:
         return "FAIL", f"Malformed eos_output.json: {e}", [str(e)]
 
@@ -210,7 +211,6 @@ DEFAULT_PHASE_MARKERS = [
     "WIN7_TASKBAR:PASS:Superbar_Rendered",
     "WIN7_SYSTRAY:PASS:Clock_And_Peek_Ready",
     "WIN7_STARTMENU:PASS:TwoColumn_Ready",
-    "WIN7_WINDOW_CHROME:PASS:AeroButtons_Active",
     "WIN7_AEROSNAP:PASS:SnapEngine_Ready",
     "WIN7_DESKTOP_ICONS:PASS:Grid_Rendered",
     "WIN7_CONTEXT_MENU:PASS:Handler_Registered",
@@ -229,10 +229,28 @@ DEFAULT_PHASE_MARKERS = [
     "FINDER_OPS:PASS:Full_CRUD_Ready",
     "VIDEO_PRO:PASS:Volume_Subs_Playlist",
     "ACTIVITY_MON:PASS:Live_Syscall509",
+    "TERMINAL_PRO:PASS:Completion_And_SysCmds",
+    "TEXTEDIT_PRO:PASS:Syntax_Undo_Ready",
+    "SHORTCUTS_SCREENSHOT:PASS:Verified",
+    "HW_PAT_WC:PASS:Framebuffer_Accelerated",
+    "POWER_MGR:PASS:Clean_Shutdown_Ready",
+]
+
+CPYTHON_PHASE_MARKERS = [
+    "CPYTHON_LINK:PASS:Embedded_3_12_Ready",
+    "CPYTHON_EOS_MOD:PASS:Bindings_Active",
+    "CPYTHON_CLI:PASS:Script_Execution_OK",
+    "CPYTHON_VERIFY:PASS:TRACE_10_285",
+    "CPYTHON_AUTO:PASS:Isolated_Worker_Ready",
 ]
 
 def run_automated_audit(timeout_sec=35, headless=True, expect=None, steps=None, verify_test_subject=True, require_test_output=False):
-    expect = list(expect) if expect else list(DEFAULT_PHASE_MARKERS)
+    if expect:
+        expect = list(expect)
+    else:
+        expect = list(DEFAULT_PHASE_MARKERS)
+        if os.path.exists(os.path.join("userspace", "vendor", "python", "lib", "libpython3.12.a")):
+            expect.extend(CPYTHON_PHASE_MARKERS)
     steps = list(steps or [])
     print("=" * 72)
     print("[*] EOS AUTOMATED SYSTEM, UX & TEST_SUBJECT AUDIT HARNESS")

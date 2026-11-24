@@ -10,9 +10,24 @@ pub fn enable_sse() {
         asm!("mov cr0, {}", in(reg) cr0);
 
         asm!("mov {}, cr4", out(reg) cr4);
-        cr4 |= 1 << 9;  // تفعيل OSFXSR (FXSAVE/FXRSTOR و SSE تعليمات)
-        cr4 |= 1 << 10; // تفعيل OSXMMEXCPT (معالجة استثناءات SIMD)
-        asm!("mov cr4, {}", in(reg) cr4);
+        cr4 |= 1 << 9;  // OSFXSR (SSE)
+        cr4 |= 1 << 10; // OSXMMEXCPT
+        // Check CPUID.1:ECX.XSAVE (bit 26) and enable OSXSAVE + XCR0 (x87 + SSE + AVX)
+        let cpuid1 = core::arch::x86_64::__cpuid(1);
+        if (cpuid1.ecx & (1 << 26)) != 0 {
+            cr4 |= 1 << 18; // OSXSAVE
+            asm!("mov cr4, {}", in(reg) cr4);
+            let xcr0: u64 = 0x7; // x87 (bit 0) | SSE (bit 1) | AVX (bit 2)
+            asm!(
+                "xsetbv",
+                in("ecx") 0u32,
+                in("eax") (xcr0 as u32),
+                in("edx") ((xcr0 >> 32) as u32),
+                options(nomem, nostack)
+            );
+        } else {
+            asm!("mov cr4, {}", in(reg) cr4);
+        }
     }
 }
 

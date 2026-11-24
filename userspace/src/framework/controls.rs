@@ -6,6 +6,7 @@ pub struct LabelWidget {
     pub text: String,
     pub color: Option<u32>,
     pub font_size: usize,
+    pub selectable: bool,
 }
 
 impl LabelWidget {
@@ -15,7 +16,13 @@ impl LabelWidget {
             text: text.into(),
             color: None,
             font_size: 14,
+            selectable: false,
         }
+    }
+
+    pub fn with_selectable(mut self, selectable: bool) -> Self {
+        self.selectable = selectable;
+        self
     }
 
     pub fn with_size(mut self, size: usize) -> Self {
@@ -124,6 +131,8 @@ pub struct TextInputWidget {
     pub text: String,
     pub placeholder: String,
     pub is_focused: bool,
+    pub selectable: bool,
+    pub sel_all: bool,
     pub cursor_pos: usize,
     pub on_submit: Option<Box<dyn FnMut(&str)>>,
 }
@@ -135,6 +144,8 @@ impl TextInputWidget {
             text: String::new(),
             placeholder: placeholder.into(),
             is_focused: false,
+            selectable: true,
+            sel_all: false,
             cursor_pos: 0,
             on_submit: None,
         }

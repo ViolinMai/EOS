@@ -196,7 +196,7 @@ impl FileDialog {
 
         if self.entries.is_empty() && (clean.is_empty() || clean == ".") {
             self.entries.push(FileDialogItem { name: "EOS SHARE".into(), is_dir: true, size: 0 });
-            self.entries.push(FileDialogItem { name: "RootFS".into(), is_dir: true, size: 0 });
+            self.entries.push(FileDialogItem { name: "r".into(), is_dir: true, size: 0 });
             self.entries.push(FileDialogItem { name: "Initrd".into(), is_dir: true, size: 0 });
         }
 
@@ -299,7 +299,7 @@ impl FileDialog {
         let places = [
             ("EOS SHARE", "EOS SHARE", "lib"),
             ("TEST_SUBJECT", "EOS SHARE/TEST_SUBJECT", "tune"),
-            ("RootFS", "RootFS", "virtual"),
+            ("r", "r", "virtual"),
             ("Home", "home/march", "lib"),
             ("Initrd", "Initrd", "disc"),
         ];
@@ -559,7 +559,7 @@ impl FileDialog {
         if mx >= x + pad && mx <= x + pad + side_w && my >= body_y && my <= body_y + body_h {
             let p_row_h = theme.pt(28.0);
             let idx = ((my - (body_y + theme.pt(8.0))) / (p_row_h + 4)) as usize;
-            let targets = ["EOS SHARE", "EOS SHARE/TEST_SUBJECT", "RootFS", "home/march", "Initrd"];
+            let targets = ["EOS SHARE", "EOS SHARE/TEST_SUBJECT", "r", "home/march", "Initrd"];
             if idx < targets.len() {
                 self.current_dir = targets[idx].to_string();
                 self.refresh_entries();

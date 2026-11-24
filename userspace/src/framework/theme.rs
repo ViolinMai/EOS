@@ -359,7 +359,7 @@ pub fn sync_theme_from_disk_if_changed() -> bool {
     }
     LAST_THEME_SYNC_MS.store(now_ms, Ordering::Relaxed);
 
-    let content = match std::fs::read_to_string("RootFS/settings.ini").or_else(|_| std::fs::read_to_string("settings.ini")) {
+    let content = match std::fs::read_to_string("r/settings.ini").or_else(|_| std::fs::read_to_string("settings.ini")) {
         Ok(c) => c,
         Err(_) => return false,
     };

@@ -27,10 +27,10 @@ pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
     crate::log_info!("VFS", "vfs_list_dir requested for path: '{}'", clean);
 
     if clean.is_empty() || clean == "." {
-        crate::log_info!("VFS", "Listing Root Virtual Mounts (EOS SHARE, RootFS, Initrd)");
+        crate::log_info!("VFS", "Listing Root Virtual Mounts (EOS SHARE, r, Initrd)");
         return Ok(alloc::vec![
             FsItem::Directory(alloc::string::String::from("EOS SHARE"), 0),
-            FsItem::Directory(alloc::string::String::from("RootFS"), 0),
+            FsItem::Directory(alloc::string::String::from("r"), 0),
             FsItem::Directory(alloc::string::String::from("Initrd"), 0),
         ]);
     }
@@ -52,13 +52,16 @@ pub fn vfs_list_dir(path: &str) -> Result<Vec<FsItem>, &'static str> {
         }
     }
 
-    if clean.eq_ignore_ascii_case("RootFS") || clean.starts_with("RootFS/") || clean.starts_with("home") || clean.starts_with("etc") || clean.starts_with("bin") || clean.starts_with("usr") || clean.starts_with("var") {
-        crate::log_info!("VFS", "Scanning EXT2 RootFS on Drive 2...");
+    if clean.eq_ignore_ascii_case("r") || clean.starts_with("r/") || clean.eq_ignore_ascii_case("RootFS") || clean.starts_with("RootFS/") || clean.starts_with("home") || clean.starts_with("etc") || clean.starts_with("bin") || clean.starts_with("usr") || clean.starts_with("var") {
+        crate::log_info!("VFS", "Scanning EXT2 /r on Drive 2...");
         unsafe {
             if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
-                let target_subpath = clean.strip_prefix("RootFS/").unwrap_or(clean);
+                let target_subpath = clean
+                    .strip_prefix("r/")
+                    .or_else(|| clean.strip_prefix("RootFS/"))
+                    .unwrap_or(clean);
 
-                if target_subpath.is_empty() || target_subpath.eq_ignore_ascii_case("RootFS") {
+                if target_subpath.is_empty() || target_subpath.eq_ignore_ascii_case("r") || target_subpath.eq_ignore_ascii_case("RootFS") {
                     if let Ok(entries) = fs.list_directory(2) {
                         let mut items = alloc::vec![];
                         for (name, ino) in entries {
@@ -144,7 +147,7 @@ pub fn vfs_stat(path: &str) -> Result<(u64, u32), &'static str> {
         }
     }
 
-    if p.is_empty() || p == "EOS SHARE" || p == "RootFS" || p == "Initrd" || p == "/" || p == "." {
+    if p.is_empty() || p == "EOS SHARE" || p == "r" || p == "RootFS" || p == "Initrd" || p == "/" || p == "." {
         return Ok((0, 0o040755));
     }
     if p.starts_with("EOS SHARE/") || p.starts_with("EOS SHARE") {
@@ -244,7 +247,10 @@ fn vfs_read_bytes_inner(path: &str) -> Result<Vec<u8>, &'static str> {
 
     unsafe {
         if let Some(fs) = &*core::ptr::addr_of_mut!(crate::fs::ext2::EXT2_FS) {
-            let check_path = clean.strip_prefix("RootFS/").unwrap_or(clean);
+            let check_path = clean
+                .strip_prefix("r/")
+                .or_else(|| clean.strip_prefix("RootFS/"))
+                .unwrap_or(clean);
             let parts: alloc::vec::Vec<&str> = check_path.split('/').filter(|s| !s.is_empty()).collect();
             if !parts.is_empty() {
                 let mut curr_ino = 2u32;
@@ -420,6 +426,7 @@ pub fn is_settings_file(path: &str) -> bool {
     let p = resolve_path(path);
     let clean = p.trim_matches('/');
     clean.eq_ignore_ascii_case("settings.ini")
+        || clean.eq_ignore_ascii_case("r/settings.ini")
         || clean.eq_ignore_ascii_case("RootFS/settings.ini")
         || clean.eq_ignore_ascii_case("EOS SHARE/settings.ini")
         || clean.ends_with("/settings.ini")

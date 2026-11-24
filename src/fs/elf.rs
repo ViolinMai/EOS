@@ -275,7 +275,7 @@ pub fn load_and_run_elf(data: &[u8], args_str: &str) -> Result<(), &'static str>
         entries.push(0);  entries.push(0);
 
         let total_words = entries.len();
-        let target_offset = if total_words % 2 != 0 { 0x800usize } else { 0x7F8usize };
+        let target_offset = 0x800usize;
         let stack_dst = stack_base.add(target_offset) as *mut u64;
         core::ptr::copy_nonoverlapping(entries.as_ptr(), stack_dst, total_words);
 

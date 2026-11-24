@@ -33,6 +33,7 @@ pub fn push_user_event(ev: InputEvent) {
 }
 
 pub struct ProcessState {
+    pub brk_bump: u64,
     pub mmap_bump: u64,
     pub fd_table: [Option<FileDescriptor>; 64],
 }
@@ -43,6 +44,7 @@ pub fn reset_core2_process() {
         CURRENT_PID[core_id].store(core_id, core::sync::atomic::Ordering::Release);
         PROCESS_LOCK.lock();
         PROCESS_TABLE[core_id] = Some(ProcessState {
+            brk_bump: 0x0000_5000_0000_0000,
             mmap_bump: 0x0000_7000_0000_0000,
             fd_table: [const { None }; 64],
         });
@@ -453,12 +455,20 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             } else { frame.rax = -9i64 as u64; }
         }
         9 => { // mmap
-            let len = frame.rsi as usize; let flags = frame.r10;
+            let req_addr = frame.rdi;
+            let len = frame.rsi as usize;
+            let flags = frame.r10;
             if (flags & 0x20) != 0 || len > 0 {
                 let pages = (len + 0xFFF) / 4096;
-                let proc = get_current_process();
-                let vaddr = proc.mmap_bump;
-                proc.mmap_bump += (pages * 4096) as u64;
+                let is_fixed = (flags & 0x10) != 0 && req_addr != 0 && req_addr < 0x0000_7FFF_0000_0000;
+                let vaddr = if is_fixed {
+                    req_addr & !0xFFF
+                } else {
+                    let proc = get_current_process();
+                    let va = proc.mmap_bump;
+                    proc.mmap_bump += (pages * 4096) as u64;
+                    va
+                };
                 let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
                 if crate::mm::paging::map_user_pages(cur_pml4, vaddr, pages).is_err() {
                     frame.rax = -12i64 as u64;
@@ -469,21 +479,24 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             } else { frame.rax = -38i64 as u64; }
         }
         11 => { frame.rax = 0; }
-        12 => { // brk
+        12 => { // brk (dedicated address space separate from mmap_bump)
             let addr = frame.rdi;
             let proc = get_current_process();
-            if addr == 0 { frame.rax = proc.mmap_bump; } else {
-                let current = proc.mmap_bump;
-                if addr > current {
+            if addr == 0 {
+                frame.rax = proc.brk_bump;
+            } else {
+                let current = proc.brk_bump;
+                if addr > current && addr < 0x0000_6FFF_0000_0000 {
                     let pages = ((addr - current) as usize + 0xFFF) / 4096;
                     let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
                     if crate::mm::paging::map_user_pages(cur_pml4, current, pages).is_err() {
-                        frame.rax = current; return;
+                        frame.rax = current;
+                        return;
                     }
-                    proc.mmap_bump = (addr + 0xFFF) & !0xFFF;
+                    proc.brk_bump = (addr + 0xFFF) & !0xFFF;
                     crate::task::record_proc_mem(cur_core, (pages * 4096) as u64);
                 }
-                frame.rax = addr;
+                frame.rax = proc.brk_bump;
             }
         }
         16 => { // ioctl
@@ -556,6 +569,31 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         24 => { // sched_yield
             crate::task::yield_now();
             frame.rax = 0;
+        }
+        25 => { // mremap(old_addr, old_size, new_size, flags)
+            let old_addr = frame.rdi;
+            let old_size = frame.rsi as usize;
+            let new_size = frame.rdx as usize;
+            if new_size <= old_size {
+                frame.rax = old_addr;
+            } else {
+                let pages = (new_size + 0xFFF) / 4096;
+                let proc = get_current_process();
+                let vaddr = proc.mmap_bump;
+                proc.mmap_bump += (pages * 4096) as u64;
+                let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
+                if crate::mm::paging::map_user_pages(cur_pml4, vaddr, pages).is_err() {
+                    frame.rax = -12i64 as u64;
+                } else {
+                    if old_addr != 0 && old_size > 0 && validate_user_range(old_addr, old_size) {
+                        unsafe {
+                            core::ptr::copy_nonoverlapping(old_addr as *const u8, vaddr as *mut u8, old_size);
+                        }
+                    }
+                    crate::task::record_proc_mem(cur_core, (pages * 4096) as u64);
+                    frame.rax = vaddr;
+                }
+            }
         }
         60 => { // exit
             if cur_core == 2 {
@@ -716,12 +754,21 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             THREAD_CLEAR_TID[cur_core].store(tidptr, Ordering::SeqCst);
             frame.rax = cur_core as u64;
         }
+        110 => { frame.rax = 1; } // getppid
         228 => { // clock_gettime
             let tp_ptr = frame.rsi;
             if validate_user_range(tp_ptr, 16) {
                 let s = pit::get_uptime_seconds(); let ns = (pit::get_ticks() % 1000) * 1_000_000; let tp = [s as u64, ns as u64];
                 let _ = copy_to_user(tp_ptr, unsafe { core::slice::from_raw_parts(tp.as_ptr() as *const u8, 16) }); frame.rax = 0;
             } else { frame.rax = -14i64 as u64; }
+        }
+        229 => { // clock_getres
+            let tp_ptr = frame.rsi;
+            if tp_ptr != 0 && validate_user_range(tp_ptr, 16) {
+                let res: [u64; 2] = [0, 1_000_000];
+                let _ = copy_to_user(tp_ptr, unsafe { core::slice::from_raw_parts(res.as_ptr() as *const u8, 16) });
+            }
+            frame.rax = 0;
         }
         231 => { // exit_group
             if cur_core == 2 {
@@ -1155,6 +1202,13 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         548 => { // sys_kill_proc(pid) -> 1 if terminated else 0
             frame.rax = if crate::task::terminate_proc_by_pid(frame.rdi as u32) { 1 } else { 0 };
         }
+        550 => { // sys_power(cmd: 1=Reboot, 2=Shutdown)
+            match frame.rdi {
+                1 => crate::arch::x86_64::power::reboot(),
+                2 => crate::arch::x86_64::power::shutdown(),
+                _ => { frame.rax = -22i64 as u64; }
+            }
+        }
         520 => { // sys_agent_dispatch (Agent Sandbox & Telemetry Protocol)
             let cmd_id = frame.rdi as u32;
             let arg_ptr = frame.rsi;
@@ -1322,6 +1376,7 @@ pub fn get_current_process() -> &'static mut ProcessState {
         let pid = CURRENT_PID[core_id].load(core::sync::atomic::Ordering::Acquire);
         if PROCESS_TABLE[pid].is_none() {
             PROCESS_TABLE[pid] = Some(ProcessState {
+                brk_bump: 0x0000_5000_0000_0000,
                 mmap_bump: 0x0000_7000_0000_0000,
                 fd_table: [const { None }; 64],
             });

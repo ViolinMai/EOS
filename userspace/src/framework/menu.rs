@@ -39,10 +39,12 @@ impl Win7StartMenu {
             right_items: vec![
                 ("EOS SHARE", "Finder", "EOS SHARE", "lib"),
                 ("TEST_SUBJECT", "Finder", "EOS SHARE/TEST_SUBJECT", "tune"),
-                ("RootFS (EXT2)", "Finder", "RootFS", "virtual"),
+                ("r (EXT2 Root)", "Finder", "r", "virtual"),
                 ("Home (/home/march)", "Finder", "home/march", "lib"),
                 ("Initrd Ramdisk", "Finder", "Initrd", "disc"),
                 ("System Settings", "Settings", "", "settings"),
+                ("Reboot EOS", "__REBOOT__", "", "tune"),
+                ("Shutdown EOS", "__SHUTDOWN__", "", "disc"),
             ],
             hovered_left: None,
             hovered_right: None,

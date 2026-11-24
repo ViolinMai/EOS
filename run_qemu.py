@@ -29,12 +29,14 @@ else:
 
 def lfn_checksum(short_name_bytes):
     chk = 0
-    for b in short_name_bytes: chk = (((chk & 1) << 7) + (chk >> 1) + b) & 0xFF
+    for b in short_name_bytes:
+        chk = (((chk & 1) << 7) + (chk >> 1) + b) & 0xFF
     return chk
 
 def make_lfn_entry(order, long_name_slice, checksum, is_last=False):
     chars = [ord(c) for c in long_name_slice]
-    while len(chars) < 13: chars.append(0xFFFF if len(chars) > len(long_name_slice) else 0x0000)
+    while len(chars) < 13:
+        chars.append(0xFFFF if len(chars) > len(long_name_slice) else 0x0000)
     entry = bytearray(32)
     entry[0] = (order | 0x40) if is_last else order
     struct.pack_into("<5H", entry, 1, *chars[0:5])
@@ -53,10 +55,12 @@ def build_userspace_app():
     env.pop("RUSTFLAGS", None)
     print(f"[*] Executing Cargo Build for Userspace: {' '.join(cmd)}")
     res = subprocess.run(cmd, shell=(os.name == "nt"), env=env)
-    if res.returncode != 0: return None
+    if res.returncode != 0:
+        return None
     bin_path = os.path.join(userspace_dir, "target", "x86_64-unknown-linux-musl", "release", "user_app")
     if os.path.exists(bin_path):
-        with open(bin_path, "rb") as f: return f.read()
+        with open(bin_path, "rb") as f:
+            return f.read()
     return None
 
 def create_demo_tar(user_elf_data):
@@ -82,13 +86,12 @@ def make_uefi_fat32_disk(img_path, files):
     CLUSTER_SIZE = SECTORS_PER_CLUSTER * SECTOR_SIZE
     RESERVED_SECTORS = 32
     NUM_FATS = 2
-    TOTAL_SECTORS = 131072 # 64 MB Superfloppy
+    TOTAL_SECTORS = 131072
     FAT_SIZE_SECTORS = 1024
     ROOT_CLUSTER = 2
 
     disk = bytearray(TOTAL_SECTORS * SECTOR_SIZE)
 
-    # VBR (Volume Boot Record) مباشرة في القطاع 0 بدون MBR
     vbr = bytearray(SECTOR_SIZE)
     vbr[0:3] = b"\xEB\x58\x90"
     vbr[3:11] = b"MSWIN4.1"
@@ -226,7 +229,7 @@ def make_ext2_disk(img_path):
     if os.path.exists(img_path) and os.path.getsize(img_path) == expected_file_size:
         return
 
-    print(f"[*] Formatting 2 GB Standard FHS Linux EXT2 RootFS for user 'march' ({img_path})...")
+    print(f"[*] Formatting 2 GB Standard FHS Linux EXT2 RootFS ({img_path})...")
     INODES_COUNT = 32768
     BLOCKS_PER_GROUP = 8192
     INODES_PER_GROUP = 256
@@ -375,69 +378,74 @@ def prepare_and_run(cli_args=None):
 
     if not args.skip_build:
         print("[*] Building Userspace App...")
-    user_elf = build_userspace_app()
-    if not user_elf:
-        print("\n[!] ABORTING: user_app.elf could not be built successfully.")
-        sys.exit(1)
+        user_elf = build_userspace_app()
+        if not user_elf:
+            print("\n[!] ABORTING: user_app.elf could not be built successfully.")
+            sys.exit(1)
 
-    print("[*] Building EOS Kernel (Release, LTO)...")
-    env = os.environ.copy(); env.pop("RUSTFLAGS", None)
-    res = subprocess.run([CARGO_BIN, "build", "--release", "-Z", "build-std=core,alloc"], shell=(os.name == "nt"), env=env)
-    if res.returncode != 0:
-        print("\n[!] ABORTING: kernel build failed.")
-        sys.exit(1)
+        print("[*] Building EOS Kernel (Release, LTO)...")
+        env = os.environ.copy()
+        env.pop("RUSTFLAGS", None)
+        res = subprocess.run([CARGO_BIN, "build", "--release", "-Z", "build-std=core,alloc"], shell=(os.name == "nt"), env=env)
+        if res.returncode != 0:
+            print("\n[!] ABORTING: kernel build failed.")
+            sys.exit(1)
 
-    target_dir = "target"; os.makedirs(target_dir, exist_ok=True)
-    kernel_src = os.path.join(target_dir, "x86_64-unknown-none", "release", "EOS")
-    bootx64_path = os.path.join(target_dir, "BOOTX64_v10.EFI")
+        kernel_src = os.path.join(target_dir, "x86_64-unknown-none", "release", "EOS")
+        bootx64_path = os.path.join(target_dir, "BOOTX64_v10.EFI")
 
-    if not os.path.exists(bootx64_path):
-        print("[*] Downloading Limine BOOTX64.EFI v10...")
-        urllib.request.urlretrieve(LIMINE_BOOTX64_URL, bootx64_path)
+        if not os.path.exists(bootx64_path):
+            print("[*] Downloading Limine BOOTX64.EFI v10...")
+            urllib.request.urlretrieve(LIMINE_BOOTX64_URL, bootx64_path)
 
-    with open(kernel_src, "rb") as f: kernel_data = f.read()
-    with open("limine.conf", "rb") as f: conf_data = f.read()
-    with open(bootx64_path, "rb") as f: bootx64_data = f.read()
+        with open(kernel_src, "rb") as f:
+            kernel_data = f.read()
+        with open("limine.conf", "rb") as f:
+            conf_data = f.read()
+        with open(bootx64_path, "rb") as f:
+            bootx64_data = f.read()
 
-    tar_data = create_demo_tar(user_elf)
-    img_path = os.path.join(target_dir, "uefi_hdd.img")
-    make_uefi_fat32_disk(img_path, { "EOS": kernel_data, "limine.conf": conf_data, "BOOTX64.EFI": bootx64_data, "initrd.tar": tar_data })
+        tar_data = create_demo_tar(user_elf)
+        make_uefi_fat32_disk(img_path, {"EOS": kernel_data, "limine.conf": conf_data, "BOOTX64.EFI": bootx64_data, "initrd.tar": tar_data})
 
-    efi_boot_share = os.path.join(share_dir, "EFI", "BOOT")
-    os.makedirs(efi_boot_share, exist_ok=True)
-    with open(os.path.join(efi_boot_share, "BOOTX64.EFI"), "wb") as f: f.write(bootx64_data)
-    with open(os.path.join(share_dir, "limine.conf"), "wb") as f: f.write(conf_data)
-    with open(os.path.join(share_dir, "EOS"), "wb") as f: f.write(kernel_data)
-    with open(os.path.join(share_dir, "INITRD.TAR"), "wb") as f: f.write(tar_data)
-    with open(os.path.join(share_dir, "startup.nsh"), "wb") as f:
-        f.write(b"\\EFI\\BOOT\\BOOTX64.EFI\r\n")
+        efi_boot_share = os.path.join(share_dir, "EFI", "BOOT")
+        os.makedirs(efi_boot_share, exist_ok=True)
+        with open(os.path.join(efi_boot_share, "BOOTX64.EFI"), "wb") as f:
+            f.write(bootx64_data)
+        with open(os.path.join(share_dir, "limine.conf"), "wb") as f:
+            f.write(conf_data)
+        with open(os.path.join(share_dir, "EOS"), "wb") as f:
+            f.write(kernel_data)
+        with open(os.path.join(share_dir, "INITRD.TAR"), "wb") as f:
+            f.write(tar_data)
+        with open(os.path.join(share_dir, "startup.nsh"), "wb") as f:
+            f.write(b"\\EFI\\BOOT\\BOOTX64.EFI\r\n")
 
-    ext2_img_path = os.path.join(target_dir, "rootfs.ext2"); make_ext2_disk(ext2_img_path)
+        make_ext2_disk(ext2_img_path)
 
-    settings_img_path = os.path.join(target_dir, "settings.img")
-    if not os.path.exists(settings_img_path) or os.path.getsize(settings_img_path) == 0:
-        default_payload = b"dark_mode=false\nui_scale=2\nwallpaper=\n"
-        crc = 0xFFFFFFFF
-        for b in default_payload:
-            crc ^= b
-            for _ in range(8):
-                crc = (crc >> 1) ^ 0xEDB88320 if (crc & 1) else (crc >> 1)
-        crc = (~crc) & 0xFFFFFFFF
+        if not os.path.exists(settings_img_path) or os.path.getsize(settings_img_path) == 0:
+            default_payload = b"dark_mode=false\nui_scale=2\nwallpaper=\n"
+            crc = 0xFFFFFFFF
+            for b in default_payload:
+                crc ^= b
+                for _ in range(8):
+                    crc = (crc >> 1) ^ 0xEDB88320 if (crc & 1) else (crc >> 1)
+            crc = (~crc) & 0xFFFFFFFF
 
-        sec0 = bytearray(512)
-        sec0[0:4] = b"EOSS"
-        struct.pack_into("<H", sec0, 4, 1)
-        struct.pack_into("<H", sec0, 6, len(default_payload))
-        struct.pack_into("<I", sec0, 8, crc)
-        sec0[20:20 + len(default_payload)] = default_payload
+            sec0 = bytearray(512)
+            sec0[0:4] = b"EOSS"
+            struct.pack_into("<H", sec0, 4, 1)
+            struct.pack_into("<H", sec0, 6, len(default_payload))
+            struct.pack_into("<I", sec0, 8, crc)
+            sec0[20:20 + len(default_payload)] = default_payload
 
-        with open(settings_img_path, "wb") as f:
-            f.write(sec0)
-            f.write(bytearray((1024 * 1024) - 512))
+            with open(settings_img_path, "wb") as f:
+                f.write(sec0)
+                f.write(bytearray((1024 * 1024) - 512))
 
-        if args.build_only:
-            print("[+] Build and disk image packaging completed (--build-only).")
-            return
+    if args.build_only:
+        print("[+] Build and disk image packaging completed (--build-only).")
+        return
 
     code_fd = None
     orig_vars = None
@@ -482,8 +490,10 @@ def prepare_and_run(cli_args=None):
 
     vars_dst = os.path.join(target_dir, "vars.fd")
     if os.path.exists(vars_dst):
-        try: os.remove(vars_dst)
-        except Exception: pass
+        try:
+            os.remove(vars_dst)
+        except Exception:
+            pass
 
     pflash_vars_args = []
     if orig_vars and os.path.exists(orig_vars):
@@ -491,7 +501,8 @@ def prepare_and_run(cli_args=None):
         pflash_vars_args = ["-drive", f"if=pflash,format=raw,file={vars_dst}"]
 
     print("[*] Starting Gamepad Bridge Server...")
-    bridge_proc = subprocess.Popen([sys.executable, "gamepad_bridge.py"]); time.sleep(0.3)
+    bridge_proc = subprocess.Popen([sys.executable, "gamepad_bridge.py"])
+    time.sleep(0.3)
 
     serial_arg = f"file:{args.serial_file}" if args.serial_file else "stdio"
     extra_qemu_args = []
@@ -519,7 +530,10 @@ def prepare_and_run(cli_args=None):
         "-netdev", ("user,id=n0,hostfwd=udp::68-:68" if os.name == "nt" else "user,id=n0,hostfwd=udp::6868-:68"), "-device", "e1000,netdev=n0",
         "-serial", serial_arg, "-d", "guest_errors", "-no-reboot", "-no-shutdown"
     ] + extra_qemu_args
-    try: subprocess.run(qemu_cmd)
-    finally: bridge_proc.terminate()
+    try:
+        subprocess.run(qemu_cmd)
+    finally:
+        bridge_proc.terminate()
 
-if __name__ == "__main__": prepare_and_run()
+if __name__ == "__main__":
+    prepare_and_run()

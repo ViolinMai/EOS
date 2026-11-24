@@ -687,8 +687,52 @@ pub fn init() {
             let cursor_notify_addr = (notify_virt_base + (c_notify_off * notify_mult as u64)) as *mut u16;
             let width = 2560usize;
             let height = 1440usize;
-            let buf0 = alloc::vec![0xFF0B2A4Au32; width * height];
-            let buf1 = alloc::vec![0xFF0B2A4Au32; width * height];
+            let mut buf0 = alloc::vec![0xFF000000u32; width * height];
+            let buf1 = alloc::vec![0xFF000000u32; width * height];
+
+            // Render EOS Boot Splash directly onto VirtIO-GPU scanout buffer
+            let bmp_w = crate::splash_data::SPLASH_BITMAP_W;
+            let bmp_h = crate::splash_data::SPLASH_BITMAP_H;
+            let start_x = width.saturating_sub(bmp_w) / 2;
+            let start_y = (height.saturating_sub(bmp_h) / 2).saturating_sub(40);
+            let bytes_per_row = (bmp_w + 7) / 8;
+            for by in 0..bmp_h {
+                let py = start_y + by;
+                if py >= height { break; }
+                let row_off = py * width;
+                for bx in 0..bytes_per_row {
+                    let bidx = by * bytes_per_row + bx;
+                    if bidx >= crate::splash_data::SPLASH_BITMAP.len() { break; }
+                    let val = crate::splash_data::SPLASH_BITMAP[bidx];
+                    if val == 0 { continue; }
+                    for bit in 0..8 {
+                        if (val & (1 << (7 - bit))) != 0 {
+                            let px = start_x + bx * 8 + bit;
+                            if px < width {
+                                buf0[row_off + px] = 0xFFFFFFFF;
+                            }
+                        }
+                    }
+                }
+            }
+            let dot_y = (start_y + bmp_h + 44) as isize;
+            let mid_x = (width / 2) as isize;
+            for i in 0..3isize {
+                let cx = mid_x + (i - 1) * 32;
+                let r: isize = if i == 1 { 7 } else { 5 };
+                let col: u32 = if i == 1 { 0xFF38BDF8 } else { 0xFF475569 };
+                for dy in -r..=r {
+                    for dx in -r..=r {
+                        if dx * dx + dy * dy <= r * r {
+                            let px = (cx + dx) as usize;
+                            let py = (dot_y + dy) as usize;
+                            if px < width && py < height {
+                                buf0[py * width + px] = col;
+                            }
+                        }
+                    }
+                }
+            }
             let phys0 = (buf0.as_ptr() as u64) - hhdm;
             let phys1 = (buf1.as_ptr() as u64) - hhdm;
 

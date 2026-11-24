@@ -273,7 +273,7 @@ Phase 3: Developer Diagnostics, Framework Controls & Core Apps (M12–M21)
 
         Steps: []
 
-    [ ] Milestone 19: Terminal Tab Auto-Completion, Output Redirection & System Commands
+    [x] Milestone 19: Terminal Tab Auto-Completion, Output Redirection & System Commands
 
         ID: m19_terminal_shell_upgrades
 
@@ -285,7 +285,7 @@ Phase 3: Developer Diagnostics, Framework Controls & Core Apps (M12–M21)
 
         Steps: []
 
-    [ ] Milestone 20: TextEdit Syntax Highlighting, Undo/Redo & Save-As Portal
+    [x] Milestone 20: TextEdit Syntax Highlighting, Undo/Redo & Save-As Portal
 
         ID: m20_textedit_code_features
 
@@ -297,7 +297,7 @@ Phase 3: Developer Diagnostics, Framework Controls & Core Apps (M12–M21)
 
         Steps: []
 
-    [ ] Milestone 21: Global Keyboard Shortcuts & Screenshot Capture (PrintScreen)
+    [x] Milestone 21: Global Keyboard Shortcuts & Screenshot Capture (PrintScreen)
 
         ID: m21_global_shortcuts_screenshot
 
@@ -311,7 +311,7 @@ Phase 3: Developer Diagnostics, Framework Controls & Core Apps (M12–M21)
 
 Phase 4: Static CPython 3.12 Runtime & System Automation (M22–M26)
 
-    [ ] Milestone 22: Static libpython3.12.a Cross-Compilation & FFI Bridge (ffi_python.c)
+    [x] Milestone 22: Static libpython3.12.a Cross-Compilation & FFI Bridge (ffi_python.c)
 
         ID: m22_cpython_static_link
 
@@ -323,7 +323,7 @@ Phase 4: Static CPython 3.12 Runtime & System Automation (M22–M26)
 
         Steps: []
 
-    [ ] Milestone 23: eos Built-in Python C-Extension Module (eos.gui, eos.sys, eos.audio)
+    [x] Milestone 23: eos Built-in Python C-Extension Module (eos.gui, eos.sys, eos.audio)
 
         ID: m23_cpython_eos_module
 
@@ -335,7 +335,7 @@ Phase 4: Static CPython 3.12 Runtime & System Automation (M22–M26)
 
         Steps: []
 
-    [ ] Milestone 24: python CLI Execution & Interactive REPL in Terminal & tty2
+    [x] Milestone 24: python CLI Execution & Interactive REPL in Terminal & tty2
 
         ID: m24_terminal_cpython_runner
 
@@ -347,7 +347,7 @@ Phase 4: Static CPython 3.12 Runtime & System Automation (M22–M26)
 
         Steps: []
 
-    [ ] Milestone 25: TEST_SUBJECT/01_math_matrix.py Real CPython Verification
+    [x] Milestone 25: TEST_SUBJECT/01_math_matrix.py Real CPython Verification
 
         ID: m25_cpython_test_subject_verify
 
@@ -359,7 +359,7 @@ Phase 4: Static CPython 3.12 Runtime & System Automation (M22–M26)
 
         Steps: []
 
-    [ ] Milestone 26: Background Python Automation Service (eos_auto.py)
+    [x] Milestone 26: Background Python Automation Service (eos_auto.py)
 
         ID: m26_cpython_background_service
 
@@ -373,7 +373,7 @@ Phase 4: Static CPython 3.12 Runtime & System Automation (M22–M26)
 
 Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
-    [ ] Milestone 27: PAT / Write-Combining (WC) Framebuffer Acceleration
+    [x] Milestone 27: PAT / Write-Combining (WC) Framebuffer Acceleration
 
         ID: m27_hw_write_combining_fb
 
@@ -421,7 +421,7 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
         Steps: []
 
-    [ ] Milestone 31: Clean ACPI Shutdown, Reboot & Disk Sync
+    [x] Milestone 31: Clean ACPI Shutdown, Reboot & Disk Sync
 
         ID: m31_clean_power_management
 
@@ -433,14 +433,52 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
         Steps: []
 
-    [ ] Milestone 32: Full System Stress & Bare-Metal Readiness Certification
+        [ ] Milestone 32: Full System Stress & Bare-Metal Readiness Certification
 
-        ID: m32_eos_gold_certification
+            ID: m32_eos_gold_certification
 
-        Goal: Run end-to-end verification across multi-process GUI apps, RTL/Arabic rendering, CPython automation, Ctrl+Alt+F2 TTY switching, and hardware drivers, exporting /EOS SHARE/TEST_SUBJECT/eos_certification.json and emitting EOS_CERTIFIED:PASS:32_OF_32.
+            Goal: Run end-to-end verification across multi-process GUI apps, RTL/Arabic rendering, CPython automation, Ctrl+Alt+F2 TTY switching, and hardware drivers, exporting /EOS SHARE/TEST_SUBJECT/eos_certification.json and emitting EOS_CERTIFIED:PASS:32_OF_32.
 
-        Files: userspace/src/test_subject.rs, test_eos_audit.py
+            Files: userspace/src/test_subject.rs, test_eos_audit.py
 
-        Expect: EOS_CERTIFIED:PASS:32_OF_32
+            Expect: EOS_CERTIFIED:PASS:32_OF_32
 
-        Steps: []
+            Steps: []
+
+    Phase 6: Local Networking, SSH & Network Storage (M33–M35)
+
+        [ ] Milestone 33: Local Network (LAN) DHCP Client, ARP Discovery & Host Ping
+
+            ID: m33_lan_dhcp_discovery
+
+            Goal: Upgrade userspace/src/net_manager.rs with dynamic DHCP IPv4 lease acquisition, LAN neighbor ARP table scanning, and interactive ping/ifconfig commands in Terminal. Emit NET_LAN:PASS:DHCP_And_Discovery_Ready.
+
+            Files: userspace/src/net_manager.rs, userspace/src/apps/terminal.rs
+
+            Expect: NET_LAN:PASS:DHCP_And_Discovery_Ready
+
+            Steps: []
+
+        [ ] Milestone 34: SSH Client & Server (SSH-2 / Ed25519 / ChaCha20-Poly1305)
+
+            ID: m34_ssh_client_server
+
+            Goal: Implement SSH-2 transport, key exchange, and interactive PTY shell over TCP port 22 (ssh user@host in Terminal + background sshd service for remote root login). Emit NET_SSH:PASS:SSH2_Ready.
+
+            Files: userspace/src/net_manager.rs, userspace/src/apps/terminal.rs
+
+            Expect: NET_SSH:PASS:SSH2_Ready
+
+            Steps: []
+
+        [ ] Milestone 35: Network Storage Mount (SMB / WebDAV / 9P Share in Finder & VFS)
+
+            ID: m35_network_storage_mount
+
+            Goal: Mount remote LAN network shares (SMB/WebDAV/HTTP-FS) directly into VFS under /net/<host> so Finder, Video Player, and Terminal can browse and stream remote files seamlessly. Emit NET_STORAGE:PASS:Remote_Share_Mounted.
+
+            Files: src/fs/mod.rs, userspace/src/net_manager.rs, userspace/src/apps/finder.rs
+
+            Expect: NET_STORAGE:PASS:Remote_Share_Mounted
+
+            Steps: []

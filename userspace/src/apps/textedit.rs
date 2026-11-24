@@ -18,6 +18,9 @@ pub struct TextEditApp {
     // Search (Ctrl + F)
     pub find_active: bool,
     pub find_query: String,
+    // Undo / Redo Stacks (Milestone 20)
+    pub undo_stack: Vec<(Vec<String>, usize, usize)>,
+    pub redo_stack: Vec<(Vec<String>, usize, usize)>,
 }
 
 impl TextEditApp {
@@ -37,6 +40,8 @@ impl TextEditApp {
             clipboard: String::new(),
             find_active: false,
             find_query: String::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
         }
     }
 
@@ -67,6 +72,47 @@ impl TextEditApp {
         }
     }
 
+    pub fn push_undo(&mut self) {
+        if self.undo_stack.len() >= 64 {
+            self.undo_stack.remove(0);
+        }
+        self.undo_stack.push((self.lines.clone(), self.cursor_row, self.cursor_col));
+        self.redo_stack.clear();
+    }
+
+    pub fn undo(&mut self) {
+        if let Some((lines, row, col)) = self.undo_stack.pop() {
+            self.redo_stack.push((self.lines.clone(), self.cursor_row, self.cursor_col));
+            self.lines = lines;
+            self.cursor_row = row.min(self.lines.len().saturating_sub(1));
+            self.cursor_col = col.min(self.lines[self.cursor_row].len());
+            self.sel_start = None;
+            self.is_modified = true;
+            self.status_text = "Undo".into();
+        }
+    }
+
+    pub fn redo(&mut self) {
+        if let Some((lines, row, col)) = self.redo_stack.pop() {
+            self.undo_stack.push((self.lines.clone(), self.cursor_row, self.cursor_col));
+            self.lines = lines;
+            self.cursor_row = row.min(self.lines.len().saturating_sub(1));
+            self.cursor_col = col.min(self.lines[self.cursor_row].len());
+            self.sel_start = None;
+            self.is_modified = true;
+            self.status_text = "Redo".into();
+        }
+    }
+
+    pub fn request_save_as(&mut self) {
+        let _ = crate::framework::portal::request_portal(PortalRequest {
+            kind: PortalKind::FilePicker,
+            caller: "TextEdit".into(),
+            payload: "txt,rs,py,c,ini,json,md".into(),
+        });
+        self.status_text = "Save As: choose destination via FilePicker...".into();
+    }
+
     pub fn save(&mut self) {
         if let Some(ref path) = self.file_path {
             let content = self.lines.join("\n");
@@ -75,6 +121,73 @@ impl TextEditApp {
                 self.status_text = format!("Saved: {}", path);
             } else {
                 self.status_text = format!("Error saving: {}", path);
+            }
+        } else {
+            self.request_save_as();
+        }
+    }
+
+    fn is_code_file(&self) -> bool {
+        let l = self.title.to_ascii_lowercase();
+        l.ends_with(".rs") || l.ends_with(".py") || l.ends_with(".c") || l.ends_with(".ini") || l.ends_with(".json")
+    }
+
+    fn draw_highlighted_line(&self, canvas: &mut Canvas, x: i32, y: i32, line: &str, font_size: usize) {
+        if !self.is_code_file() {
+            canvas.draw_text(x, y, line, 0xFFF4F4F5, font_size);
+            return;
+        }
+        let trimmed = line.trim_start();
+        if trimmed.starts_with("//") || trimmed.starts_with('#') || trimmed.starts_with(';') {
+            canvas.draw_text(x, y, line, 0xFF6A9955, font_size);
+            return;
+        }
+        let keywords = [
+            "fn", "let", "mut", "pub", "struct", "enum", "impl", "match", "if", "else", "for", "while", "return",
+            "use", "mod", "def", "class", "import", "from", "int", "void", "char", "const", "static", "true", "false",
+        ];
+        let mut cur_x = x;
+        let mut chars = line.char_indices().peekable();
+        while let Some((idx, ch)) = chars.next() {
+            if ch == '"' || ch == '\'' {
+                let q = ch;
+                let mut end = line.len();
+                while let Some((j, c2)) = chars.next() {
+                    if c2 == q {
+                        end = j + c2.len_utf8();
+                        break;
+                    }
+                }
+                let tok = &line[idx..end];
+                canvas.draw_text(cur_x, y, tok, 0xFFCE9178, font_size);
+                let (tw, _) = canvas.measure_text(tok, font_size);
+                cur_x += tw as i32;
+            } else if ch.is_ascii_alphanumeric() || ch == '_' {
+                let mut end = idx + ch.len_utf8();
+                while let Some(&(j, c2)) = chars.peek() {
+                    if c2.is_ascii_alphanumeric() || c2 == '_' {
+                        end = j + c2.len_utf8();
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                let tok = &line[idx..end];
+                let col = if keywords.contains(&tok) {
+                    0xFF569CD6
+                } else if tok.chars().all(|c| c.is_ascii_digit()) {
+                    0xFFB5CEA8
+                } else {
+                    0xFFF4F4F5
+                };
+                canvas.draw_text(cur_x, y, tok, col, font_size);
+                let (tw, _) = canvas.measure_text(tok, font_size);
+                cur_x += tw as i32;
+            } else {
+                let tok = &line[idx..idx + ch.len_utf8()];
+                canvas.draw_text(cur_x, y, tok, 0xFFD4D4D4, font_size);
+                let (tw, _) = canvas.measure_text(tok, font_size);
+                cur_x += tw as i32;
             }
         }
     }
@@ -193,7 +306,7 @@ impl Widget for TextEditApp {
             canvas.draw_text(self.bounds.x + theme.pt(8.0), y, &num_str, 0xFF71717A, theme.font_caption());
 
             let text_x = self.bounds.x + theme.pt(48.0);
-            canvas.draw_text(text_x, y, line, 0xFFF4F4F5, theme.font_body());
+            self.draw_highlighted_line(canvas, text_x, y, line, theme.font_body());
 
             // Highlight selection
             if let Some(start) = self.sel_start {
@@ -260,7 +373,12 @@ impl Widget for TextEditApp {
 
         if is_ctrl {
             match keycode {
-                0x1F => { self.save(); return true; } // Ctrl+S
+                0x1F => {
+                    if is_shift { self.request_save_as(); } else { self.save(); }
+                    return true;
+                } // Ctrl+S / Ctrl+Shift+S
+                0x2C => { self.undo(); return true; } // Ctrl+Z
+                0x15 => { self.redo(); return true; } // Ctrl+Y
                 0x2E => { // Ctrl+C (Copy)
                     if let Some(text) = self.get_selected_text() {
                         let _ = crate::syscall::sys_clipboard_set(&text);
@@ -271,6 +389,7 @@ impl Widget for TextEditApp {
                 }
                 0x2D => { // Ctrl+X (Cut)
                     if let Some(text) = self.get_selected_text() {
+                        self.push_undo();
                         let _ = crate::syscall::sys_clipboard_set(&text);
                         self.clipboard = text;
                         self.delete_selection();
@@ -284,6 +403,7 @@ impl Widget for TextEditApp {
                         clip = self.clipboard.clone();
                     }
                     if !clip.is_empty() {
+                        self.push_undo();
                         self.delete_selection();
                         for c in clip.chars() {
                             if c == '\n' {
@@ -348,6 +468,7 @@ impl Widget for TextEditApp {
                 true
             }
             0x0E => { // Backspace
+                self.push_undo();
                 if self.sel_start.is_some() {
                     self.delete_selection();
                 } else if self.cursor_col > 0 {
@@ -369,6 +490,7 @@ impl Widget for TextEditApp {
                     self.find_next();
                     return true;
                 }
+                self.push_undo();
                 self.delete_selection();
                 let cur_str = &self.lines[self.cursor_row];
                 let remainder = cur_str[self.cursor_col..].to_string();
@@ -392,6 +514,7 @@ impl Widget for TextEditApp {
         }
 
         if c >= ' ' && c != '\x7F' {
+            self.push_undo();
             self.delete_selection();
             self.lines[self.cursor_row].insert(self.cursor_col, c);
             self.cursor_col += 1;

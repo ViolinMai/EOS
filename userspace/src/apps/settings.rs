@@ -42,7 +42,7 @@ impl SettingsApp {
         let mut mono_font = crate::framework::fonts::active_font_name(FontRole::Mono);
         let mut active_wallpaper = "none".to_string();
 
-        if let Ok(c) = fs::read_to_string("RootFS/settings.ini").or_else(|_| fs::read_to_string("settings.ini")) {
+        if let Ok(c) = fs::read_to_string("r/settings.ini").or_else(|_| fs::read_to_string("settings.ini")) {
             for line in c.lines() {
                 let l = line.trim();
                 if let Some(v) = l.strip_prefix("dark_mode=") {
@@ -144,7 +144,7 @@ impl SettingsApp {
             self.mono_font,
             self.active_wallpaper
         );
-        let _ = fs::write("RootFS/settings.ini", &ini);
+        let _ = fs::write("r/settings.ini", &ini);
         let _ = fs::write("settings.ini", &ini);
         redraw_fullscreen();
     }
