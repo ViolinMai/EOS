@@ -44,13 +44,12 @@ impl StyledLine {
 
 pub struct TerminalApp {
     bounds: Rect,
+    shell: crate::shell::ShellSession,
     history: Vec<StyledLine>,
     input: String,
     cursor_idx: usize,
-    cmd_history: Vec<String>,
     history_idx: Option<usize>,
     scroll_y: i32,
-    current_dir: String,
     // Mouse text selection (enabled by default in Terminal)
     selectable: bool,
     is_selecting: bool,
@@ -63,32 +62,29 @@ pub struct TerminalApp {
 
 impl TerminalApp {
     pub fn new() -> Self {
-        let mut app = Self {
+        Self {
             bounds: Rect::default(),
+            shell: crate::shell::ShellSession::new(),
             history: vec![
                 StyledLine::spans(vec![
                     ("EOS 0.1.0".into(), 0xFF38BDF8),
                     ("  •  ".into(), 0xFF475569),
-                    ("root@eos".into(), 0xFF34D399),
+                    ("root@eos (Unified POSIX)".into(), 0xFF34D399),
                     ("  •  Ctrl+Shift+C: Copy  |  Ctrl+C: Cancel".into(), 0xFF64748B),
                 ]),
                 StyledLine::plain("", 0xFFFFFFFF),
             ],
             input: String::new(),
             cursor_idx: 0,
-            cmd_history: Vec::new(),
             history_idx: None,
             scroll_y: 0,
-            current_dir: "/".into(),
             selectable: true,
             is_selecting: false,
             sel_start: None,
             sel_end: None,
             cursor_visible: true,
             last_blink: Instant::now(),
-        };
-        app.load_history_from_disk();
-        app
+        }
     }
 
     pub fn tick_cursor(&mut self) -> bool {
@@ -114,33 +110,7 @@ impl TerminalApp {
     }
 
     fn prompt_prefix(&self) -> String {
-        let disp_dir = if self.current_dir == "/" {
-            "~".to_string()
-        } else {
-            self.current_dir.clone()
-        };
-        format!("root@eos {}> ", disp_dir)
-    }
-
-    fn load_history_from_disk(&mut self) {
-        for p in ["/home/march/.bash_history", "home/march/.bash_history", ".bash_history"] {
-            if let Ok(content) = fs::read_to_string(p) {
-                for line in content.lines() {
-                    let tr = line.trim();
-                    if !tr.is_empty() && !self.cmd_history.contains(&tr.to_string()) {
-                        self.cmd_history.push(tr.to_string());
-                    }
-                }
-                break;
-            }
-        }
-    }
-
-    fn save_history_to_disk(&self) {
-        let payload = self.cmd_history.join("\n") + "\n";
-        for p in ["/home/march/.bash_history", "home/march/.bash_history", ".bash_history"] {
-            let _ = fs::write(p, payload.as_bytes());
-        }
+        self.shell.prompt_prefix(false)
     }
 
     fn scroll_to_bottom(&mut self) {
@@ -155,18 +125,18 @@ impl TerminalApp {
         if self.input.is_empty() || self.cursor_idx != self.input.len() {
             return None;
         }
-        // 1. Check command history (most recent first)
-        for cmd in self.cmd_history.iter().rev() {
+        for cmd in self.shell.cmd_history.iter().rev() {
             if cmd.len() > self.input.len() && cmd.starts_with(&self.input) {
                 return Some(cmd[self.input.len()..].to_string());
             }
         }
-        // 2. Check builtin commands
         if !self.input.contains(' ') {
             let builtins = [
-                "help", "whoami", "pwd", "history", "ls", "cd", "cat", "rm", "clear",
-                "uname", "echo", "ps", "kill", "free", "lspci", "ifconfig", "dhcp", "arp",
-                "ping", "ssh", "reboot", "shutdown", "python",
+                "help", "whoami", "pwd", "history", "ls", "cd", "cat", "head", "tail", "wc",
+                "grep", "sort", "uniq", "cut", "tr", "find", "stat", "hexdump", "touch", "mkdir",
+                "cp", "mv", "rm", "clear", "uname", "echo", "env", "export", "ps", "kill", "free",
+                "lspci", "audit", "ifconfig", "dhcp", "arp", "ping", "ssh", "sshd", "reboot",
+                "shutdown", "python",
             ];
             for b in builtins {
                 if b.len() > self.input.len() && b.starts_with(&self.input) {
@@ -184,11 +154,6 @@ impl TerminalApp {
             (self.input.clone(), 0xFFF8FAFC),
         ]));
 
-        if !raw_cmd.is_empty() {
-            self.cmd_history.retain(|x| x != &raw_cmd);
-            self.cmd_history.push(raw_cmd.clone());
-            self.save_history_to_disk();
-        }
         self.history_idx = None;
         self.input.clear();
         self.cursor_idx = 0;
@@ -200,351 +165,28 @@ impl TerminalApp {
             return;
         }
 
-        let parts = self.parse_command_args(&raw_cmd);
-        if parts.is_empty() {
-            self.scroll_to_bottom();
+        let is_plain_ls = !raw_cmd.contains('|') && !raw_cmd.contains('>')
+            && (raw_cmd == "ls" || (raw_cmd.starts_with("ls ") && !raw_cmd.contains("-l")));
+
+        let res = self.shell.execute_line(&raw_cmd, true);
+        if res.clear_screen {
+            self.history.clear();
+            self.scroll_y = 0;
             return;
         }
 
-        let mut redir_file: Option<(String, bool)> = None;
-        let mut cmd_parts: Vec<String> = Vec::new();
-        let mut pi = 0;
-        while pi < parts.len() {
-            if parts[pi] == ">" || parts[pi] == ">>" {
-                let append = parts[pi] == ">>";
-                if let Some(target) = parts.get(pi + 1) {
-                    let full = if target.starts_with('/') || self.current_dir == "/" {
-                        target.clone()
-                    } else {
-                        format!("{}/{}", self.current_dir.trim_matches('/'), target)
-                    };
-                    redir_file = Some((full, append));
-                }
-                break;
+        if is_plain_ls && !res.lines.is_empty() && !res.lines[0].0.starts_with("ls:") {
+            let max_len = res.lines.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0);
+            let cols = if max_len > 26 { 2usize } else { 3usize };
+            for chunk in res.lines.chunks(cols) {
+                self.history.push(StyledLine::grid(chunk.to_vec(), cols));
             }
-            cmd_parts.push(parts[pi].clone());
-            pi += 1;
-        }
-        if cmd_parts.is_empty() {
-            self.scroll_to_bottom();
-            return;
-        }
-
-        let program = cmd_parts[0].as_str();
-        let args = &cmd_parts[1..];
-        let hist_before = self.history.len();
-
-        match program {
-            "help" => {
-                self.history.push(StyledLine::plain("ls [path]  cd <dir>  cat <file>  rm <file>  echo <txt>  clear", 0xFFE2E8F0));
-                self.history.push(StyledLine::plain("ps  kill <pid>  free  lspci  ifconfig  dhcp  arp [-scan]  ping <ip>", 0xFF34D399));
-                self.history.push(StyledLine::plain("python <script|-c>  reboot  shutdown  |  Ctrl+Shift+C/V: Copy/Paste", 0xFF94A3B8));
-            }
-            "ifconfig" | "ip" => {
-                for line in crate::net_manager::get_ifconfig_lines() {
-                    self.history.push(StyledLine::plain(line, 0xFF38BDF8));
-                }
-            }
-            "dhcp" => {
-                self.history.push(StyledLine::plain("Sending DHCPDISCOVER on eth0...", 0xFFFCD34D));
-                for line in crate::net_manager::renew_dhcp_sync() {
-                    self.history.push(StyledLine::plain(line, 0xFF34D399));
-                }
-            }
-            "arp" => {
-                let do_scan = args.iter().any(|a| a == "-scan" || a == "scan");
-                for line in crate::net_manager::get_arp_lines(do_scan) {
-                    self.history.push(StyledLine::plain(line, 0xFFE2E8F0));
-                }
-            }
-            "ping" => {
-                let target_str = args.first().map(|s| s.as_str()).unwrap_or("10.0.2.2");
-                if let Some(ip) = crate::net_manager::parse_ipv4(target_str) {
-                    for line in crate::net_manager::run_ping_sync(ip, 4) {
-                        let col = if line.contains("timeout") { 0xFFF87171 } else { 0xFF34D399 };
-                        self.history.push(StyledLine::plain(line, col));
-                    }
-                } else {
-                    self.history.push(StyledLine::plain(format!("ping: invalid IPv4 address '{}'", target_str), 0xFFEF4444));
-                }
-            }
-            "echo" => self.history.push(StyledLine::plain(args.join(" "), 0xFFE2E8F0)),
-            "whoami" => self.history.push(StyledLine::plain("root", 0xFF34D399)),
-            "pwd" => self.history.push(StyledLine::plain(self.current_dir.clone(), 0xFFE2E8F0)),
-            "clear" => {
-                self.history.clear();
-                self.scroll_y = 0;
-            }
-            "uname" => self.history.push(StyledLine::plain("EOS 0.1.0 x86_64 SMP (musl)", 0xFFE2E8F0)),
-            "history" => {
-                for (i, h) in self.cmd_history.iter().enumerate() {
-                    self.history.push(StyledLine::plain(format!("{:3}  {}", i + 1, h), 0xFFE2E8F0));
-                }
-            }
-            "ps" => {
-                let procs = crate::sdk::sys::query_processes();
-                self.history.push(StyledLine::plain("PID   CORE   MEM(KB)   SYSCALLS   NAME", 0xFFFCD34D));
-                for p in procs {
-                    self.history.push(StyledLine::plain(
-                        format!("{:<5} {:<6} {:<9} {:<10} {}", p.pid, p.core_id, p.mem_kb, p.syscalls, p.name),
-                        0xFFE2E8F0,
-                    ));
-                }
-            }
-            "kill" => {
-                if let Some(pid_str) = args.first() {
-                    if let Ok(pid) = pid_str.parse::<u32>() {
-                        if crate::syscall::sys_kill_proc(pid) {
-                            self.history.push(StyledLine::plain(format!("Terminated PID {}", pid), 0xFF10B981));
-                        } else {
-                            self.history.push(StyledLine::plain(format!("kill: failed or protected PID {}", pid), 0xFFEF4444));
-                        }
-                    } else {
-                        self.history.push(StyledLine::plain("kill: invalid PID", 0xFFEF4444));
-                    }
-                } else {
-                    self.history.push(StyledLine::plain("usage: kill <pid>", 0xFFEF4444));
-                }
-            }
-            "free" => {
-                let used_kb: usize = crate::sdk::agent::query_kernel_heap_used() / 1024;
-                let total_kb: usize = 256 * 1024;
-                let free_kb: usize = total_kb.saturating_sub(used_kb);
-                self.history.push(StyledLine::plain("              total        used        free", 0xFFFCD34D));
-                self.history.push(StyledLine::plain(
-                    format!("KernelHeap: {:>7} KB  {:>7} KB  {:>7} KB", total_kb, used_kb, free_kb),
-                    0xFFE2E8F0,
-                ));
-            }
-            "lspci" => {
-                let gpu = crate::sdk::gpu::query_info();
-                let aud = if crate::sdk::audio::is_available() { "Active" } else { "Offline" };
-                for d in [
-                    "00:00.0 Host bridge: Intel Q35 / ICH9",
-                    &format!("00:02.0 Display: {} ({}x{})", gpu.backend_name(), gpu.width, gpu.height),
-                    "00:03.0 Ethernet: Intel E1000 Gigabit",
-                    &format!("00:04.0 Audio: Intel AC'97 ({})", aud),
-                    "00:1f.2 Storage: PIIX3 IDE/SATA",
-                ] {
-                    self.history.push(StyledLine::plain(d, 0xFFE2E8F0));
-                }
-            }
-            "python" | "python3" => {
-                let dyn_py = "/EOS SHARE/bin/python3";
-                let has_dyn_py = fs::metadata(dyn_py).is_ok() || fs::metadata("EOS SHARE/bin/python3").is_ok();
-                if has_dyn_py {
-                    if args.is_empty() {
-                        self.history.push(StyledLine::plain(
-                            "Python 3.12.7 Dynamic (musl + dlopen) — usage: python -c '<code>' | python <script.py>",
-                            0xFF34D399,
-                        ));
-                    } else {
-                        let mut quoted_args: Vec<String> = vec!["python3".to_string()];
-                        for a in args {
-                            let resolved = if !a.starts_with('-') && self.current_dir != "/" && !a.starts_with('/')
-                                && (a.ends_with(".py") || fs::metadata(format!("{}/{}", self.current_dir.trim_matches('/'), a)).is_ok())
-                            {
-                                format!("{}/{}", self.current_dir.trim_matches('/'), a)
-                            } else {
-                                a.clone()
-                            };
-                            if resolved.contains(' ') {
-                                quoted_args.push(format!("\"{}\"", resolved));
-                            } else {
-                                quoted_args.push(resolved);
-                            }
-                        }
-                        let arg_str = quoted_args.join(" ");
-                        let ret = crate::syscall::sys_spawn_elf("EOS SHARE/bin/python3", &arg_str);
-                        if ret >= 0 {
-                            self.history.push(StyledLine::plain(
-                                format!("[Dynamic CPython 3.12 + dlopen] Spawned on Core {}", ret),
-                                0xFF34D399,
-                            ));
-                        } else {
-                            self.history.push(StyledLine::plain("Failed to spawn dynamic python3", 0xFFEF4444));
-                        }
-                    }
-                } else if args.is_empty() {
-                    self.history.push(StyledLine::plain("Python 3.12 — usage: python -c '<code>' | python <script.py>", 0xFF34D399));
-                } else if args[0] == "-c" && args.len() >= 2 {
-                    let code = args[1..].join(" ");
-                    match crate::ffi_python::run_code(&code) {
-                        Ok(out) => {
-                            for line in out.lines() {
-                                self.history.push(StyledLine::plain(line.to_string(), 0xFFE2E8F0));
-                            }
-                        }
-                        Err(e) => {
-                            for line in e.lines() {
-                                self.history.push(StyledLine::plain(line.to_string(), 0xFFEF4444));
-                            }
-                        }
-                    }
-                } else {
-                    let target = args.join(" ");
-                    let full = if target.starts_with('/') || self.current_dir == "/" {
-                        target.clone()
-                    } else {
-                        format!("{}/{}", self.current_dir.trim_matches('/'), target)
-                    };
-                    match crate::ffi_python::run_file(&full) {
-                        Ok(out) => {
-                            for line in out.lines() {
-                                self.history.push(StyledLine::plain(line.to_string(), 0xFFE2E8F0));
-                            }
-                        }
-                        Err(e) => {
-                            for line in e.lines() {
-                                self.history.push(StyledLine::plain(line.to_string(), 0xFFEF4444));
-                            }
-                        }
-                    }
-                }
-            }
-            "reboot" => crate::syscall::sys_power(1),
-            "shutdown" => crate::syscall::sys_power(2),
-            "rm" => {
-                if !args.is_empty() {
-                    let target = args.join(" ");
-                    let full = if target.starts_with('/') {
-                        target.clone()
-                    } else if self.current_dir == "/" {
-                        format!("/{}", target)
-                    } else {
-                        format!("{}/{}", self.current_dir, target)
-                    };
-                    match fs::remove_file(&full) {
-                        Ok(_) => self.history.push(StyledLine::plain(format!("Removed '{}'", target), 0xFF10B981)),
-                        Err(e) => self.history.push(StyledLine::plain(format!("rm: '{}': {:?}", target, e), 0xFFEF4444)),
-                    }
-                } else {
-                    self.history.push(StyledLine::plain("rm: missing operand", 0xFFEF4444));
-                }
-            }
-            "ls" => {
-                let target = if args.is_empty() { self.current_dir.clone() } else { args.join(" ") };
-                let clean = target.trim_matches('/').to_string();
-                let cands = [clean.clone(), format!("/{}", clean), if clean.is_empty() { ".".into() } else { clean.clone() }];
-                let mut found = false;
-                for p in &cands {
-                    if let Ok(entries) = fs::read_dir(p) {
-                        let mut items: Vec<(String, u32)> = Vec::new();
-                        for e in entries.flatten() {
-                            let name = e.file_name().to_string_lossy().to_string();
-                            if name == "." || name == ".." { continue; }
-                            let is_dir = e.file_type().map(|t| t.is_dir()).unwrap_or(false);
-                            let lower = name.to_ascii_lowercase();
-                            if is_dir {
-                                items.push((format!("{}/", name), 0xFF38BDF8)); // Cyan-Blue for folders
-                            } else if lower.ends_with(".elf") || lower.ends_with(".sh") || lower.ends_with(".py") {
-                                items.push((format!("{}*", name), 0xFF34D399)); // Green for executables/scripts
-                            } else {
-                                items.push((name, 0xFFE2E8F0)); // Crisp light gray for files
-                            }
-                        }
-                        items.sort_by(|a, b| a.0.to_lowercase().cmp(&b.0.to_lowercase()));
-                        if items.is_empty() {
-                            self.history.push(StyledLine::plain("(empty)", 0xFF64748B));
-                        } else {
-                            // Pixel-aligned multi-column grid (adapts to long filenames)
-                            let max_len = items.iter().map(|(n, _)| n.chars().count()).max().unwrap_or(0);
-                            let cols = if max_len > 26 { 2usize } else { 3usize };
-                            for chunk in items.chunks(cols) {
-                                let spans: Vec<(String, u32)> = chunk.iter().cloned().collect();
-                                self.history.push(StyledLine::grid(spans, cols));
-                            }
-                        }
-                        found = true;
-                        break;
-                    }
-                }
-                if !found {
-                    self.history.push(StyledLine::plain(format!("ls: '{}': No such directory", target), 0xFFEF4444));
-                }
-            }
-            "cd" => {
-                let target = args.join(" ");
-                if target.is_empty() || target == "~" || target == "/" {
-                    self.current_dir = "/".into();
-                } else if target == ".." {
-                    if let Some(pos) = self.current_dir.trim_end_matches('/').rfind('/') {
-                        let p = &self.current_dir[..pos];
-                        self.current_dir = if p.is_empty() { "/".into() } else { p.into() };
-                    } else {
-                        self.current_dir = "/".into();
-                    }
-                } else {
-                    let next = if target.starts_with('/') {
-                        target.clone()
-                    } else if self.current_dir == "/" {
-                        format!("/{}", target)
-                    } else {
-                        format!("{}/{}", self.current_dir, target)
-                    };
-                    let clean_chk = next.trim_matches('/');
-                    if clean_chk.is_empty() || fs::read_dir(clean_chk).is_ok() || fs::read_dir(&format!("/{}", clean_chk)).is_ok() {
-                        self.current_dir = next;
-                    } else {
-                        self.history.push(StyledLine::plain(format!("cd: no such directory: {}", target), 0xFFEF4444));
-                    }
-                }
-            }
-            "cat" => {
-                if !args.is_empty() {
-                    let a0 = args.join(" ");
-                    let fpath = if a0.starts_with('/') || self.current_dir == "/" {
-                        a0.clone()
-                    } else {
-                        format!("{}/{}", self.current_dir.trim_matches('/'), a0)
-                    };
-                    let mut ok = false;
-                    for p in [fpath.clone(), a0.clone(), format!("/{}", fpath)] {
-                        if let Ok(content) = fs::read_to_string(&p) {
-                            for line in content.lines() {
-                                self.history.push(StyledLine::plain(line.to_string(), 0xFFE2E8F0));
-                            }
-                            ok = true;
-                            break;
-                        }
-                    }
-                    if !ok {
-                        self.history.push(StyledLine::plain(format!("cat: {}: No such file", a0), 0xFFEF4444));
-                    }
-                } else {
-                    self.history.push(StyledLine::plain("cat: missing operand", 0xFFEF4444));
-                }
-            }
-            _ => self.execute_elf(program, args),
-        }
-
-        if let Some((target_path, append)) = redir_file {
-            if self.history.len() > hist_before {
-                let captured: Vec<String> = self.history.drain(hist_before..).map(|l| l.full_text()).collect();
-                let mut payload = captured.join("\n") + "\n";
-                if append {
-                    if let Ok(existing) = fs::read_to_string(&target_path) {
-                        payload = existing + &payload;
-                    }
-                }
-                match fs::write(&target_path, payload.as_bytes()) {
-                    Ok(_) => self.history.push(StyledLine::plain(format!("-> {}", target_path), 0xFF10B981)),
-                    Err(e) => self.history.push(StyledLine::plain(format!("Redirection error: {:?}", e), 0xFFEF4444)),
-                }
+        } else {
+            for (line, col) in res.lines {
+                self.history.push(StyledLine::plain(line, col));
             }
         }
         self.scroll_to_bottom();
-    }
-
-    fn execute_elf(&mut self, prog: &str, args: &[String]) {
-        let clean_prog = prog.trim().trim_start_matches('/');
-        let arg_str = args.join(" ");
-        let ret = crate::syscall::sys_spawn_elf(clean_prog, &arg_str);
-        if ret >= 0 {
-            self.history.push(StyledLine::plain(format!("Spawned '{}' on Core {}", clean_prog, ret), 0xFF10B981));
-        } else {
-            self.history.push(StyledLine::plain(format!("command not found: {}", prog), 0xFFEF4444));
-        }
     }
 
     fn tab_autocomplete(&mut self) {
@@ -560,13 +202,13 @@ impl TerminalApp {
                 None => ("", prefix),
             };
             let scan_dir = if dir_part.is_empty() {
-                self.current_dir.clone()
+                self.shell.cwd.clone()
             } else if dir_part.starts_with('/') {
                 dir_part.to_string()
-            } else if self.current_dir == "/" {
+            } else if self.shell.cwd == "/" {
                 format!("/{}", dir_part)
             } else {
-                format!("{}/{}", self.current_dir.trim_end_matches('/'), dir_part)
+                format!("{}/{}", self.shell.cwd.trim_end_matches('/'), dir_part)
             };
             let clean = scan_dir.trim_matches('/');
             let cand = if clean.is_empty() { ".".to_string() } else { clean.to_string() };
@@ -891,13 +533,14 @@ impl Widget for TerminalApp {
                 true
             }
             0x48 => {
-                if !self.cmd_history.is_empty() {
+                self.shell.reload_history();
+                if !self.shell.cmd_history.is_empty() {
                     let next = match self.history_idx {
                         Some(i) => i.saturating_sub(1),
-                        None => self.cmd_history.len() - 1,
+                        None => self.shell.cmd_history.len() - 1,
                     };
                     self.history_idx = Some(next);
-                    self.input = self.cmd_history[next].clone();
+                    self.input = self.shell.cmd_history[next].clone();
                     self.cursor_idx = self.input.len();
                     return true;
                 }
@@ -905,9 +548,9 @@ impl Widget for TerminalApp {
             }
             0x50 => {
                 if let Some(i) = self.history_idx {
-                    if i + 1 < self.cmd_history.len() {
+                    if i + 1 < self.shell.cmd_history.len() {
                         self.history_idx = Some(i + 1);
-                        self.input = self.cmd_history[i + 1].clone();
+                        self.input = self.shell.cmd_history[i + 1].clone();
                         self.cursor_idx = self.input.len();
                     } else {
                         self.history_idx = None;

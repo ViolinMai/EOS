@@ -116,8 +116,13 @@ pub fn init() {
             mgr.mac.0[0], mgr.mac.0[1], mgr.mac.0[2],
             mgr.mac.0[3], mgr.mac.0[4], mgr.mac.0[5]
         );
+    } else if let Some(rtl) = crate::drivers::rtl8111::get_driver() {
+        let mgr = get_mgr_mut();
+        mgr.active = true;
+        mgr.mac = MacAddress(rtl.read_mac());
+        log_info!("NET", "Raw Packet Bridge Active. Bound to Realtek RTL8111 NIC.");
     } else {
-        log_error!("NET", "No E1000 NIC found. Network disabled.");
+        log_error!("NET", "No E1000/RTL8111 NIC found. Network disabled.");
     }
 }
 
@@ -131,6 +136,16 @@ pub fn poll() {
         let tx_packets = drain_tx();
         for packet in tx_packets {
             e1k.send_packet(&packet);
+            get_mgr_mut().tx_packets += 1;
+        }
+    } else if let Some(rtl) = crate::drivers::rtl8111::get_driver() {
+        while let Some(packet) = rtl.receive_packet() {
+            get_mgr_mut().rx_packets += 1;
+            enqueue_rx(packet);
+        }
+        let tx_packets = drain_tx();
+        for packet in tx_packets {
+            rtl.send_packet(&packet);
             get_mgr_mut().tx_packets += 1;
         }
     }

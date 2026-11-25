@@ -527,7 +527,7 @@ def prepare_and_run(cli_args=None):
         "-drive", f"id=disk1,file=fat:rw:{share_dir},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
         "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",
         "-drive", f"id=disk3,file={settings_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=1,drive=disk3",
-        "-netdev", ("user,id=n0,hostfwd=udp::68-:68" if os.name == "nt" else "user,id=n0,hostfwd=udp::6868-:68"), "-device", "e1000,netdev=n0",
+        "-netdev", ("user,id=n0,hostfwd=udp::68-:68,hostfwd=tcp::2222-:22" if os.name == "nt" else "user,id=n0,hostfwd=udp::6868-:68,hostfwd=tcp::2222-:22"), "-device", "e1000,netdev=n0",
         "-serial", serial_arg, "-d", "guest_errors", "-no-reboot", "-no-shutdown"
     ] + extra_qemu_args
     try:

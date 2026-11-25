@@ -155,6 +155,7 @@ struct TtyConsole {
     lines: Vec<(String, u32)>,
     input: String,
     cwd: String,
+    cmd_history: Vec<String>,
     fb_cache: Vec<u32>,
     fb_w: usize,
     fb_h: usize,
@@ -163,22 +164,53 @@ struct TtyConsole {
 
 static mut TTY_CONSOLE: Option<TtyConsole> = None;
 
+fn tty_load_shared_history(con: &mut TtyConsole) {
+    con.cmd_history.clear();
+    if let Ok(bytes) = crate::fs::vfs_read_bytes("home/march/.bash_history") {
+        if let Ok(txt) = core::str::from_utf8(&bytes) {
+            for l in txt.lines() {
+                let t = l.trim();
+                if !t.is_empty() {
+                    con.cmd_history.push(String::from(t));
+                }
+            }
+        }
+    }
+}
+
+fn tty_append_shared_history(con: &mut TtyConsole, cmd: &str) {
+    let t = cmd.trim();
+    if t.is_empty() { return; }
+    tty_load_shared_history(con);
+    con.cmd_history.retain(|x| x != t);
+    con.cmd_history.push(String::from(t));
+    let mut payload = String::new();
+    for h in &con.cmd_history {
+        payload.push_str(h);
+        payload.push('\n');
+    }
+    let _ = crate::fs::vfs_save_text_file("home/march/.bash_history", payload.as_bytes());
+}
+
 fn get_tty_console() -> &'static mut TtyConsole {
     unsafe {
         if (*addr_of_mut!(TTY_CONSOLE)).is_none() {
             let mut lines = Vec::new();
-            lines.push((String::from("EOS Kernel Virtual Console (tty2) — Root Sovereignty Mode"), 0xFF38BDF8));
-            lines.push((String::from("Press Ctrl+Alt+F1 to return to Graphical Desktop (tty1). Type 'help' for commands."), 0xFF94A3B8));
+            lines.push((String::from("EOS Kernel Virtual Console (tty2) — Unified POSIX Root Shell"), 0xFF38BDF8));
+            lines.push((String::from("Ctrl+Alt+F1: Desktop (tty1) | Shared History with Terminal & SSH | Type 'help'"), 0xFF94A3B8));
             lines.push((String::new(), 0xFFFFFFFF));
-            *addr_of_mut!(TTY_CONSOLE) = Some(TtyConsole {
+            let mut con = TtyConsole {
                 lines,
                 input: String::new(),
                 cwd: String::from("/"),
+                cmd_history: Vec::new(),
                 fb_cache: Vec::new(),
                 fb_w: 0,
                 fb_h: 0,
                 dirty: true,
-            });
+            };
+            tty_load_shared_history(&mut con);
+            *addr_of_mut!(TTY_CONSOLE) = Some(con);
         }
         (*addr_of_mut!(TTY_CONSOLE)).as_mut().unwrap()
     }
@@ -232,79 +264,203 @@ pub fn tty_poll() {
     }
 }
 
-fn execute_tty_command(con: &mut TtyConsole, cmd: &str) {
-    if cmd.is_empty() { return; }
-    let mut parts = cmd.split_whitespace();
-    let prog = parts.next().unwrap_or("");
-    let arg = parts.next().unwrap_or("");
+fn tty_resolve_path(cwd: &str, arg: &str) -> String {
+    let a = arg.trim();
+    if a.is_empty() || a == "." {
+        String::from(cwd)
+    } else if a.starts_with('/') {
+        String::from(a)
+    } else if cwd == "/" {
+        format!("/{}", a)
+    } else {
+        format!("{}/{}", cwd.trim_end_matches('/'), a)
+    }
+}
 
-    match prog {
-        "help" => {
-            con.lines.push((String::from("tty2 Root Commands: help, clear, ls [dir], cat <file>, ps, mem, audit, reboot, shutdown, gui"), 0xFFE2E8F0));
-        }
-        "clear" => {
-            con.lines.clear();
-        }
-        "gui" | "exit" => {
-            request_tty_switch(1);
-        }
-        "whoami" => {
-            con.lines.push((String::from("root (uid=0, gid=0)"), 0xFF34D399));
-        }
-        "mem" => {
-            let used_kb = crate::mm::heap::HEAP_ALLOCATOR.used() / 1024;
-            con.lines.push((format!("Kernel Heap Used: {} KB / 262144 KB", used_kb), 0xFFE2E8F0));
-        }
-        "ps" => {
-            let mut snap = [crate::task::ProcTelemetry::empty(); crate::task::MAX_PROCS];
-            let count = crate::task::snapshot_procs(&mut snap);
-            con.lines.push((String::from("PID   CORE   MEM(KB)   NAME"), 0xFFFCD34D));
-            for p in &snap[..count] {
-                let nlen = p.name.iter().position(|&b| b == 0).unwrap_or(24);
-                let name = core::str::from_utf8(&p.name[..nlen]).unwrap_or("?");
-                con.lines.push((format!("{:<5} {:<6} {:<9} {}", p.pid, p.core_id, p.mem_bytes / 1024, name), 0xFFE2E8F0));
+fn execute_tty_command(con: &mut TtyConsole, cmd: &str) {
+    let trimmed = cmd.trim();
+    if trimmed.is_empty() { return; }
+    tty_append_shared_history(con, trimmed);
+
+    // Support POSIX pipelines (`cmd1 | cmd2`) directly inside tty2
+    let stages: Vec<&str> = trimmed.split('|').map(|s| s.trim()).filter(|s| !s.is_empty()).collect();
+    let mut pipe_buf: Option<Vec<String>> = None;
+
+    for (s_idx, stage) in stages.iter().enumerate() {
+        let tokens: Vec<&str> = stage.split_whitespace().collect();
+        if tokens.is_empty() { continue; }
+        let prog = tokens[0];
+        let args = &tokens[1..];
+        let mut out: Vec<(String, u32)> = Vec::new();
+
+        match prog {
+            "help" => {
+                out.push((String::from("POSIX: ls cd pwd cat head tail wc grep rm echo history uname whoami"), 0xFFE2E8F0));
+                out.push((String::from("SYS  : ps kill <pid> free mem audit reboot shutdown gui clear | supports '|'"), 0xFF34D399));
             }
-        }
-        "ls" => {
-            let target = if arg.is_empty() { con.cwd.as_str() } else { arg };
-            match crate::fs::vfs_list_dir(target) {
-                Ok(items) => {
-                    let mut row = String::new();
-                    for it in items {
-                        match it {
-                            crate::fs::FsItem::Directory(n, _) => { row.push_str(&n); row.push_str("/  "); }
-                            crate::fs::FsItem::File(n, _, _) => { row.push_str(&n); row.push_str("  "); }
-                        }
-                    }
-                    if row.is_empty() { row.push_str("(empty)"); }
-                    con.lines.push((row, 0xFFE2E8F0));
-                }
-                Err(e) => con.lines.push((format!("ls error: {}", e), 0xFFEF4444)),
-            }
-        }
-        "cat" => {
-            if arg.is_empty() {
-                con.lines.push((String::from("usage: cat <path>"), 0xFFEF4444));
-            } else {
-                match crate::fs::vfs_read_bytes(arg) {
-                    Ok(bytes) => {
-                        let s = core::str::from_utf8(&bytes).unwrap_or("<binary>");
-                        for l in s.lines().take(24) {
-                            con.lines.push((String::from(l), 0xFFE2E8F0));
-                        }
-                    }
-                    Err(e) => con.lines.push((format!("cat error: {}", e), 0xFFEF4444)),
+            "clear" => { con.lines.clear(); return; }
+            "gui" | "exit" => { request_tty_switch(1); return; }
+            "whoami" => out.push((String::from("root"), 0xFF34D399)),
+            "uname" => out.push((String::from("EOS 0.1.0 x86_64 SMP (POSIX tty2)"), 0xFFE2E8F0)),
+            "pwd" => out.push((con.cwd.clone(), 0xFFE2E8F0)),
+            "echo" => out.push((args.join(" "), 0xFFE2E8F0)),
+            "history" => {
+                tty_load_shared_history(con);
+                for (i, h) in con.cmd_history.iter().enumerate() {
+                    out.push((format!("{:3}  {}", i + 1, h), 0xFFE2E8F0));
                 }
             }
+            "cd" => {
+                let target = args.join(" ");
+                if target.is_empty() || target == "/" || target == "~" {
+                    con.cwd = String::from("/");
+                } else if target == ".." {
+                    if let Some(pos) = con.cwd.trim_end_matches('/').rfind('/') {
+                        let p = &con.cwd[..pos];
+                        con.cwd = if p.is_empty() { String::from("/") } else { String::from(p) };
+                    } else { con.cwd = String::from("/"); }
+                } else {
+                    let next = tty_resolve_path(&con.cwd, &target);
+                    if crate::fs::vfs_list_dir(&next).is_ok() {
+                        con.cwd = next;
+                    } else {
+                        out.push((format!("cd: no such directory: {}", target), 0xFFEF4444));
+                    }
+                }
+            }
+            "mem" | "free" => {
+                let used_kb = crate::mm::heap::HEAP_ALLOCATOR.used() / 1024;
+                let total_kb = crate::mm::heap::HEAP_SIZE / 1024;
+                out.push((format!("KernelHeap: {} KB total | {} KB used | {} KB free", total_kb, used_kb, total_kb.saturating_sub(used_kb)), 0xFFE2E8F0));
+            }
+            "ps" => {
+                let mut snap = [crate::task::ProcTelemetry::empty(); crate::task::MAX_PROCS];
+                let count = crate::task::snapshot_procs(&mut snap);
+                out.push((String::from("PID   CORE   MEM(KB)   SYSCALLS   NAME"), 0xFFFCD34D));
+                for p in &snap[..count] {
+                    let nlen = p.name.iter().position(|&b| b == 0).unwrap_or(24);
+                    let name = core::str::from_utf8(&p.name[..nlen]).unwrap_or("?");
+                    out.push((format!("{:<5} {:<6} {:<9} {:<10} {}", p.pid, p.core_id, p.mem_bytes / 1024, p.syscalls, name), 0xFFE2E8F0));
+                }
+            }
+            "kill" => {
+                if let Some(pid_s) = args.first() {
+                    if let Ok(pid) = pid_s.parse::<u32>() {
+                        if crate::task::terminate_proc_by_pid(pid) {
+                            out.push((format!("Terminated PID {}", pid), 0xFF34D399));
+                        } else {
+                            out.push((format!("kill: failed or protected PID {}", pid), 0xFFEF4444));
+                        }
+                    } else { out.push((String::from("kill: invalid PID"), 0xFFEF4444)); }
+                } else { out.push((String::from("usage: kill <pid>"), 0xFFEF4444)); }
+            }
+            "ls" => {
+                let target = if args.is_empty() { con.cwd.clone() } else { tty_resolve_path(&con.cwd, &args.join(" ")) };
+                match crate::fs::vfs_list_dir(&target) {
+                    Ok(items) => {
+                        for it in items {
+                            match it {
+                                crate::fs::FsItem::Directory(n, _) => out.push((format!("{}/", n), 0xFF38BDF8)),
+                                crate::fs::FsItem::File(n, sz, _) => out.push((format!("{} ({} B)", n, sz), 0xFFE2E8F0)),
+                            }
+                        }
+                    }
+                    Err(e) => out.push((format!("ls: {}: {}", target, e), 0xFFEF4444)),
+                }
+            }
+            "cat" => {
+                if let Some(ref stdin) = pipe_buf {
+                    for l in stdin { out.push((l.clone(), 0xFFE2E8F0)); }
+                } else if args.is_empty() {
+                    out.push((String::from("usage: cat <path>"), 0xFFEF4444));
+                } else {
+                    let path = tty_resolve_path(&con.cwd, &args.join(" "));
+                    match crate::fs::vfs_read_bytes(&path) {
+                        Ok(bytes) => {
+                            let s = core::str::from_utf8(&bytes).unwrap_or("<binary>");
+                            for l in s.lines() { out.push((String::from(l), 0xFFE2E8F0)); }
+                        }
+                        Err(e) => out.push((format!("cat: {}: {}", path, e), 0xFFEF4444)),
+                    }
+                }
+            }
+            "head" => {
+                let n = 10usize;
+                let src = if let Some(ref stdin) = pipe_buf {
+                    stdin.clone()
+                } else if !args.is_empty() {
+                    let path = tty_resolve_path(&con.cwd, &args.join(" "));
+                    crate::fs::vfs_read_bytes(&path).ok()
+                        .and_then(|b| core::str::from_utf8(&b).ok().map(|s| s.lines().map(String::from).collect()))
+                        .unwrap_or_default()
+                } else { Vec::new() };
+                for l in src.into_iter().take(n) { out.push((l, 0xFFE2E8F0)); }
+            }
+            "tail" => {
+                let n = 10usize;
+                let src = if let Some(ref stdin) = pipe_buf {
+                    stdin.clone()
+                } else if !args.is_empty() {
+                    let path = tty_resolve_path(&con.cwd, &args.join(" "));
+                    crate::fs::vfs_read_bytes(&path).ok()
+                        .and_then(|b| core::str::from_utf8(&b).ok().map(|s| s.lines().map(String::from).collect()))
+                        .unwrap_or_default()
+                } else { Vec::new() };
+                let skip = src.len().saturating_sub(n);
+                for l in src.into_iter().skip(skip) { out.push((l, 0xFFE2E8F0)); }
+            }
+            "grep" => {
+                let pat = args.first().copied().unwrap_or("");
+                let src = if let Some(ref stdin) = pipe_buf {
+                    stdin.clone()
+                } else if args.len() >= 2 {
+                    let path = tty_resolve_path(&con.cwd, &args[1..].join(" "));
+                    crate::fs::vfs_read_bytes(&path).ok()
+                        .and_then(|b| core::str::from_utf8(&b).ok().map(|s| s.lines().map(String::from).collect()))
+                        .unwrap_or_default()
+                } else { Vec::new() };
+                for l in src {
+                    if !pat.is_empty() && l.contains(pat) { out.push((l, 0xFF34D399)); }
+                }
+            }
+            "wc" => {
+                let src = if let Some(ref stdin) = pipe_buf {
+                    stdin.clone()
+                } else if !args.is_empty() {
+                    let path = tty_resolve_path(&con.cwd, &args.join(" "));
+                    crate::fs::vfs_read_bytes(&path).ok()
+                        .and_then(|b| core::str::from_utf8(&b).ok().map(|s| s.lines().map(String::from).collect()))
+                        .unwrap_or_default()
+                } else { Vec::new() };
+                let lines_cnt = src.len();
+                let words_cnt: usize = src.iter().map(|l| l.split_whitespace().count()).sum();
+                let bytes_cnt: usize = src.iter().map(|l| l.len() + 1).sum();
+                out.push((format!("{} {} {}", lines_cnt, words_cnt, bytes_cnt), 0xFFE2E8F0));
+            }
+            "rm" => {
+                if !args.is_empty() {
+                    let path = tty_resolve_path(&con.cwd, &args.join(" "));
+                    match crate::fs::vfs_delete_file(&path) {
+                        Ok(_) => out.push((format!("Removed '{}'", path), 0xFF34D399)),
+                        Err(e) => out.push((format!("rm: {}: {}", path, e), 0xFFEF4444)),
+                    }
+                } else { out.push((String::from("rm: missing operand"), 0xFFEF4444)); }
+            }
+            "audit" => {
+                let p = crate::audit::run_kernel_self_audit();
+                out.push((format!("Kernel self-audit completed: {}/6 core checks passed", p), 0xFF34D399));
+            }
+            "reboot" => crate::arch::x86_64::power::reboot(),
+            "shutdown" => crate::arch::x86_64::power::shutdown(),
+            _ => out.push((format!("tty2: command not found: '{}'. Type 'help'.", prog), 0xFFEF4444)),
         }
-        "audit" => {
-            let p = crate::audit::run_kernel_self_audit();
-            con.lines.push((format!("Kernel self-audit completed: {}/6 checks passed", p), 0xFF34D399));
-        }
-        "reboot" => crate::arch::x86_64::power::reboot(),
-        "shutdown" => crate::arch::x86_64::power::shutdown(),
-        _ => {
-            con.lines.push((format!("tty2: unknown command '{}'. Type 'help'.", prog), 0xFFEF4444));
+
+        if s_idx + 1 < stages.len() {
+            pipe_buf = Some(out.into_iter().map(|(s, _)| s).collect());
+        } else {
+            for item in out.into_iter().take(40) {
+                con.lines.push(item);
+            }
         }
     }
 

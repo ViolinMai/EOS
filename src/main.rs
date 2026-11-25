@@ -117,10 +117,14 @@ pub extern "C" fn _start() -> ! {
 
     drivers::pci::init();
     drivers::virtio_gpu::init();
+    drivers::hda::init();
     drivers::ac97::init();
     drivers::e1000::init();
+    drivers::rtl8111::init();
     net::init();
 
+    drivers::nvme::init();
+    drivers::ahci::init();
     drivers::ata::init();
     fs::ext2::init(2);
 
@@ -213,7 +217,7 @@ extern "C" fn ap_startup_entry(info: &limine::mp::MpInfo) -> ! {
         if core_id < 8 { CORE_HEARTBEAT[core_id].fetch_add(1, Ordering::Relaxed); }
         let did_work = task::core_poll_and_execute(core_id);
         if !did_work {
-            for _ in 0..64 {
+            for _ in 0..2048 {
                 core::hint::spin_loop();
             }
         }

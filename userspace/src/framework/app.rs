@@ -1405,6 +1405,8 @@ impl<'a> FrameworkApp<'a> {
                 self.request_full_redraw();
             }
 
+            crate::ssh::poll_sshd();
+
             if self.crash_dialog.is_none() {
                 if let Some(crash) = crate::syscall::sys_poll_crash() {
                     self.crash_dialog = Some(crash);
@@ -1429,7 +1431,16 @@ impl<'a> FrameworkApp<'a> {
                 self.file_dialog = Some((caller, dlg));
                 self.request_full_redraw();
             }
-            if crate::framework::theme::sync_theme_from_disk_if_changed()
+            static LAST_COMP_THEME_SYNC: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+            let check_disk = if let Ok(mut g) = LAST_COMP_THEME_SYNC.lock() {
+                let now = std::time::Instant::now();
+                if g.map(|p| now.saturating_duration_since(p) >= std::time::Duration::from_millis(1500)).unwrap_or(true) {
+                    *g = Some(now);
+                    true
+                } else { false }
+            } else { false };
+
+            if (check_disk && crate::framework::theme::sync_theme_from_disk_if_changed())
                 || crate::framework::theme::take_full_redraw_requested()
             {
                 self.request_full_redraw();
@@ -1582,7 +1593,7 @@ impl<'a> FrameworkApp<'a> {
                 ));
                 self.damage.add(win.bounds);
                 self.root_widgets.push(win);
-                self.window_surfaces.push(crate::framework::surface::WindowSurface::new(win_w as usize, win_h as usize));
+                self.window_surfaces.push(crate::framework::surface::WindowSurface::new(1, 1));
                 self.focus_mgr.active_window_idx = Some(self.root_widgets.len() - 1);
                 self.request_full_redraw();
             }

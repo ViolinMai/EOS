@@ -5,6 +5,8 @@ mod sdk;
 mod framework;
 pub mod png;
 pub mod net_manager;
+pub mod shell;
+pub mod ssh;
 pub mod test_subject;
 pub mod ffi_media;
 pub mod ffi_python;
@@ -62,6 +64,9 @@ fn main() {
     println!("🚀 Launching EOS Desktop (Ring 3 Userspace)...");
 
     net_manager::init_net([10, 0, 2, 15], [10, 0, 2, 2]);
+    net_manager::init_net_storage();
+    ssh::init_sshd();
+    shell::init_posix_shell();
 
     let font_paths = [
         "segoeui.ttf",
@@ -210,6 +215,7 @@ fn run_isolated_client_app(app_name: &str, file_arg: Option<&str>, dir_arg: Opti
     let mut font_cache = std::collections::BTreeMap::new();
     let mut pixels = vec![0xFF0F172A; w * h];
     let mut dirty = true;
+    let mut last_theme_sync = std::time::Instant::now();
 
     loop {
         while let Some(ev) = syscall::sys_win_poll_event(win_id) {
@@ -245,8 +251,11 @@ fn run_isolated_client_app(app_name: &str, file_arg: Option<&str>, dir_arg: Opti
         }
 
         let mut active_media = false;
-        if framework::theme::sync_theme_from_disk_if_changed() {
-            dirty = true;
+        if last_theme_sync.elapsed() >= std::time::Duration::from_millis(1500) {
+            last_theme_sync = std::time::Instant::now();
+            if framework::theme::sync_theme_from_disk_if_changed() {
+                dirty = true;
+            }
         }
         if let Some(test_app) = widget.as_any_mut().downcast_mut::<apps::TestApp>() {
             if test_app.tick_animation() { dirty = true; }
@@ -263,8 +272,8 @@ fn run_isolated_client_app(app_name: &str, file_arg: Option<&str>, dir_arg: Opti
             syscall::sys_win_commit(win_id, &pixels, w as u32, h as u32);
             dirty = false;
         } else {
-            // تهدئة الـ Idle: 40ms للخمول التام، و 4ms فقط أثناء تشغيل فيديو فعلي لضبط VSync
-            let sleep_ms = if active_media { 4 } else { 40 };
+            // تهدئة الـ Idle: 60ms للخمول التام، و 8ms فقط أثناء تشغيل فيديو فعلي لضبط VSync
+            let sleep_ms = if active_media { 8 } else { 60 };
             std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
         }
     }

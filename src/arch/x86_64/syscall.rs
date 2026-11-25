@@ -245,6 +245,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             if fd == 1 || fd == 2 {
                 let mut buf = alloc::vec![0u8; frame.rdx as usize];
                 if copy_from_user(&mut buf, frame.rsi, frame.rdx as usize).is_ok() {
+                    crate::task::append_core_stdout(cur_core, &buf);
                     if let Ok(s) = core::str::from_utf8(&buf) { crate::serial_print!("{}", s); }
                     frame.rax = frame.rdx;
                 } else { frame.rax = -14i64 as u64; }
@@ -565,7 +566,9 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         }
         16 => { // ioctl
             let req = frame.rsi;
-            if req == 0x5413 { // TIOCGWINSZ
+            if req == 0x5401 { // TCGETS -> non-interactive pipe/script execution (-ENOTTY)
+                frame.rax = -25i64 as u64;
+            } else if req == 0x5413 { // TIOCGWINSZ
                 let ws_ptr = frame.rdx;
                 if validate_user_range(ws_ptr, 8) {
                     let winsize: [u16; 4] = [25, 80, 0, 0];
@@ -587,6 +590,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                     if copy_from_user(unsafe { core::slice::from_raw_parts_mut(iov.as_mut_ptr() as *mut u8, 16) }, iov_ptr as u64 + (i * 16) as u64, 16).is_ok() {
                         let mut buf = alloc::vec![0u8; iov[1] as usize];
                         if copy_from_user(&mut buf, iov[0], iov[1] as usize).is_ok() {
+                            crate::task::append_core_stdout(cur_core, &buf);
                             if let Ok(s) = core::str::from_utf8(&buf) { crate::serial_print!("{}", s); }
                             written += iov[1];
                         }
@@ -632,6 +636,45 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         }
         24 => { // sched_yield
             crate::task::yield_now();
+            frame.rax = 0;
+        }
+        32 => { // dup(oldfd)
+            let oldfd = frame.rdi as usize;
+            if oldfd < 64 {
+                let proc = get_current_process();
+                if let Some(cloned) = proc.fd_table[oldfd].clone() {
+                    let mut newfd = None;
+                    for (i, slot) in proc.fd_table.iter_mut().enumerate().skip(3) {
+                        if slot.is_none() {
+                            *slot = Some(cloned);
+                            newfd = Some(i);
+                            break;
+                        }
+                    }
+                    frame.rax = newfd.map(|i| i as u64).unwrap_or(-24i64 as u64);
+                } else { frame.rax = -9i64 as u64; }
+            } else { frame.rax = -9i64 as u64; }
+        }
+        33 => { // dup2(oldfd, newfd)
+            let oldfd = frame.rdi as usize;
+            let newfd = frame.rsi as usize;
+            if oldfd < 64 && newfd < 64 {
+                if oldfd == newfd {
+                    frame.rax = newfd as u64;
+                } else {
+                    let proc = get_current_process();
+                    if let Some(cloned) = proc.fd_table[oldfd].clone() {
+                        proc.fd_table[newfd] = Some(cloned);
+                        frame.rax = newfd as u64;
+                    } else { frame.rax = -9i64 as u64; }
+                }
+            } else { frame.rax = -9i64 as u64; }
+        }
+        61 => { // wait4(pid, wstatus, options, rusage)
+            let wstatus_ptr = frame.rsi;
+            if wstatus_ptr != 0 && validate_user_range(wstatus_ptr, 4) {
+                let _ = copy_to_user(wstatus_ptr, &0u32.to_ne_bytes());
+            }
             frame.rax = 0;
         }
         25 => { // mremap(old_addr, old_size, new_size, flags)
@@ -852,6 +895,35 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             }
             frame.rax = 0;
         }
+        293 => { // pipe2(pipefd, flags)
+            let pipefd_ptr = frame.rdi;
+            if validate_user_range(pipefd_ptr, 8) {
+                if let Some((r_id, w_id)) = crate::task::create_pipe() {
+                    let proc = get_current_process();
+                    let mut r_fd = None;
+                    let mut w_fd = None;
+                    for (i, f) in proc.fd_table.iter_mut().enumerate().skip(3) {
+                        if f.is_none() && r_fd.is_none() { r_fd = Some(i); continue; }
+                        if f.is_none() && w_fd.is_none() { w_fd = Some(i); break; }
+                    }
+                    if let (Some(r), Some(w)) = (r_fd, w_fd) {
+                        proc.fd_table[r] = Some(crate::task::FileDescriptor {
+                            path: alloc::string::String::from("pipe:read"),
+                            source: crate::task::FileSource::Pipe { id: r_id, is_read: true },
+                            offset: 0, is_writable: false, is_dirty: false,
+                        });
+                        proc.fd_table[w] = Some(crate::task::FileDescriptor {
+                            path: alloc::string::String::from("pipe:write"),
+                            source: crate::task::FileSource::Pipe { id: w_id, is_read: false },
+                            offset: 0, is_writable: true, is_dirty: false,
+                        });
+                        let fds = [r as u32, w as u32];
+                        let _ = copy_to_user(pipefd_ptr, unsafe { core::slice::from_raw_parts(fds.as_ptr() as *const u8, 8) });
+                        frame.rax = 0;
+                    } else { frame.rax = -24i64 as u64; }
+                } else { frame.rax = -23i64 as u64; }
+            } else { frame.rax = -14i64 as u64; }
+        }
         318 => { // getrandom
             let mut buf = alloc::vec![0u8; frame.rsi as usize];
             let mut r = pit::read_tsc();
@@ -880,6 +952,29 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             match crate::task::request_elf_execution(path_str, args_str) {
                 Ok(core_id) => { frame.rax = core_id as u64; }
                 Err(_) => { frame.rax = -2i64 as u64; }
+            }
+        }
+        501 => { // sys_wait_elf_output(target_core, out_ptr, max_len) -> bytes_copied
+            let target_core = frame.rdi as usize;
+            let out_ptr = frame.rsi;
+            let max_len = (frame.rdx as usize).min(65536);
+            if target_core >= 1 && target_core < 8 && max_len > 0 && validate_user_range(out_ptr, max_len) {
+                let start = pit::get_ticks();
+                while crate::task::CORE_IS_BUSY[target_core].load(Ordering::Acquire) {
+                    if pit::get_ticks().saturating_sub(start) > 12000 {
+                        break;
+                    }
+                    core::hint::spin_loop();
+                }
+                let captured = crate::task::take_core_stdout(target_core);
+                let n = captured.len().min(max_len);
+                if n > 0 && copy_to_user(out_ptr, &captured[..n]).is_err() {
+                    frame.rax = -14i64 as u64;
+                } else {
+                    frame.rax = n as u64;
+                }
+            } else {
+                frame.rax = 0;
             }
         }
         502 => { // sys_present
@@ -1196,13 +1291,17 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 frame.rax = n as u64;
             } else { frame.rax = 0; }
         }
-        540 => { // sys_audio_write(pcm_ptr, byte_len) -> bytes_written
+        540 => { // sys_audio_write(pcm_ptr, byte_len) -> bytes_written (Intel HDA or AC'97)
             let ptr = frame.rdi;
             let len = (frame.rsi as usize).min(65536);
             if len > 0 && validate_user_range(ptr, len) {
                 let mut tmp = alloc::vec![0u8; len];
                 if copy_from_user(&mut tmp, ptr, len).is_ok() {
-                    frame.rax = crate::drivers::ac97::write_pcm(&tmp) as u64;
+                    frame.rax = if crate::drivers::hda::is_active() {
+                        crate::drivers::hda::write_pcm(&tmp) as u64
+                    } else {
+                        crate::drivers::ac97::write_pcm(&tmp) as u64
+                    };
                 } else {
                     frame.rax = 0;
                 }
@@ -1211,11 +1310,15 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             }
         }
         541 => { // sys_audio_set_volume(vol_0_100)
-            crate::drivers::ac97::set_volume(frame.rdi as u8);
+            let v = frame.rdi as u8;
+            if crate::drivers::hda::is_active() {
+                crate::drivers::hda::set_volume(v);
+            }
+            crate::drivers::ac97::set_volume(v);
             frame.rax = 0;
         }
         542 => { // sys_audio_info() -> 1 if active
-            frame.rax = if crate::drivers::ac97::is_active() { 1 } else { 0 };
+            frame.rax = if crate::drivers::hda::is_active() || crate::drivers::ac97::is_active() { 1 } else { 0 };
         }
         543 => { // sys_tty_state() -> active tty (1=GUI, 2=RootShell)
             frame.rax = crate::writer::active_tty() as u64;
@@ -1366,9 +1469,9 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                         let target = pit::TICKS.load(Ordering::Relaxed).saturating_add(wait_ticks);
                         while pit::TICKS.load(Ordering::Relaxed) < target {
                             if cur_core == 0 {
-                                unsafe { core::arch::asm!("sti; hlt"); }
+                                unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
                             } else {
-                                core::hint::spin_loop();
+                                for _ in 0..512 { core::hint::spin_loop(); }
                             }
                         }
                     }
@@ -1387,9 +1490,9 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                         let target = pit::TICKS.load(Ordering::Relaxed).saturating_add(wait_ticks);
                         while pit::TICKS.load(Ordering::Relaxed) < target {
                             if cur_core == 0 {
-                                unsafe { core::arch::asm!("sti; hlt"); }
+                                unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
                             } else {
-                                core::hint::spin_loop();
+                                for _ in 0..512 { core::hint::spin_loop(); }
                             }
                         }
                     }

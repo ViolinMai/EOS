@@ -1,5 +1,6 @@
 pub mod elf;
 pub mod ext2;
+pub mod ext4;
 pub mod image;
 pub mod tar;
 

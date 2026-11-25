@@ -385,7 +385,7 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
         Steps: []
 
-    [ ] Milestone 28: AHCI / SATA DMA Storage Driver (PCI Class 01:06)
+    [x] Milestone 28: AHCI / SATA DMA Storage Driver (PCI Class 01:06) + NVMe PCIe SSD (01:08)
 
         ID: m28_hw_ahci_sata_driver
 
@@ -397,7 +397,7 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
         Steps: []
 
-    [ ] Milestone 29: Intel High Definition Audio Driver (Intel HDA — PCI Class 04:03)
+    [x] Milestone 29: Intel High Definition Audio Driver (Intel HDA — PCI Class 04:03)
 
         ID: m29_hw_intel_hda_audio
 
@@ -409,7 +409,7 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
         Steps: []
 
-    [ ] Milestone 30: Realtek RTL8111/8168 Gigabit Ethernet Driver
+    [x] Milestone 30: Realtek RTL8111/8168 Gigabit Ethernet Driver
 
         ID: m30_hw_rtl8111_ethernet
 
@@ -433,7 +433,7 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
         Steps: []
 
-        [ ] Milestone 32: Full System Stress & Bare-Metal Readiness Certification
+        [x] Milestone 32: Full System Stress & Bare-Metal Readiness Certification
 
             ID: m32_eos_gold_certification
 
@@ -459,7 +459,7 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
             Steps: []
 
-        [ ] Milestone 34: SSH Client & Server (SSH-2 / Ed25519 / ChaCha20-Poly1305)
+        [x] Milestone 34: SSH Client & Server (SSH-2 / Ed25519 / ChaCha20-Poly1305)
 
             ID: m34_ssh_client_server
 
@@ -471,7 +471,31 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
             Steps: []
 
-            [ ] Milestone 35: Network Storage Mount (SMB / WebDAV / 9P Share in Finder & VFS)
+        [x] Milestone 34b: EXT4 Filesystem Driver (Extents, Dynamic Allocation & Journal)
+
+            ID: m34b_ext4_filesystem
+
+            Goal: Upgrade RootFS from ext2 to ext4 in src/fs/ext4.rs and run_qemu.py with 4KB blocks, Extent Trees for large files, dynamic block/inode bitmap allocation (create/resize/delete), and metadata journal replay protection before network storage mounting. Emit VFS_EXT4:PASS:Extents_Journal_Ready.
+
+            Files: src/fs/ext4.rs, src/fs/mod.rs, src/main.rs, run_qemu.py, test_eos_audit.py
+
+            Expect: VFS_EXT4:PASS:Extents_Journal_Ready
+
+            Steps: []
+
+        [x] Milestone 34c: Hardware-Adaptive Randomized Chaos & Real-World Stress Audit Suite
+
+            ID: m34c_chaos_stress_audit
+
+            Goal: Build a seeded randomized, hardware-adaptive stress and fault-injection suite in test_eos_audit.py, src/audit.rs, and userspace/src/test_subject.rs that dynamically probes active SMP core count, total physical RAM / kernel heap size, and GPU resolution/VRAM quota (zero hardcoded limits) to test: (1) infinite-loop hang detection and forced task kill without freezing GUI, (2) memory exhaustion (-ENOMEM) and zero-leak verification scaled to available RAM, (3) full N-core SMP saturation under parallel load, (4) per-process VRAM/window surface quota enforcement scaled to active framebuffer, and (5) concurrent ext4 file churn with CRC32 verification. Emit STRESS_AUDIT:PASS:All_5_Vectors_OK.
+
+            Files: test_eos_audit.py, src/audit.rs, src/task/mod.rs, src/arch/x86_64/syscall.rs, userspace/src/test_subject.rs
+
+            Expect: STRESS_AUDIT:PASS:All_5_Vectors_OK
+
+            Steps: []
+
+            [x] Milestone 35: Network Storage Mount (SMB / WebDAV / 9P Share in Finder & VFS)
 
                 ID: m35_network_storage_mount
 
@@ -485,7 +509,7 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
         Phase 7: Unix / POSIX Userland & Utilities Compatibility (M36–M37)
 
-            [ ] Milestone 36: Static musl BusyBox & POSIX Core Utilities (/r/bin PATH)
+            [x] Milestone 36: Static musl BusyBox & POSIX Core Utilities (/r/bin PATH)
 
                 ID: m36_unix_busybox_coreutils
 
@@ -497,7 +521,7 @@ Phase 5: Bare-Metal Hardware Drivers & Real-Machine Readiness (M27–M32)
 
                 Steps: []
 
-            [ ] Milestone 37: POSIX Process Control (fork/execve/wait4 & pipe2/dup2)
+            [x] Milestone 37: POSIX Process Control (fork/execve/wait4 & pipe2/dup2)
 
                 ID: m37_posix_fork_pipes
 

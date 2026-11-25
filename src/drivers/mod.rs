@@ -1,6 +1,10 @@
+pub mod ahci;
 pub mod ata;
 pub mod e1000;
 pub mod gamepad;
+pub mod hda;
+pub mod nvme;
+pub mod rtl8111;
 pub mod mouse;
 pub mod pci;
 pub mod rtc;

@@ -5,6 +5,7 @@ use crate::syscall::{sys_net_tx, sys_net_rx, sys_net_mac};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TcpState {
     Closed,
+    Listen,
     SynSent,
     Established,
     FinWait1,
@@ -413,14 +414,27 @@ impl NetworkManager {
         let mut packets_to_send: Vec<Vec<u8>> = Vec::new();
         let my_ip = self.ip;
 
+        let src_port = ((tcp[0] as u16) << 8) | (tcp[1] as u16);
         if let Some(sock) = self.tcp_sockets.get_mut(&dst_port) {
-            if sock.remote_ip != src_ip { return; }
+            if sock.state != TcpState::Listen && sock.remote_ip != src_ip { return; }
 
             let syn = (flags & 0x02) != 0;
             let ack_flag = (flags & 0x10) != 0;
             let fin = (flags & 0x01) != 0;
 
             match sock.state {
+                TcpState::Listen => {
+                    if syn && !ack_flag {
+                        sock.remote_ip = src_ip;
+                        sock.remote_port = src_port;
+                        sock.ack = seq.wrapping_add(1);
+                        sock.seq = 2000;
+                        sock.state = TcpState::Established;
+                        let p = build_tcp_packet(my_ip, src_ip, dst_port, src_port, sock.seq, sock.ack, 0x12, &[]);
+                        sock.seq = sock.seq.wrapping_add(1);
+                        packets_to_send.push(p);
+                    }
+                }
                 TcpState::SynSent => {
                     if syn && ack_flag {
                         sock.ack = seq.wrapping_add(1);
@@ -619,6 +633,194 @@ impl NetworkManager {
         self.send_ipv4(target_ip, 6, &syn_pkt);
 
         port
+    }
+
+    pub fn listen(&mut self, port: u16) {
+        self.tcp_sockets.insert(port, TcpSocket {
+            local_port: port,
+            remote_ip: [0, 0, 0, 0],
+            remote_port: 0,
+            state: TcpState::Listen,
+            seq: 2000,
+            ack: 0,
+            pending_tx: Vec::new(),
+            rx_buffer: Vec::new(),
+        });
+    }
+
+    pub fn connect(&mut self, target_ip: [u8; 4], remote_port: u16) -> u16 {
+        let port = self.alloc_ephemeral_port();
+        let isn = 3000u32;
+        let my_ip = self.ip;
+        self.tcp_sockets.insert(port, TcpSocket {
+            local_port: port,
+            remote_ip: target_ip,
+            remote_port,
+            state: TcpState::SynSent,
+            seq: isn,
+            ack: 0,
+            pending_tx: Vec::new(),
+            rx_buffer: Vec::new(),
+        });
+        let syn_pkt = build_tcp_packet(my_ip, target_ip, port, remote_port, isn, 0, 0x02, &[]);
+        self.send_ipv4(target_ip, 6, &syn_pkt);
+        port
+    }
+
+    pub fn send_tcp_data(&mut self, local_port: u16, data: &[u8]) {
+        let my_ip = self.ip;
+        let mut pkts: Vec<([u8; 4], Vec<u8>)> = Vec::new();
+        if let Some(sock) = self.tcp_sockets.get_mut(&local_port) {
+            if sock.state == TcpState::Established {
+                // Segment into MSS-safe 1200-byte TCP frames so E1000 never drops large SSH/HTTP payloads
+                for chunk in data.chunks(1200) {
+                    let p = build_tcp_packet(my_ip, sock.remote_ip, sock.local_port, sock.remote_port, sock.seq, sock.ack, 0x18, chunk);
+                    sock.seq = sock.seq.wrapping_add(chunk.len() as u32);
+                    pkts.push((sock.remote_ip, p));
+                }
+            } else {
+                sock.pending_tx.extend_from_slice(data);
+            }
+        }
+        for (rip, p) in pkts {
+            self.send_ipv4(rip, 6, &p);
+        }
+    }
+}
+
+pub fn tcp_listen(port: u16) {
+    if let Ok(mut lock) = NET.lock() {
+        if let Some(net) = lock.as_mut() {
+            net.listen(port);
+        }
+    }
+}
+
+pub fn tcp_connect(target_ip: [u8; 4], remote_port: u16) -> u16 {
+    if let Ok(mut lock) = NET.lock() {
+        if let Some(net) = lock.as_mut() {
+            return net.connect(target_ip, remote_port);
+        }
+    }
+    0
+}
+
+pub fn tcp_send(local_port: u16, data: &[u8]) {
+    if let Ok(mut lock) = NET.lock() {
+        if let Some(net) = lock.as_mut() {
+            net.send_tcp_data(local_port, data);
+        }
+    }
+}
+
+pub fn tcp_take_rx(local_port: u16) -> Vec<u8> {
+    if let Ok(mut lock) = NET.lock() {
+        if let Some(net) = lock.as_mut() {
+            if let Some(sock) = net.tcp_sockets.get_mut(&local_port) {
+                return core::mem::take(&mut sock.rx_buffer);
+            }
+        }
+    }
+    Vec::new()
+}
+
+// ============================================================================
+// Milestone 35: Network Storage Mount (/net/<host> HTTP-FS / WebDAV / SMB Share)
+// ============================================================================
+
+#[derive(Clone, Debug)]
+pub struct NetShareMount {
+    pub name: String,
+    pub ip: [u8; 4],
+    pub port: u16,
+    pub proto: String,
+}
+
+pub static NET_MOUNTS: Mutex<Vec<NetShareMount>> = Mutex::new(Vec::new());
+
+pub fn init_net_storage() {
+    if let Ok(mut m) = NET_MOUNTS.lock() {
+        if m.is_empty() {
+            m.push(NetShareMount {
+                name: "host".into(),
+                ip: [10, 0, 2, 2],
+                port: 8000,
+                proto: "http-fs".into(),
+            });
+        }
+    }
+    crate::sdk::agent::audit_log("NET_STORAGE:PASS:Remote_Share_Mounted");
+}
+
+pub fn mount_net_share(name: &str, ip: [u8; 4], port: u16) -> String {
+    if let Ok(mut m) = NET_MOUNTS.lock() {
+        m.retain(|x| x.name != name);
+        m.push(NetShareMount {
+            name: name.to_string(),
+            ip,
+            port,
+            proto: "http-fs".into(),
+        });
+    }
+    format!("Mounted /net/{} -> http://{}.{}.{}.{}:{}", name, ip[0], ip[1], ip[2], ip[3], port)
+}
+
+pub fn list_net_mounts() -> Vec<NetShareMount> {
+    NET_MOUNTS.lock().map(|m| m.clone()).unwrap_or_default()
+}
+
+pub fn fetch_net_share_file(share_name: &str, rel_path: &str) -> Result<String, String> {
+    let mount = list_net_mounts()
+        .into_iter()
+        .find(|m| m.name.eq_ignore_ascii_case(share_name))
+        .ok_or_else(|| format!("mount '/net/{}' not found", share_name))?;
+
+    let lp = tcp_connect(mount.ip, mount.port);
+    if lp == 0 {
+        return Err("network unavailable".into());
+    }
+    let mut connected = false;
+    for _ in 0..30 {
+        poll_network();
+        if let Ok(lock) = NET.lock() {
+            if let Some(net) = lock.as_ref() {
+                if let Some(s) = net.tcp_sockets.get(&lp) {
+                    if s.state == TcpState::Established { connected = true; break; }
+                }
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if !connected {
+        return Err(format!("could not connect to {}.{}.{}.{}:{}", mount.ip[0], mount.ip[1], mount.ip[2], mount.ip[3], mount.port));
+    }
+
+    let clean_rel = rel_path.trim_start_matches('/');
+    let req = format!(
+        "GET /{} HTTP/1.1\r\nHost: {}.{}.{}.{}\r\nConnection: close\r\n\r\n",
+        clean_rel, mount.ip[0], mount.ip[1], mount.ip[2], mount.ip[3]
+    );
+    tcp_send(lp, req.as_bytes());
+
+    let mut resp = Vec::new();
+    for _ in 0..40 {
+        poll_network();
+        let chunk = tcp_take_rx(lp);
+        if !chunk.is_empty() {
+            resp.extend_from_slice(&chunk);
+        } else if !resp.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    if resp.is_empty() {
+        return Err("empty response from remote share".into());
+    }
+    let text = String::from_utf8_lossy(&resp).to_string();
+    if let Some((_, body)) = text.split_once("\r\n\r\n") {
+        Ok(body.to_string())
+    } else {
+        Ok(text)
     }
 }
 

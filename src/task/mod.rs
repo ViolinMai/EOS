@@ -150,10 +150,48 @@ pub fn request_elf_execution(filename: &str, argument: &str) -> Result<usize, &'
         let ab = argument.as_bytes(); let alen = core::cmp::min(ab.len(), 127);
         core::ptr::copy_nonoverlapping(ab.as_ptr(), addr_of_mut!(ELF_TARGET_ARGS[core_id]) as *mut u8, alen);
     }
+    clear_core_stdout(core_id);
     CORE_IS_BUSY[core_id].store(true, Ordering::SeqCst);
     CORE_ELF_SPAWN_REQ[core_id].store(true, Ordering::SeqCst);
     ELF_ACTIVE_RUNNING.store(true, Ordering::SeqCst);
     Ok(core_id)
+}
+
+static STDOUT_CAP_LOCK: AtomicBool = AtomicBool::new(false);
+static mut CORE_STDOUT_CAP: [Vec<u8>; 8] = [const { Vec::new() }; 8];
+
+pub fn clear_core_stdout(core_id: usize) {
+    if core_id >= 8 { return; }
+    while STDOUT_CAP_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    unsafe { CORE_STDOUT_CAP[core_id].clear(); }
+    STDOUT_CAP_LOCK.store(false, Ordering::Release);
+}
+
+pub fn append_core_stdout(core_id: usize, data: &[u8]) {
+    if core_id >= 8 || data.is_empty() { return; }
+    while STDOUT_CAP_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    unsafe {
+        let buf = &mut CORE_STDOUT_CAP[core_id];
+        if buf.len() < 65536 {
+            let take = (65536 - buf.len()).min(data.len());
+            buf.extend_from_slice(&data[..take]);
+        }
+    }
+    STDOUT_CAP_LOCK.store(false, Ordering::Release);
+}
+
+pub fn take_core_stdout(core_id: usize) -> Vec<u8> {
+    if core_id >= 8 { return Vec::new(); }
+    while STDOUT_CAP_LOCK.compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed).is_err() {
+        core::hint::spin_loop();
+    }
+    let out = unsafe { core::mem::take(&mut CORE_STDOUT_CAP[core_id]) };
+    STDOUT_CAP_LOCK.store(false, Ordering::Release);
+    out
 }
 
 fn elf_runner_worker(core_id: usize) {

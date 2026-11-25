@@ -1,9 +1,7 @@
 {
   "modified": [
-    "userspace/src/net_manager.rs",
-    "userspace/src/apps/terminal.rs",
-    "milestones.md",
-    "test_eos_audit.py"
+    "src/main.rs",
+    "src/arch/x86_64/syscall.rs"
   ],
   "created": []
 }

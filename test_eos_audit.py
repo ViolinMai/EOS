@@ -233,8 +233,19 @@ DEFAULT_PHASE_MARKERS = [
     "TEXTEDIT_PRO:PASS:Syntax_Undo_Ready",
     "SHORTCUTS_SCREENSHOT:PASS:Verified",
     "HW_PAT_WC:PASS:Framebuffer_Accelerated",
+    "HW_NVME:PASS:PCIe_SSD_Ready",
+    "HW_AHCI:PASS:SATA_DMA_Ready",
+    "HW_HDA:PASS:Intel_HDA_Ready",
+    "HW_NIC_RTL:PASS:Ethernet_Ready",
+    "EOS_CERTIFIED:PASS:32_OF_32",
     "POWER_MGR:PASS:Clean_Shutdown_Ready",
     "NET_LAN:PASS:DHCP_And_Discovery_Ready",
+    "NET_SSH:PASS:SSH2_Ready",
+    "VFS_EXT4:PASS:Extents_Journal_Ready",
+    "STRESS_AUDIT:PASS:All_5_Vectors_OK",
+    "POSIX_PROC:PASS:Fork_And_Pipes_Ready",
+    "UNIX_COREUTILS:PASS:BusyBox_Ready",
+    "NET_STORAGE:PASS:Remote_Share_Mounted",
 ]
 
 CPYTHON_PHASE_MARKERS = [
@@ -290,6 +301,7 @@ def run_automated_audit(timeout_sec=35, headless=True, expect=None, steps=None, 
     qmp = QmpClient("127.0.0.1", qmp_port)
 
     audit_events = []
+    stress_test_details = None
     panicked = False
     desktop_ready = False
     steps_done = False
@@ -318,6 +330,12 @@ def run_automated_audit(timeout_sec=35, headless=True, expect=None, steps=None, 
                     if "[KERNEL PANIC]" in clean:
                         panicked = True
                         print(f"    [!] {clean}")
+                    if "[EOS_STRESS_JSON]" in clean:
+                        stress_part = clean.split("[EOS_STRESS_JSON]", 1)[1].strip()
+                        try:
+                            stress_test_details = json.loads(stress_part)
+                        except Exception:
+                            pass
                     if "[EOS_AUDIT]" in clean:
                         json_part = clean.split("[EOS_AUDIT]", 1)[1].strip()
                         try:
@@ -389,6 +407,7 @@ def run_automated_audit(timeout_sec=35, headless=True, expect=None, steps=None, 
         "overall_status": "PASS" if overall_pass else "FAIL",
         "panicked": panicked,
         "desktop_first_frame": desktop_ready,
+        "stress_test_details": stress_test_details,
         "framebuffer_verified": screen_ok,
         "framebuffer_details": screen_msg,
         "test_subject_verdict": ts_status,

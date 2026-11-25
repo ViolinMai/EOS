@@ -128,6 +128,23 @@ pub fn sys_spawn_elf(path: &str, args: &str) -> i64 {
     ret
 }
 
+pub fn sys_wait_elf_output(core_id: usize) -> String {
+    let mut buf = vec![0u8; 32768];
+    let ret: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") 501i64 => ret,
+            in("rdi") core_id as u64,
+            in("rsi") buf.as_mut_ptr() as u64,
+            in("rdx") buf.len() as u64,
+            out("rcx") _, out("r11") _
+        );
+    }
+    let n = (ret.max(0) as usize).min(buf.len());
+    String::from_utf8_lossy(&buf[..n]).to_string()
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct RawExtWindowDesc {
