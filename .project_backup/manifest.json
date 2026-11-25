@@ -1,7 +1,14 @@
 {
   "modified": [
+    "src/drivers/mod.rs",
     "src/main.rs",
-    "src/arch/x86_64/syscall.rs"
+    "userspace/src/main.rs",
+    "userspace/src/shell.rs",
+    "limine.conf"
   ],
-  "created": []
+  "created": [
+    "src/drivers/ehci.rs",
+    "src/drivers/ath9k.rs",
+    "build_iso.py"
+  ]
 }

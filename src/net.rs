@@ -46,15 +46,25 @@ fn unlock_net() {
     NET_LOCK.store(false, Ordering::Release);
 }
 
+#[inline(always)]
+pub fn has_rx_packets() -> bool {
+    unsafe { !(*core::ptr::addr_of!(RAW_RX_QUEUE)).is_empty() }
+}
+
 pub fn enqueue_rx(packet: Vec<u8>) {
     lock_net();
+    let mut pushed = false;
     unsafe {
         let q = &mut *addr_of_mut!(RAW_RX_QUEUE);
-        if q.len() < 512 {
+        if q.len() < 2048 {
             q.push_back(packet);
+            pushed = true;
         }
     }
     unlock_net();
+    if pushed {
+        crate::arch::x86_64::apic::send_ipi(2, crate::arch::x86_64::apic::LAPIC_TIMER_VECTOR);
+    }
 }
 
 pub fn dequeue_rx() -> Option<Vec<u8>> {

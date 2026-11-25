@@ -260,6 +260,44 @@ pub fn map_mmio_pages(phys_addr: u64, pages: usize) -> Result<u64, &'static str>
     Ok(phys_addr + vmm.hhdm_offset)
 }
 
+/// Real `munmap` implementation: unmaps user pages, frees physical frames back to PMM, and returns freed bytes.
+pub fn unmap_user_pages(pml4_phys: u64, virt_addr: u64, pages: usize) -> usize {
+    let vmm = match unsafe { (*addr_of!(VMM)).as_ref() } {
+        Some(v) => v,
+        None => return 0,
+    };
+    let pml4 = unsafe { &mut *((pml4_phys + vmm.hhdm_offset) as *mut PageTable) };
+    let mut curr_vaddr = virt_addr & !0xFFF;
+    let mut freed_bytes = 0usize;
+
+    for _ in 0..pages {
+        if curr_vaddr >= 0x0000_8000_0000_0000 { break; }
+        let p4_idx = ((curr_vaddr >> 39) & 0x1FF) as usize;
+        let p3_idx = ((curr_vaddr >> 30) & 0x1FF) as usize;
+        let p2_idx = ((curr_vaddr >> 21) & 0x1FF) as usize;
+        let p1_idx = ((curr_vaddr >> 12) & 0x1FF) as usize;
+
+        if pml4.entries[p4_idx].is_present() {
+            let pt3 = unsafe { &mut *((pml4.entries[p4_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
+            if pt3.entries[p3_idx].is_present() {
+                let pt2 = unsafe { &mut *((pt3.entries[p3_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
+                if pt2.entries[p2_idx].is_present() {
+                    let pt1 = unsafe { &mut *((pt2.entries[p2_idx].physical_address() + vmm.hhdm_offset) as *mut PageTable) };
+                    if pt1.entries[p1_idx].is_present() && pt1.entries[p1_idx].is_user() {
+                        let phys = pt1.entries[p1_idx].physical_address();
+                        pt1.entries[p1_idx] = PageTableEntry::empty();
+                        unsafe { invalidate_tlb(curr_vaddr); }
+                        crate::mm::frame::free_frame_safe(phys);
+                        freed_bytes += 4096;
+                    }
+                }
+            }
+        }
+        curr_vaddr += 4096;
+    }
+    freed_bytes
+}
+
 pub fn is_user_mapped(pml4_phys: u64, virt_addr: u64) -> bool {
     unsafe {
         let vmm = if let Some(v) = (*core::ptr::addr_of!(VMM)).as_ref() { v } else { return false; };

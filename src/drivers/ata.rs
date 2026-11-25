@@ -319,8 +319,16 @@ pub fn scan_shared_disk() -> Result<Vec<DiskFileInfo>, &'static str> {
 }
 
 pub fn read_entire_file(drive: u8, file_info: &DiskFileInfo) -> Result<Vec<u8>, &'static str> {
+    if file_info.size as usize > 64 * 1024 * 1024 {
+        crate::log_error!("FAT", "Refusing to buffer '{}' ({} bytes > 64MB kernel VFS cap)", file_info.name, file_info.size);
+        return Err("File too large for kernel heap");
+    }
     let layout = get_fat_layout(drive)?;
-    let mut data = Vec::with_capacity(file_info.size as usize);
+    let mut data = Vec::new();
+    if data.try_reserve_exact(file_info.size as usize).is_err() {
+        crate::log_error!("FAT", "Kernel heap OOM reserving {} bytes for '{}'", file_info.size, file_info.name);
+        return Err("Kernel heap OOM");
+    }
     let mut current_cluster = file_info.first_cluster;
     let mut remaining = file_info.size as usize;
     let mut sector_buf = [0u8; 512];

@@ -783,6 +783,57 @@ impl ShellSession {
                     }
                 }
             }
+            "eos-update" => {
+                use sha2::{Digest, Sha256};
+                if args.is_empty() {
+                    out.lines.push(("EOS Delta Updater (Network + USB + Limine Rollback)".into(), 0xFF38BDF8));
+                    out.lines.push(("Usage: eos-update --usb <dir>   (e.g. eos-update --usb /EOS SHARE/update)".into(), 0xFFE2E8F0));
+                    out.lines.push(("       eos-update --net <share> (e.g. eos-update --net host)".into(), 0xFFE2E8F0));
+                } else if args[0] == "--usb" {
+                    let src_dir = args.get(1).map(|s| s.trim_matches('/')).unwrap_or("EOS SHARE/update");
+                    let targets = ["EOS", "INITRD.TAR"];
+                    let mut updated = 0usize;
+                    for fname in targets {
+                        let src_path = format!("{}/{}", src_dir, fname);
+                        let cur_path = format!("EOS SHARE/{}", fname);
+                        let bak_path = format!("EOS SHARE/{}.BAK", fname);
+                        if let Ok(new_bytes) = fs::read(&src_path) {
+                            let new_hash = format!("{:x}", Sha256::digest(&new_bytes));
+                            let old_hash = fs::read(&cur_path).map(|b| format!("{:x}", Sha256::digest(&b))).unwrap_or_default();
+                            if new_hash == old_hash {
+                                out.lines.push((format!("[SKIP] {} unchanged (SHA256: {}..)", fname, &new_hash[..12]), 0xFF94A3B8));
+                            } else {
+                                if let Ok(old_b) = fs::read(&cur_path) {
+                                    let _ = fs::write(&bak_path, &old_b);
+                                }
+                                match fs::write(&cur_path, &new_bytes) {
+                                    Ok(_) => {
+                                        out.lines.push((format!("[UPDATED] {} ({} KB) | Backup -> {}.BAK", fname, new_bytes.len() / 1024, fname), 0xFF34D399));
+                                        updated += 1;
+                                    }
+                                    Err(e) => out.lines.push((format!("[ERR] Failed writing {}: {:?}", fname, e), 0xFFEF4444)),
+                                }
+                            }
+                        }
+                    }
+                    if updated > 0 {
+                        out.lines.push(("Delta update applied! Run 'reboot' to boot new kernel (Rollback available in Limine).".into(), 0xFFFCD34D));
+                    } else {
+                        out.lines.push((format!("No newer files found in '/{}'.", src_dir), 0xFF94A3B8));
+                    }
+                } else if args[0] == "--net" {
+                    let share = args.get(1).map(|s| s.as_str()).unwrap_or("host");
+                    match crate::net_manager::fetch_net_share_file(share, "eos_manifest.json") {
+                        Ok(manifest) => {
+                            out.lines.push((format!("Fetched manifest from /net/{} ({} bytes):", share, manifest.len()), 0xFF34D399));
+                            for l in manifest.lines().take(12) {
+                                out.lines.push((l.to_string(), 0xFFE2E8F0));
+                            }
+                        }
+                        Err(e) => out.lines.push((format!("eos-update --net error: {}", e), 0xFFEF4444)),
+                    }
+                }
+            }
             "reboot" => crate::syscall::sys_power(1),
             "shutdown" => crate::syscall::sys_power(2),
             _ => {

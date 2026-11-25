@@ -39,6 +39,8 @@ pub fn init() {
         (*idt_ptr).entries[35].set_handler(com2_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
         (*idt_ptr).entries[36].set_handler(com1_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
         (*idt_ptr).entries[44].set_handler(mouse_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
+        (*idt_ptr).entries[48].set_handler(lapic_timer_interrupt_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
+        (*idt_ptr).entries[255].set_handler(lapic_spurious_handler as *const () as usize, KERNEL_CODE_SELECTOR, 0, 0x8E);
 
         InterruptDescriptorTable::load_raw(idt_ptr);
     }
@@ -57,6 +59,12 @@ pub extern "x86-interrupt" fn mouse_interrupt_handler(_stack_frame: InterruptSta
         crate::arch::x86_64::pic::send_eoi(12);
     }
 }
+
+pub extern "x86-interrupt" fn lapic_timer_interrupt_handler(_stack_frame: InterruptStackFrame) {
+    crate::arch::x86_64::apic::eoi();
+}
+
+pub extern "x86-interrupt" fn lapic_spurious_handler(_stack_frame: InterruptStackFrame) {}
 
 pub extern "x86-interrupt" fn com1_interrupt_handler(_stack_frame: InterruptStackFrame) {
     unsafe {

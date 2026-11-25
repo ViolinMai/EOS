@@ -105,6 +105,7 @@ pub extern "C" fn _start() -> ! {
 
     arch::x86_64::gdt::init_core(0);
     arch::x86_64::interrupts::init();
+    arch::x86_64::apic::init_bsp_mmio();
     drivers::mouse::init();
     arch::x86_64::syscall::init();
 
@@ -203,8 +204,9 @@ extern "C" fn ap_startup_entry(info: &limine::mp::MpInfo) -> ! {
             crate::arch::x86_64::idt::InterruptDescriptorTable::load_raw(
                 core::ptr::addr_of_mut!(crate::arch::x86_64::interrupts::IDT)
             );
-            core::arch::asm!("sti", options(nomem, nostack));
         }
+        arch::x86_64::apic::init_ap_timer();
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
         arch::x86_64::syscall::init_core_syscall(core_id);
     }
     CORES_ONLINE.fetch_add(1, Ordering::SeqCst);

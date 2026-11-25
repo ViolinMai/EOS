@@ -118,6 +118,22 @@ pub fn sys_media_decode_image(src: &[u8], out_pixels: *mut u32, out_cap: usize, 
     ret
 }
 
+/// Direct single-syscall kernel sleep (avoids musl's 6-syscall clock_nanosleep overhead)
+pub fn sys_sleep_ms(ms: u64) {
+    let ts: [u64; 2] = [ms / 1000, (ms % 1000) * 1_000_000];
+    let ret: i64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") 35i64 => ret,
+            in("rdi") ts.as_ptr() as u64,
+            in("rsi") 0u64,
+            out("rcx") _, out("r11") _
+        );
+    }
+    let _ = ret;
+}
+
 pub fn sys_spawn_elf(path: &str, args: &str) -> i64 {
     let mut pb = [0u8; 128]; let mut ab = [0u8; 128];
     let p = path.as_bytes(); let a = args.as_bytes();
@@ -186,6 +202,20 @@ pub fn sys_win_commit(id: u32, px: &[u32], w: u32, h: u32) {
 pub fn sys_win_poll_event(id: u32) -> Option<RawExtWindowEvent> {
     let mut ev = RawExtWindowEvent::default(); let ret: u64;
     unsafe { asm!("syscall", inout("rax") 532u64 => ret, in("rdi") id as u64, in("rsi") &mut ev as *mut _ as u64, out("rcx") _, out("r11") _); }
+    if ret == 1 { Some(ev) } else { None }
+}
+pub fn sys_win_wait_event(id: u32, timeout_ms: u64) -> Option<RawExtWindowEvent> {
+    let mut ev = RawExtWindowEvent::default(); let ret: u64;
+    unsafe {
+        asm!(
+            "syscall",
+            inout("rax") 538u64 => ret,
+            in("rdi") id as u64,
+            in("rsi") &mut ev as *mut _ as u64,
+            in("rdx") timeout_ms,
+            out("rcx") _, out("r11") _
+        );
+    }
     if ret == 1 { Some(ev) } else { None }
 }
 pub fn sys_win_destroy(id: u32) {

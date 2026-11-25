@@ -373,6 +373,7 @@ def prepare_and_run(cli_args=None):
                 break
 
     img_path = os.path.join(target_dir, "uefi_hdd.img")
+    share_img_path = os.path.join(target_dir, "eos_share.img")
     ext2_img_path = os.path.join(target_dir, "rootfs.ext2")
     settings_img_path = os.path.join(target_dir, "settings.img")
 
@@ -422,6 +423,14 @@ def prepare_and_run(cli_args=None):
             f.write(b"\\EFI\\BOOT\\BOOTX64.EFI\r\n")
 
         make_ext2_disk(ext2_img_path)
+
+        # Build a real 1 GB FAT32 disk image for EOS SHARE (bypasses QEMU vvfat 516 MB FAT16 limit)
+        if os.name != "nt" and shutil.which("mkfs.vfat") and shutil.which("mcopy"):
+            subprocess.run(["truncate", "-s", "1G", share_img_path], check=True)
+            subprocess.run(["mkfs.vfat", "-F", "32", "-n", "EOSSHARE", share_img_path], stdout=subprocess.DEVNULL, check=True)
+            for item in os.listdir(share_dir):
+                src_item = os.path.join(share_dir, item)
+                subprocess.run(["mcopy", "-s", "-o", "-i", share_img_path, src_item, "::"], check=False)
 
         if not os.path.exists(settings_img_path) or os.path.getsize(settings_img_path) == 0:
             default_payload = b"dark_mode=false\nui_scale=2\nwallpaper=\n"
@@ -524,7 +533,7 @@ def prepare_and_run(cli_args=None):
     ] + pflash_vars_args + [
         "-device", "piix3-ide,id=ide",
         "-drive", f"id=disk0,file={img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=0,drive=disk0",
-        "-drive", f"id=disk1,file=fat:rw:{share_dir},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
+        "-drive", f"id=disk1,file={(share_img_path if os.path.exists(share_img_path) else f'fat:rw:{share_dir}')},format=raw,if=none", "-device", "ide-hd,bus=ide.0,unit=1,drive=disk1",
         "-drive", f"id=disk2,file={ext2_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=0,drive=disk2",
         "-drive", f"id=disk3,file={settings_img_path},format=raw,if=none", "-device", "ide-hd,bus=ide.1,unit=1,drive=disk3",
         "-netdev", ("user,id=n0,hostfwd=udp::68-:68,hostfwd=tcp::2222-:22" if os.name == "nt" else "user,id=n0,hostfwd=udp::6868-:68,hostfwd=tcp::2222-:22"), "-device", "e1000,netdev=n0",

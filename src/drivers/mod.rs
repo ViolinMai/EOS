@@ -1,6 +1,8 @@
 pub mod ahci;
 pub mod ata;
+pub mod ath9k;
 pub mod e1000;
+pub mod ehci;
 pub mod gamepad;
 pub mod hda;
 pub mod nvme;

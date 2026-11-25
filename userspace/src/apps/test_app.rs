@@ -155,14 +155,12 @@ impl TestApp {
         });
 
         if let Some(top) = samples.iter().find(|s| s.pid >= 3).or_else(|| samples.first()) {
-            let tag = if top.syscalls_per_sec > 500 {
+            let tag = if top.syscalls_per_sec > 200 {
                 "SYSCALL FLOOD"
-            } else if top.mcycles_per_sec > 50.0 {
-                "HIGH CPU CYCLES"
             } else if top.mem_delta_kb_s > 256 {
                 "MEM GROWTH"
             } else {
-                "NORMAL"
+                "OPTIMAL"
             };
             self.culprit_summary = format!(
                 "Top Consumer: '{}' (PID {} Core {}) | {} sc/s | {:.2} MCyc/s | Mem: {} KB ({:+} KB/s) [{}]",
@@ -180,7 +178,7 @@ impl TestApp {
         match self.tab {
             TestTab::GpuProcs => {
                 let elapsed = now.saturating_duration_since(self.last_proc_poll);
-                if elapsed >= std::time::Duration::from_millis(500) {
+                if elapsed >= std::time::Duration::from_millis(1000) {
                     self.prev_procs = self.procs.clone();
                     self.procs = sdk::sys::query_processes();
                     self.prev_heap_kb = self.kernel_heap_kb;
@@ -384,19 +382,20 @@ impl Widget for TestApp {
                 let mut cur_y = table_y + row_h + 2;
                 for p in &self.proc_rates {
                     if cur_y + row_h > y + h - pad { break; }
-                    let hot = p.pid >= 3 && (p.syscalls_per_sec > 400 || p.mcycles_per_sec > 40.0 || p.mem_delta_kb_s > 256);
+                    let hot = p.pid >= 3 && (p.syscalls_per_sec > 150 || p.mem_delta_kb_s > 256);
                     let row_bg = if hot { 0xFF451A1A } else { 0xFF141E2E };
                     let row_fg = if hot { 0xFFFCA5A5 } else { 0xFFE2E8F0 };
                     canvas.draw_rect(x + pad, cur_y, cw, row_h, row_bg, 2);
 
                     let cyc_m = p.cycles_total / 1_000_000;
+                    let dmem_str = format!("{:+}", p.mem_delta_kb_s);
                     let line = format!(
-                        "{:<4} C{:<4} {:<17} {:<8} {:+<8} {:<10} {:<7} {:<14} {:.1}",
+                        "{:<4} C{:<4} {:<17} {:<8} {:<8} {:<10} {:<7} {:<14} {:.1}",
                         p.pid,
                         p.core_id,
                         p.name.chars().take(17).collect::<String>(),
                         p.mem_kb,
-                        p.mem_delta_kb_s,
+                        dmem_str,
                         p.syscalls_total,
                         p.syscalls_per_sec,
                         cyc_m,

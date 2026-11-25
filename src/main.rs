@@ -94,17 +94,39 @@ pub extern "C" fn _start() -> ! {
         }
     }
 
-    let heap_bytes = config::CONFIG.default_heap_size_mb * 1024 * 1024;
-    mm::frame::reserve_physical_range(0x10000000, heap_bytes);
+    // Hardware-adaptive Kernel Heap placement (safe on both 4GB QEMU & 3.7GB bare-metal laptops)
+    let mut heap_phys: u64 = 0x1000_0000;
+    let mut heap_bytes = config::CONFIG.default_heap_size_mb * 1024 * 1024;
+    let mut found_region = false;
+    for &entry in mmap_resp.entries() {
+        let raw_type: u64 = unsafe { core::ptr::read_unaligned(&entry.type_ as *const _ as *const u64) };
+        if raw_type == 0 && entry.base >= 0x0100_0000 && entry.length as usize >= heap_bytes + (32 * 1024 * 1024) {
+            heap_phys = (entry.base + 0x1F_FFFF) & !0x1F_FFFF;
+            found_region = true;
+            break;
+        }
+    }
+    if !found_region {
+        heap_bytes = 128 * 1024 * 1024;
+        for &entry in mmap_resp.entries() {
+            let raw_type: u64 = unsafe { core::ptr::read_unaligned(&entry.type_ as *const _ as *const u64) };
+            if raw_type == 0 && entry.base >= 0x0100_0000 && entry.length as usize >= heap_bytes {
+                heap_phys = (entry.base + 0x1F_FFFF) & !0x1F_FFFF;
+                break;
+            }
+        }
+    }
+    mm::frame::reserve_physical_range(heap_phys, heap_bytes);
     unsafe {
         mm::heap::HEAP_ALLOCATOR.init(
-            (0x10000000 + hhdm_offset) as *mut u8,
+            (heap_phys + hhdm_offset) as *mut u8,
             heap_bytes
         );
     }
 
     arch::x86_64::gdt::init_core(0);
     arch::x86_64::interrupts::init();
+    arch::x86_64::apic::init_bsp_mmio();
     drivers::mouse::init();
     arch::x86_64::syscall::init();
 
@@ -123,6 +145,8 @@ pub extern "C" fn _start() -> ! {
     drivers::rtl8111::init();
     net::init();
 
+    drivers::ehci::init();
+    drivers::ath9k::init();
     drivers::nvme::init();
     drivers::ahci::init();
     drivers::ata::init();
@@ -203,8 +227,9 @@ extern "C" fn ap_startup_entry(info: &limine::mp::MpInfo) -> ! {
             crate::arch::x86_64::idt::InterruptDescriptorTable::load_raw(
                 core::ptr::addr_of_mut!(crate::arch::x86_64::interrupts::IDT)
             );
-            core::arch::asm!("sti", options(nomem, nostack));
         }
+        arch::x86_64::apic::init_ap_timer();
+        unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
         arch::x86_64::syscall::init_core_syscall(core_id);
     }
     CORES_ONLINE.fetch_add(1, Ordering::SeqCst);
@@ -217,9 +242,7 @@ extern "C" fn ap_startup_entry(info: &limine::mp::MpInfo) -> ! {
         if core_id < 8 { CORE_HEARTBEAT[core_id].fetch_add(1, Ordering::Relaxed); }
         let did_work = task::core_poll_and_execute(core_id);
         if !did_work {
-            for _ in 0..2048 {
-                core::hint::spin_loop();
-            }
+            unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
         }
     }
 }

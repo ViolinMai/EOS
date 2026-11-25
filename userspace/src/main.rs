@@ -158,7 +158,10 @@ fn main() {
     sdk::agent::audit_log("SHORTCUTS_SCREENSHOT:PASS:Verified");
     sdk::agent::audit_log("POWER_MGR:PASS:Clean_Shutdown_Ready");
 
-    let mut app = FrameworkApp::new(&font_bytes, SCREEN_W, SCREEN_H);
+    let gpu_info = sdk::gpu::query_info();
+    let fb_w = (gpu_info.width as usize).clamp(640, 2560);
+    let fb_h = (gpu_info.height as usize).clamp(480, 1440);
+    let mut app = FrameworkApp::new(&font_bytes, fb_w, fb_h);
     app.set_dock_handler(|_idx| {});
     sdk::agent::audit_log("FIRST_FRAME:PASS");
     sdk::agent::audit_log("DESKTOP_INIT:PASS:Userspace desktop ready and entering main event loop");
@@ -167,6 +170,7 @@ fn main() {
 }
 
 fn run_isolated_client_app(app_name: &str, file_arg: Option<&str>, dir_arg: Option<&str>, font_bytes: &[u8]) {
+    let _ = framework::theme::sync_theme_from_disk_if_changed();
     let theme = get_theme();
     let mut w = theme.pt(680.0).clamp(320, 1800) as usize;
     let mut h = theme.pt(440.0).clamp(240, 1100) as usize;
@@ -271,10 +275,44 @@ fn run_isolated_client_app(app_name: &str, file_arg: Option<&str>, dir_arg: Opti
             widget.paint(&mut canvas);
             syscall::sys_win_commit(win_id, &pixels, w as u32, h as u32);
             dirty = false;
+        }
+
+        // Event-driven hardware-HLT blocking wait (zero polling overhead when idle)
+        let wait_ms = if active_media {
+            16
+        } else if app_name == "Test" {
+            if widget.as_any().downcast_ref::<apps::TestApp>().map(|t| t.anim_running).unwrap_or(false) { 100 } else { 1000 }
+        } else if app_name == "Terminal" {
+            500
         } else {
-            // تهدئة الـ Idle: 60ms للخمول التام، و 8ms فقط أثناء تشغيل فيديو فعلي لضبط VSync
-            let sleep_ms = if active_media { 8 } else { 60 };
-            std::thread::sleep(std::time::Duration::from_millis(sleep_ms));
+            1000
+        };
+
+        if let Some(ev) = syscall::sys_win_wait_event(win_id, wait_ms) {
+            match ev.kind {
+                1 => { widget.handle_mouse(ev.a, ev.b, ev.c != 0); dirty = true; }
+                2 => { widget.handle_scroll(ev.a, ev.b, ev.c); dirty = true; }
+                3 => { widget.handle_key(ev.a as u8, ev.b as u8); dirty = true; }
+                4 => { if let Some(ch) = char::from_u32(ev.a as u32) { widget.handle_char(ch); dirty = true; } }
+                5 => {
+                    let nw = (ev.a.max(160) as usize).min(2560);
+                    let nh = (ev.b.max(120) as usize).min(1440);
+                    if nw != w || nh != h {
+                        w = nw; h = nh;
+                        pixels.resize(w * h, 0xFF0F172A);
+                        widget.layout(0, 0, w as i32, h as i32);
+                        dirty = true;
+                    }
+                }
+                9 => {
+                    syscall::sys_win_destroy(win_id);
+                    core::mem::forget(widget);
+                    unsafe {
+                        core::arch::asm!("syscall", in("rax") 231u64, in("rdi") 0u64, options(noreturn));
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }

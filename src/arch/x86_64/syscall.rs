@@ -29,6 +29,8 @@ pub fn push_user_event(ev: InputEvent) {
     if next != tail {
         unsafe { USERSPACE_EVENTS[head] = Some(ev); }
         USER_EVENT_HEAD.store(next, Ordering::Release);
+        // Instantly wake Core 2 (Compositor) from HLT for zero-latency mouse & keyboard
+        crate::arch::x86_64::apic::send_ipi(2, crate::arch::x86_64::apic::LAPIC_TIMER_VECTOR);
     }
 }
 
@@ -185,6 +187,7 @@ fn fill_stat_buffer(statbuf: u64, size: u64, mode: u32) -> Result<(), ()> {
 pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
     let t_start = pit::read_tsc();
     let frame = unsafe { &mut *frame_ptr };
+    let syscall_num = frame.rax;
     let cur_core = crate::profiler::get_core_id();
 
     match frame.rax {
@@ -512,7 +515,19 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 }
             } else { frame.rax = -22i64 as u64; }
         }
-        11 => { frame.rax = 0; }
+        11 => { // munmap(addr, length) — real page unmapping & PMM frame reclamation
+            let addr = frame.rdi;
+            let len = frame.rsi as usize;
+            if addr != 0 && len > 0 && addr < 0x0000_7FFF_0000_0000 {
+                let pages = (len + 0xFFF) / 4096;
+                let cur_pml4 = read_cr3() & 0x000F_FFFF_FFFF_F000;
+                let freed = crate::mm::paging::unmap_user_pages(cur_pml4, addr, pages);
+                if freed > 0 {
+                    crate::task::record_proc_mem_sub(cur_core, freed as u64);
+                }
+            }
+            frame.rax = 0;
+        }
         12 => { // brk (dedicated address space separate from mmap_bump)
             let addr = frame.rdi;
             let proc = get_current_process();
@@ -1066,7 +1081,7 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             }
             frame.rax = 0;
         }
-        505 => { // sys_wait_event
+        505 => { // sys_wait_event (true hardware HLT blocking wait)
             let timeout_ms = frame.rdi;
             let start_ticks = crate::arch::x86_64::pit::get_ticks();
             let mut got_event = false;
@@ -1085,8 +1100,9 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 if timeout_ms == 0 { break; }
                 let elapsed = crate::arch::x86_64::pit::get_ticks().saturating_sub(start_ticks);
                 if timeout_ms != u64::MAX && elapsed >= timeout_ms { break; }
-                crate::task::yield_now();
+                unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
             }
+            unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
             if !got_event { frame.rax = 0; frame.rdi = 0; frame.rsi = 0; }
         }
         506 => { // sys_gpu_move_cursor
@@ -1276,6 +1292,36 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
             let ev = crate::task::ExtWindowEvent { kind: frame.rsi as u32, a: frame.rdx as i32, b: frame.r10 as i32, c: frame.r8 as i32 };
             frame.rax = if crate::task::push_ext_event(frame.rdi as u32, ev) { 0 } else { -1i64 as u64 };
         }
+        538 => { // sys_win_wait_event(win_id, out_ptr, timeout_ms) -> 1 if event else 0
+            let win_id = frame.rdi as u32;
+            let out_ptr = frame.rsi;
+            let timeout_ms = frame.rdx;
+            let sz = core::mem::size_of::<crate::task::ExtWindowEvent>();
+            if validate_user_range(out_ptr, sz) {
+                let target = pit::TICKS.load(Ordering::Relaxed).saturating_add(timeout_ms);
+                let mut found = None;
+                loop {
+                    if let Some(ev) = crate::task::poll_ext_event(win_id) {
+                        found = Some(ev);
+                        break;
+                    }
+                    if timeout_ms == 0 || pit::TICKS.load(Ordering::Relaxed) >= target {
+                        break;
+                    }
+                    unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
+                }
+                unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
+                if let Some(ev) = found {
+                    let b = unsafe { core::slice::from_raw_parts(&ev as *const _ as *const u8, sz) };
+                    let _ = copy_to_user(out_ptr, b);
+                    frame.rax = 1;
+                } else {
+                    frame.rax = 0;
+                }
+            } else {
+                frame.rax = 0;
+            }
+        }
         537 => { // sys_win_file_portal(cmd, win_id, buf_ptr, buf_len)
             let cmd = frame.rdi as u32;
             let wid = frame.rsi as u32;
@@ -1458,22 +1504,21 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 }
             }
         }
-        35 => { // nanosleep(req_ptr, rem_ptr)
+        35 => { // nanosleep(req_ptr, rem_ptr) — 1 PIT tick = 1 ms; Core 2 wakes instantly on input/net IPI
             let mut req = [0u64; 2];
             if validate_user_range(frame.rdi, 16) {
                 let bytes = unsafe { core::slice::from_raw_parts_mut(req.as_mut_ptr() as *mut u8, 16) };
                 if copy_from_user(bytes, frame.rdi, 16).is_ok() {
                     let ms = req[0].saturating_mul(1000).saturating_add(req[1] / 1_000_000);
                     if ms > 0 {
-                        let wait_ticks = (ms / 10).max(1);
-                        let target = pit::TICKS.load(Ordering::Relaxed).saturating_add(wait_ticks);
+                        let target = pit::TICKS.load(Ordering::Relaxed).saturating_add(ms);
                         while pit::TICKS.load(Ordering::Relaxed) < target {
-                            if cur_core == 0 {
-                                unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
-                            } else {
-                                for _ in 0..512 { core::hint::spin_loop(); }
+                            if cur_core == 2 && (USER_EVENT_HEAD.load(Ordering::Acquire) != USER_EVENT_TAIL.load(Ordering::Acquire) || crate::net::has_rx_packets()) {
+                                break;
                             }
+                            unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
                         }
+                        unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
                     }
                 }
             }
@@ -1486,15 +1531,14 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
                 if copy_from_user(bytes, frame.rdx, 16).is_ok() {
                     let ms = req[0].saturating_mul(1000).saturating_add(req[1] / 1_000_000);
                     if ms > 0 {
-                        let wait_ticks = (ms / 10).max(1);
-                        let target = pit::TICKS.load(Ordering::Relaxed).saturating_add(wait_ticks);
+                        let target = pit::TICKS.load(Ordering::Relaxed).saturating_add(ms);
                         while pit::TICKS.load(Ordering::Relaxed) < target {
-                            if cur_core == 0 {
-                                unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
-                            } else {
-                                for _ in 0..512 { core::hint::spin_loop(); }
+                            if cur_core == 2 && (USER_EVENT_HEAD.load(Ordering::Acquire) != USER_EVENT_TAIL.load(Ordering::Acquire) || crate::net::has_rx_packets()) {
+                                break;
                             }
+                            unsafe { core::arch::asm!("sti; hlt", options(nomem, nostack)); }
                         }
+                        unsafe { core::arch::asm!("cli", options(nomem, nostack)); }
                     }
                 }
             }
@@ -1504,7 +1548,12 @@ pub fn syscall_handler(frame_ptr: *mut SyscallFrame) {
         39 => { frame.rax = 1; }
         _ => { frame.rax = -38i64 as u64; }
     }
-    crate::task::record_proc_syscall(cur_core, pit::read_tsc().saturating_sub(t_start));
+    // Exclude hardware-HLT idle sleep time from active CPU cycle accounting
+    let active_cycles = match syscall_num {
+        35 | 230 | 505 | 538 => 0,
+        _ => pit::read_tsc().saturating_sub(t_start),
+    };
+    crate::task::record_proc_syscall(cur_core, active_cycles);
 }
 
 pub struct ProcessTableLock {

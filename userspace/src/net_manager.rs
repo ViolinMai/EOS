@@ -419,8 +419,16 @@ impl NetworkManager {
             if sock.state != TcpState::Listen && sock.remote_ip != src_ip { return; }
 
             let syn = (flags & 0x02) != 0;
+            let rst = (flags & 0x04) != 0;
             let ack_flag = (flags & 0x10) != 0;
             let fin = (flags & 0x01) != 0;
+
+            if rst {
+                sock.state = TcpState::Closed;
+                sock.rx_buffer.clear();
+                sock.pending_tx.clear();
+                return;
+            }
 
             match sock.state {
                 TcpState::Listen => {
@@ -430,6 +438,7 @@ impl NetworkManager {
                         sock.ack = seq.wrapping_add(1);
                         sock.seq = 2000;
                         sock.state = TcpState::Established;
+                        sock.rx_buffer.clear();
                         let p = build_tcp_packet(my_ip, src_ip, dst_port, src_port, sock.seq, sock.ack, 0x12, &[]);
                         sock.seq = sock.seq.wrapping_add(1);
                         packets_to_send.push(p);

@@ -1,26 +1,40 @@
-# Rust build artifacts
+# Rust & Cargo build artifacts
 target/
 userspace/target/
 **/*.rs.bk
+Cargo.lock
+userspace/Cargo.lock
 
-# Generated OS disk images and firmware variables
+# Generated OS disk images, ISO, and firmware variables
 *.img
+*.iso
 vars.fd
 
-# Logs and runtime dumps
+# Vendored / cross-compiled external libraries & build scripts output
+userspace/vendor/cpython_dyn_build/
+userspace/vendor/python/
+userspace/vendor/ffmpeg/lib/
+userspace/vendor/ffmpeg/include/
+userspace/vendor/ffmpeg/share/
+build_busybox_musl.sh
+build_cpython_musl.sh
+
+# Generated test subject outputs & runtime logs
+TEST_SUBJECT/eos_output.json
+TEST_SUBJECT/eos_certification.json
 *.log
 qemu.log
 full_project_dump.txt
 patch.txt
 
-# Limine downloaded EFI binary (downloaded dynamically via run_qemu.py)
+# Limine downloaded EFI binary (fetched dynamically via run_qemu.py)
 BOOTX64.EFI
 
-# IDEs & System files
+# IDEs & OS metadata files
 .vscode/
 .idea/
 .DS_Store
 Thumbs.db
 
-# Live host share folder (do not push shared Windows files)
+# Live host share folder
 disk_share/

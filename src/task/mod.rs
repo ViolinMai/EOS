@@ -474,6 +474,19 @@ pub fn record_proc_mem(core_id: usize, delta_bytes: u64) {
     unlock_tel();
 }
 
+pub fn record_proc_mem_sub(core_id: usize, freed_bytes: u64) {
+    lock_tel();
+    unsafe {
+        for p in PROC_TELEMETRY.iter_mut() {
+            if p.state == 1 && p.core_id as usize == core_id {
+                p.mem_bytes = p.mem_bytes.saturating_sub(freed_bytes);
+                break;
+            }
+        }
+    }
+    unlock_tel();
+}
+
 pub fn record_proc_syscall(core_id: usize, cycles: u64) {
     unsafe {
         for p in PROC_TELEMETRY.iter_mut() {
@@ -713,6 +726,7 @@ pub fn poll_ext_event(win_id: u32) -> Option<ExtWindowEvent> {
 pub fn push_ext_event(win_id: u32, ev: ExtWindowEvent) -> bool {
     lock_ew();
     let mut ok = false;
+    let mut target_core: Option<u8> = None;
     unsafe {
         for s in EXT_WINDOWS.iter_mut().flatten() {
             if s.id == win_id {
@@ -720,11 +734,15 @@ pub fn push_ext_event(win_id: u32, ev: ExtWindowEvent) -> bool {
                     s.closing = true;
                 }
                 if s.events.len() < 64 { s.events.push_back(ev); }
+                target_core = Some(s.core_id as u8);
                 ok = true; break;
             }
         }
     }
     unlock_ew();
+    if let Some(cid) = target_core {
+        crate::arch::x86_64::apic::send_ipi(cid, crate::arch::x86_64::apic::LAPIC_TIMER_VECTOR);
+    }
     ok
 }
 
